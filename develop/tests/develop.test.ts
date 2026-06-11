@@ -169,7 +169,28 @@ beforeEach(() => {
     mock.clearAllMocks();
     mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
-    mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
+    mockLanePoolRun.mockImplementation(async function(this: unknown) {
+        // Auto-process tasks from the LanePool's taskTracker so tests
+        // don't need to manually drive the pool.
+        const lastCall = mockLanePoolCtor.mock.calls[mockLanePoolCtor.mock.calls.length - 1];
+        if (lastCall?.[0]) {
+            const opts = lastCall[0] as Record<string, unknown>;
+            if (opts.taskTracker && typeof (opts.taskTracker as any).getAllTasks === 'function') {
+                const tt = opts.taskTracker as any;
+                for (const task of [...tt.getAllTasks()]) {
+                    const claimed = tt.claimTasks(1);
+                    if (claimed.length > 0) {
+                        tt.startTask(claimed[0].id, 'mock-lane');
+                        tt.submitForReview(claimed[0].id, { report: `scout report for ${claimed[0].title}` });
+                        tt.completeTask(claimed[0].id);
+                    }
+                }
+                const doneCount = tt.getAllTasks().filter((t: any) => t.status === 'done').length;
+                return { completedTasks: doneCount, failedTasks: 0 };
+            }
+        }
+        return { completedTasks: 0, failedTasks: 0 };
+    });
 });
 
 // ─── Schemas ────────────────────────────────────────────────────────────────
@@ -270,8 +291,9 @@ describe("Zod Schemas", () => {
 // ─── scoutingPhase ──────────────────────────────────────────────────────────
 
 describe("scoutingPhase", () => {
-    it("creates a scout harness, gets topics, and spawns parallel scouts", async () => {
+    it("creates a scout harness, gets topics, and runs a LanePool", async () => {
         const dir = tmpDir();
+        const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
         const topics = {
@@ -289,51 +311,44 @@ describe("scoutingPhase", () => {
             ],
         };
 
-        // First call for topics, then parallel agents for reports
+        // First call for topics; LanePool mock processes tasks automatically
         mockPromptForStructured.mockResolvedValueOnce(topics);
-        mockParallelAgents.mockResolvedValueOnce([
-            { status: "fulfilled", value: { report: "scout report A" } },
-            { status: "fulfilled", value: { report: "scout report B" } },
-        ]);
 
-        const reports = await scoutingPhase(tracker, ["/profiles"], "Build a feature", "/cwd");
+        const reports = await scoutingPhase(tracker, ["/profiles"], "Build a feature", "/cwd", 3, workDir);
 
         expect(reports).toHaveLength(2);
-        expect(reports[0]).toEqual({ report: "scout report A" });
-        expect(reports[1]).toEqual({ report: "scout report B" });
+        expect(reports[0]).toEqual({ report: "scout report for module-a" });
+        expect(reports[1]).toEqual({ report: "scout report for module-b" });
         expect(mockCreateHarness).toHaveBeenCalledTimes(1); // coordinator harness
         expect(mockPromptForStructured).toHaveBeenCalledTimes(1);
-        expect(mockParallelAgents).toHaveBeenCalledTimes(1);
-        expect(mockParallelAgents).toHaveBeenCalledWith(
-            expect.arrayContaining([
-                expect.objectContaining({
-                    profile: expect.objectContaining({ id: "scout" }),
-                    cwd: "/cwd",
-                }),
-                expect.objectContaining({
-                    profile: expect.objectContaining({ id: "scout" }),
-                    cwd: "/cwd",
-                }),
-            ]),
-            expect.any(Function),
+        expect(mockLanePoolCtor).toHaveBeenCalledTimes(1);
+        expect(mockLanePoolRun).toHaveBeenCalledTimes(1);
+        expect(mockLanePoolCtor).toHaveBeenCalledWith(
+            expect.objectContaining({
+                maxConcurrentLanes: 3,
+                profilesDirs: ["/profiles"],
+                cwd: "/cwd",
+            }),
         );
         expect(tracker.scoutingReports).toEqual(reports);
     });
 
     it("returns empty reports when no topics found", async () => {
         const dir = tmpDir();
+        const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
         mockPromptForStructured.mockResolvedValueOnce({ topics: [] });
 
-        const reports = await scoutingPhase(tracker, ["/profiles"], "Build a feature", "/cwd");
+        const reports = await scoutingPhase(tracker, ["/profiles"], "Build a feature", "/cwd", 3, workDir);
 
         expect(reports).toEqual([]);
-        expect(mockParallelAgents).not.toHaveBeenCalled();
+        expect(mockLanePoolCtor).not.toHaveBeenCalled();
     });
 
-    it("handles partial failures in parallel scouts", async () => {
+    it("handles partial failures in LanePool", async () => {
         const dir = tmpDir();
+        const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
         const topics = {
@@ -344,12 +359,36 @@ describe("scoutingPhase", () => {
         };
 
         mockPromptForStructured.mockResolvedValueOnce(topics);
-        mockParallelAgents.mockResolvedValueOnce([
-            { status: "fulfilled", value: { report: "success" } },
-            { status: "rejected", reason: new Error("scout failed") },
-        ]);
 
-        const reports = await scoutingPhase(tracker, ["/profiles"], "task", "/cwd");
+        // Override mockLanePoolRun to fail the second task
+        mockLanePoolRun.mockImplementation(async function(this: unknown) {
+            const lastCall = mockLanePoolCtor.mock.calls[mockLanePoolCtor.mock.calls.length - 1];
+            if (lastCall?.[0]) {
+                const opts = lastCall[0] as Record<string, unknown>;
+                if (opts.taskTracker && typeof (opts.taskTracker as any).getAllTasks === 'function') {
+                    const tt = opts.taskTracker as any;
+                    const allTasks = [...tt.getAllTasks()];
+                    // Complete first task successfully
+                    const claimed1 = tt.claimTasks(1);
+                    if (claimed1.length > 0) {
+                        tt.startTask(claimed1[0].id, 'mock-lane');
+                        tt.submitForReview(claimed1[0].id, { report: 'success' });
+                        tt.completeTask(claimed1[0].id);
+                    }
+                    // Fail second task
+                    const claimed2 = tt.claimTasks(1);
+                    if (claimed2.length > 0) {
+                        tt.startTask(claimed2[0].id, 'mock-lane');
+                        tt.failTask(claimed2[0].id, { error: 'scout failed' });
+                    }
+                    const doneCount = tt.getAllTasks().filter((t: any) => t.status === 'done').length;
+                    return { completedTasks: doneCount, failedTasks: 1 };
+                }
+            }
+            return { completedTasks: 0, failedTasks: 0 };
+        });
+
+        const reports = await scoutingPhase(tracker, ["/profiles"], "task", "/cwd", 3, workDir);
 
         expect(reports).toHaveLength(1);
         expect(reports[0]).toEqual({ report: "success" });
@@ -357,12 +396,13 @@ describe("scoutingPhase", () => {
 
     it("throws if scout profile not found", async () => {
         const dir = tmpDir();
+        const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
         mockLoadProfilesFromDirs.mockResolvedValueOnce(new Map()); // empty profiles
 
         await expect(
-            scoutingPhase(tracker, ["/profiles"], "task", "/cwd"),
+            scoutingPhase(tracker, ["/profiles"], "task", "/cwd", 3, workDir),
         ).rejects.toThrow('Profile "scout" not found');
     });
 });
@@ -946,7 +986,7 @@ describe("run", () => {
     it("orchestrates all phases in order", async () => {
         const workDir = tmpDir();
 
-        // scoutingPhase: topics then parallel agents
+        // scoutingPhase: topics then LanePool
         mockPromptForStructured
             // initialization: title generation
             .mockResolvedValueOnce({ title: "AI title" })
@@ -988,12 +1028,6 @@ describe("run", () => {
                 issues: [],
             });
 
-        // parallelAgents for scouting
-        mockParallelAgents
-            .mockResolvedValueOnce([
-                { status: "fulfilled", value: { report: "scouted" } },
-            ]);
-
         await run("Build a feature", {
             profilesDir: "/profiles",
             cwd: "/project",
@@ -1007,11 +1041,9 @@ describe("run", () => {
 
         expect(state.currentPhase).toBe("done");
         expect(state.completedPhases).toContain("scouting");
-        expect(state.completedPhases).toContain("scouting_review");
         expect(state.completedPhases).toContain("planning");
-        expect(state.completedPhases).toContain("plan_review");
         expect(state.completedPhases).toContain("implementing");
-        expect(state.completedPhases).toContain("final_review");
+        expect(state.completedPhases).toContain("review");
     }, 30000);
 
     it("retries scouting when not ready", async () => {
@@ -1042,9 +1074,6 @@ describe("run", () => {
                 issues: [],
             });
 
-        mockParallelAgents
-            .mockResolvedValue([{ status: "fulfilled", value: {} }]);
-
         await run("Build something", {
             profilesDir: "/profiles",
             cwd: "/project",
@@ -1052,7 +1081,7 @@ describe("run", () => {
         });
 
         // Scouting phase called twice (2 rounds)
-        expect(mockParallelAgents).toHaveBeenCalled();
+        expect(mockLanePoolCtor).toHaveBeenCalled();
 
         const raw = await fs.readFile(path.join(workDir, ".engin-state.json"), "utf-8");
         const state = JSON.parse(raw);
@@ -1137,8 +1166,6 @@ describe("run", () => {
                 overallAssessment: "ok",
                 issues: [],
             });
-
-        mockParallelAgents.mockResolvedValue([]);
 
         await run("Test task", {
             profilesDir: "/profiles",
@@ -1231,8 +1258,6 @@ describe("run", () => {
 
             return {};
         });
-
-        mockParallelAgents.mockResolvedValue([]);
 
         await run("Test", {
             profilesDir: "/profiles",

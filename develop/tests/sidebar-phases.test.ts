@@ -152,8 +152,8 @@ describe("SIDEBAR_PHASES", () => {
         const sidebarData = sidebarCalls[0];
         const phases = sidebarData.phases as Array<{ id: string; label: string; icon: string }>;
 
-        // Should have 7 entries (initialization + 6 existing)
-        expect(phases).toHaveLength(7);
+        // Should have 5 entries (initialization + 4 phases)
+        expect(phases).toHaveLength(5);
 
         // First entry must be initialization
         expect(phases[0].id).toBe("initialization");
@@ -162,11 +162,9 @@ describe("SIDEBAR_PHASES", () => {
 
         // Subsequent entries should match existing phases in order
         expect(phases[1].id).toBe("scouting");
-        expect(phases[2].id).toBe("scouting_review");
-        expect(phases[3].id).toBe("planning");
-        expect(phases[4].id).toBe("plan_review");
-        expect(phases[5].id).toBe("implementing");
-        expect(phases[6].id).toBe("final_review");
+        expect(phases[2].id).toBe("planning");
+        expect(phases[3].id).toBe("implementing");
+        expect(phases[4].id).toBe("review");
     });
 
     it("has correct structure for each entry", async () => {

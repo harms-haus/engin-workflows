@@ -282,14 +282,13 @@ describe("Workflow-level callbacks", () => {
             onStatus: { onPhaseStart },
         });
 
-        expect(onPhaseStart.mock.calls.length).toBeGreaterThanOrEqual(6);
+        expect(onPhaseStart.mock.calls.length).toBeGreaterThanOrEqual(4);
 
         const phases = onPhaseStart.mock.calls.map((call: unknown[]) => (call[0] as { phase: string }).phase);
         expect(phases).toContain("scouting");
-        expect(phases).toContain("scouting_review");
         expect(phases).toContain("planning");
-        expect(phases).toContain("plan_review");
-        expect(phases).toContain("final_review");
+        expect(phases).toContain("implementing");
+        expect(phases).toContain("review");
     });
 
     // 4. onPhaseComplete called for each phase
@@ -305,7 +304,7 @@ describe("Workflow-level callbacks", () => {
             onStatus: { onPhaseComplete },
         });
 
-        expect(onPhaseComplete.mock.calls.length).toBeGreaterThanOrEqual(6);
+        expect(onPhaseComplete.mock.calls.length).toBeGreaterThanOrEqual(4);
 
         // Each call should have a phase and durationMs
         for (const call of onPhaseComplete.mock.calls) {

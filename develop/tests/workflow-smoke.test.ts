@@ -203,11 +203,9 @@ describe("Workflow Smoke Tests", () => {
             expect(state.currentPhase).toBe("done");
             expect(state.taskPrompt).toBe("Build a simple feature");
             expect(state.completedPhases).toContain("scouting");
-            expect(state.completedPhases).toContain("scouting_review");
             expect(state.completedPhases).toContain("planning");
-            expect(state.completedPhases).toContain("plan_review");
             expect(state.completedPhases).toContain("implementing");
-            expect(state.completedPhases).toContain("final_review");
+            expect(state.completedPhases).toContain("review");
 
             // ── Verify audit.jsonl ────────────────────────────────────
             const auditPath = path.join(workDir, "audit", "audit.jsonl");
@@ -309,8 +307,10 @@ describe("Workflow Smoke Tests", () => {
         it("handles LanePool run throwing during implementation", async () => {
             const workDir = tmpDir();
 
-            // Make LanePool throw
-            mockLanePoolRun.mockRejectedValueOnce(new Error("Lane pool crashed"));
+            // Scouting LanePool succeeds, implementation LanePool throws
+            mockLanePoolRun
+                .mockResolvedValueOnce({ completedTasks: 0, failedTasks: 0 })
+                .mockRejectedValueOnce(new Error("Lane pool crashed"));
 
             // The workflow should propagate the error
             await expect(
@@ -398,14 +398,13 @@ describe("Workflow Smoke Tests", () => {
             );
 
             // ── Phase callbacks ─────────────────────────────────────
-            // 6 phases: scouting, scouting_review, planning, plan_review,
-            // implementing, final_review
+            // 4 phases: scouting, planning, implementing, review
             expect(
                 (onPhaseStart as ReturnType<typeof mock>).mock.calls.length,
-            ).toBeGreaterThanOrEqual(6);
+            ).toBeGreaterThanOrEqual(4);
             expect(
                 (onPhaseComplete as ReturnType<typeof mock>).mock.calls.length,
-            ).toBeGreaterThanOrEqual(6);
+            ).toBeGreaterThanOrEqual(4);
 
             // Verify each phase was started
             const startedPhases = (
@@ -414,11 +413,9 @@ describe("Workflow Smoke Tests", () => {
                 (call: [{ phase: string }]) => call[0].phase,
             );
             expect(startedPhases).toContain("scouting");
-            expect(startedPhases).toContain("scouting_review");
             expect(startedPhases).toContain("planning");
-            expect(startedPhases).toContain("plan_review");
             expect(startedPhases).toContain("implementing");
-            expect(startedPhases).toContain("final_review");
+            expect(startedPhases).toContain("review");
 
             // ── Agent callbacks ─────────────────────────────────────
             // At minimum: scout-coordinator, planner, final-reviewer
@@ -497,10 +494,11 @@ describe("Workflow Smoke Tests", () => {
                 onStatus: { onTaskStart, onTaskComplete, onTaskRejected },
             });
 
-            // Verify LanePool was constructed with onStatus containing task callbacks
-            expect(mockLanePoolCtor).toHaveBeenCalledTimes(1);
-            const ctorOptions = mockLanePoolCtor.mock.calls[0][0] as Record<string, unknown>;
-            const passedStatus = ctorOptions.onStatus as Record<string, unknown>;
+            // Verify LanePool was constructed (scouting + implementation)
+            expect(mockLanePoolCtor).toHaveBeenCalledTimes(2);
+            // Check the implementation LanePool (second call) for task callbacks
+            const implCtorOptions = mockLanePoolCtor.mock.calls[1][0] as Record<string, unknown>;
+            const passedStatus = implCtorOptions.onStatus as Record<string, unknown>;
             expect(typeof passedStatus.onTaskStart).toBe("function");
             expect(typeof passedStatus.onTaskComplete).toBe("function");
             expect(typeof passedStatus.onTaskRejected).toBe("function");

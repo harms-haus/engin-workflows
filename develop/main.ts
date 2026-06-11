@@ -6,8 +6,8 @@ import { resolveProfilesDirs } from "@harms-haus/engin";
 import { createHarness } from "@harms-haus/engin";
 import { promptForStructured } from "@harms-haus/engin";
 import { parallelAgents } from "@harms-haus/engin";
-import { WorkflowStatusTracker, PHASE_ORDER } from "@harms-haus/engin";
-import { LanePool } from "@harms-haus/engin";
+import { WorkflowStatusTracker } from "@harms-haus/engin";
+import { LanePool, TaskTracker } from "@harms-haus/engin";
 import { join } from "node:path";
 
 // ─── Zod Schemas ────────────────────────────────────────────────────────────
@@ -189,15 +189,17 @@ async function makeHarnessOptions(
     return { profile, cwd, apiKeys, onAgentStatus: agentCallbacks(onStatus) };
 }
 
+// ─── Develop Workflow Phase Order ───────────────────────────────────────────
+
+const PHASES: readonly Phase[] = ["scouting", "planning", "implementing", "review", "done"];
+
 // ─── Phase type (shared by run(), completePhase, executePhase) ────────────
 
 type Phase =
     | "scouting"
-    | "scouting_review"
     | "planning"
-    | "plan_review"
     | "implementing"
-    | "final_review"
+    | "review"
     | "done";
 
 // ─── Sidebar Phase Metadata ────────────────────────────────────────────────
@@ -205,11 +207,9 @@ type Phase =
 const SIDEBAR_PHASES = [
     { id: 'initialization',  label: 'Initialization',  icon: '⚙' },
     { id: 'scouting',        label: 'Scouting',        icon: '🔍' },
-    { id: 'scouting_review', label: 'Scouting Review', icon: '🔎' },
     { id: 'planning',        label: 'Planning',        icon: '📋' },
-    { id: 'plan_review',     label: 'Plan Review',     icon: '📝' },
     { id: 'implementing',    label: 'Implementing',    icon: '🔨' },
-    { id: 'final_review',    label: 'Final Review',    icon: '🔎' },
+    { id: 'review',          label: 'Review',          icon: '🔎' },
 ];
 
 function getPhaseIndicator(phase: Phase): string {
@@ -240,10 +240,9 @@ async function completePhase(
     startTime: number,
     nextPhase?: Phase,
 ): Promise<void> {
-    if (nextPhase !== undefined) {
-        tracker.setPhase(nextPhase);
-    } else {
-        tracker.advancePhase();
+    const next = nextPhase ?? PHASES[PHASES.indexOf(phase) + 1];
+    if (next) {
+        tracker.setPhase(next);
     }
     await tracker.save();
     onStatus?.onPhaseComplete?.({ phase, durationMs: Date.now() - startTime });
@@ -272,26 +271,22 @@ async function executePhase(
     signal?: AbortSignal,
 ): Promise<Phase | void> {
     const phaseStartTime = Date.now();
-    const round = (phase === "scouting" || phase === "scouting_review")
+    const round = (phase === "scouting")
         ? state.scoutingRounds
-        : (phase === "planning" || phase === "plan_review")
+        : (phase === "planning")
             ? state.planningRounds
             : 0;
     onStatus?.onPhaseStart?.({ phase, round });
     onStatus?.onSidebarUpdate?.({ indicator: getPhaseIndicator(phase) });
 
     switch (phase) {
-        // ── Scouting: run scouts, then advance to scouting_review ──
+        // ── Scouting: get topics → lane-pool scouts → review → loop if needed ──
         case "scouting": {
             state.scoutingReports = await scoutingPhase(
-                tracker, profilesDirs, taskPrompt, cwd, apiKeys, onStatus,
+                tracker, profilesDirs, taskPrompt, cwd, maxConcurrentTasks,
+                workDir, apiKeys, onStatus, signal,
             );
-            await completePhase(phase, tracker, onStatus, phaseStartTime);
-            break;
-        }
 
-        // ── Scouting Review: evaluate reports, loop back if needed ──
-        case "scouting_review": {
             const reports = state.scoutingReports.length > 0
                 ? state.scoutingReports
                 : tracker.scoutingReports;
@@ -299,7 +294,6 @@ async function executePhase(
                 tracker, profilesDirs, reports, cwd, apiKeys, onStatus,
             );
             state.scoutingRounds++;
-
             state.research = review.research;
             tracker.setResearch(state.research);
 
@@ -319,7 +313,7 @@ async function executePhase(
             break;
         }
 
-        // ── Planning: create a plan, then advance to plan_review ──
+        // ── Planning: create plan → review → loop if needed ──
         case "planning": {
             // Derive research from saved scouting reports if not yet available
             if (!state.research) {
@@ -340,12 +334,7 @@ async function executePhase(
                 state.planReviewFeedback, state.planReviewSuggestions,
                 apiKeys, onStatus,
             );
-            await completePhase(phase, tracker, onStatus, phaseStartTime);
-            break;
-        }
 
-        // ── Plan Review: evaluate the plan, loop back if needed ──
-        case "plan_review": {
             if (!state.plan) {
                 state.plan = tracker.plan as Plan | undefined;
             }
@@ -378,7 +367,7 @@ async function executePhase(
             break;
         }
 
-        // ── Implementation: run the plan tasks ──
+        // ── Implementation: run the plan tasks via lane pool ──
         case "implementing": {
             // Load plan from tracker on resume
             if (!state.plan) {
@@ -393,8 +382,8 @@ async function executePhase(
             break;
         }
 
-        // ── Final Review: quality check the result ──
-        case "final_review": {
+        // ── Review: final quality check + fixer loop ──
+        case "review": {
             await finalReviewPhase(tracker, profilesDirs, cwd, apiKeys, onStatus);
             await completePhase(phase, tracker, onStatus, phaseStartTime);
             break;
@@ -411,16 +400,19 @@ async function executePhase(
  * Scout the codebase to identify key areas of investigation.
  *
  * 1. Uses the `scout` profile to identify topics.
- * 2. For each topic, spawns a scout agent in parallel to investigate.
- * 3. Returns the collected reports.
+ * 2. For each topic, loads it as a task into a LanePool with a single scouting step.
+ * 3. Returns the collected reports from completed lanes.
  */
 export async function scoutingPhase(
     tracker: WorkflowStatusTracker,
     profilesDirs: string[],
     taskPrompt: string,
     cwd: string,
+    maxConcurrentTasks: number = 3,
+    workDir: string,
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
+    signal?: AbortSignal,
 ): Promise<unknown[]> {
     // 1. Get scouting topics
     const scoutOpts = await makeHarnessOptions(profilesDirs, "scout", cwd, apiKeys, onStatus);
@@ -443,45 +435,61 @@ export async function scoutingPhase(
     }
     onStatus?.onAgentComplete?.({ agentId: "scout-coordinator", profile: "scout", phase: "scouting" });
 
-    // 2. Spawn parallel scouts for each topic
+    // 2. Build tasks and run through a LanePool with a single scouting step
     const reports: unknown[] = [];
 
     if (topics.topics.length > 0) {
-        for (let i = 0; i < topics.topics.length; i++) {
-            onStatus?.onAgentSpawn?.({ agentId: `scout-${i}`, profile: "scout", phase: "scouting" });
-            tracker.recordAgentSpawn({ agentId: `scout-${i}`, profile: "scout", phase: "scouting" });
-            tracker.incrementAgentCount();
-        }
+        const scoutingTracker = new TaskTracker();
 
-        const scoutProfile = await getProfile(profilesDirs, "scout");
-        const scoutConfigs: HarnessCreationOptions[] = topics.topics.map(() => ({
-            profile: scoutProfile,
-            cwd,
-            apiKeys,
-            onAgentStatus: agentCallbacks(onStatus),
-        }));
-
-        const results = await parallelAgents(
-            scoutConfigs,
-            (_harness, i) => {
-                const topic = topics.topics[i];
-                return [
+        for (const topic of topics.topics) {
+            const taskId = `scout-${topic.topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}`;
+            scoutingTracker.addTask({
+                id: taskId,
+                title: topic.topic,
+                prompt: [
                     `Investigate the following area of the codebase:`,
                     "",
                     `Topic: ${topic.topic}`,
                     `Rationale: ${topic.rationale}`,
                     `Key files: ${topic.files.join(", ")}`,
                     "",
-                    "Provide a detailed report of your findings as a JSON object with a 'report' field.",
-                ].join("\n");
-            },
-        );
+                    "Provide a detailed report of your findings.",
+                ].join("\n"),
+                profile: "scout",
+                files: topic.files,
+                dependencies: [],
+                isCode: false,
+            });
 
-        for (let i = 0; i < results.length; i++) {
-            const result = results[i];
-            if (result.status === "fulfilled") {
-                reports.push(result.value);
-                onStatus?.onAgentComplete?.({ agentId: `scout-${i}`, profile: "scout", phase: "scouting" });
+            onStatus?.onAgentSpawn?.({ agentId: taskId, profile: "scout", phase: "scouting" });
+            tracker.recordAgentSpawn({ agentId: taskId, profile: "scout", phase: "scouting" });
+            tracker.incrementAgentCount();
+        }
+
+        const SCOUTING_STEPS: StepDefinition[] = [
+            { name: 'scouting', profileId: 'scout', isReadOnly: true },
+        ];
+
+        const pool = new LanePool({
+            maxConcurrentLanes: maxConcurrentTasks,
+            profilesDirs,
+            sessionBaseDir: join(workDir, 'sessions', 'scouting'),
+            cwd,
+            apiKeys,
+            onStatus,
+            auditLog: tracker.auditLog,
+            taskTracker: scoutingTracker,
+            getStepsForTask: () => SCOUTING_STEPS,
+            signal,
+        });
+
+        await pool.run();
+
+        // Collect results from completed tasks
+        for (const task of scoutingTracker.getAllTasks()) {
+            if (task.status === 'done') {
+                reports.push(task.result);
+                onStatus?.onAgentComplete?.({ agentId: task.id, profile: "scout", phase: "scouting" });
             }
         }
     }
@@ -512,8 +520,8 @@ export async function scoutingReviewPhase(
 ): Promise<ScoutingReview> {
     const opts = await makeHarnessOptions(profilesDirs, "scouting-reviewer", cwd, apiKeys, onStatus);
     const { session: harness, dispose: unsub } = await createHarness(opts);
-    onStatus?.onAgentSpawn?.({ agentId: "scouting-reviewer", profile: "scouting-reviewer", phase: "scouting_review" });
-    tracker.recordAgentSpawn({ agentId: "scouting-reviewer", profile: "scouting-reviewer", phase: "scouting_review" });
+    onStatus?.onAgentSpawn?.({ agentId: "scouting-reviewer", profile: "scouting-reviewer", phase: "scouting" });
+    tracker.recordAgentSpawn({ agentId: "scouting-reviewer", profile: "scouting-reviewer", phase: "scouting" });
     tracker.incrementAgentCount();
 
     const prompt = [
@@ -531,7 +539,7 @@ export async function scoutingReviewPhase(
     } finally {
         unsub?.();
     }
-    onStatus?.onAgentComplete?.({ agentId: "scouting-reviewer", profile: "scouting-reviewer", phase: "scouting_review" });
+    onStatus?.onAgentComplete?.({ agentId: "scouting-reviewer", profile: "scouting-reviewer", phase: "scouting" });
 
     onStatus?.onDecision?.({
         agentId: "scouting-reviewer",
@@ -634,8 +642,8 @@ export async function planReviewPhase(
 ): Promise<PlanReview> {
     const opts = await makeHarnessOptions(profilesDirs, "plan-reviewer", cwd, apiKeys, onStatus);
     const { session: harness, dispose: unsub } = await createHarness(opts);
-    onStatus?.onAgentSpawn?.({ agentId: "plan-reviewer", profile: "plan-reviewer", phase: "plan_review" });
-    tracker.recordAgentSpawn({ agentId: "plan-reviewer", profile: "plan-reviewer", phase: "plan_review" });
+    onStatus?.onAgentSpawn?.({ agentId: "plan-reviewer", profile: "plan-reviewer", phase: "planning" });
+    tracker.recordAgentSpawn({ agentId: "plan-reviewer", profile: "plan-reviewer", phase: "planning" });
     tracker.incrementAgentCount();
 
     const prompt = [
@@ -658,7 +666,7 @@ export async function planReviewPhase(
     } finally {
         unsub?.();
     }
-    onStatus?.onAgentComplete?.({ agentId: "plan-reviewer", profile: "plan-reviewer", phase: "plan_review" });
+    onStatus?.onAgentComplete?.({ agentId: "plan-reviewer", profile: "plan-reviewer", phase: "planning" });
 
     onStatus?.onDecision?.({
         agentId: "plan-reviewer",
@@ -761,8 +769,8 @@ export async function finalReviewPhase(
         // 1. Get final review assessment
         const reviewerOpts = await makeHarnessOptions(profilesDirs, "final-reviewer", cwd, apiKeys, onStatus);
         const { session: reviewerHarness, dispose: reviewerDispose } = await createHarness(reviewerOpts);
-        onStatus?.onAgentSpawn?.({ agentId: "final-reviewer", profile: "final-reviewer", phase: "final_review" });
-        tracker.recordAgentSpawn({ agentId: "final-reviewer", profile: "final-reviewer", phase: "final_review" });
+        onStatus?.onAgentSpawn?.({ agentId: "final-reviewer", profile: "final-reviewer", phase: "review" });
+        tracker.recordAgentSpawn({ agentId: "final-reviewer", profile: "final-reviewer", phase: "review" });
         tracker.incrementAgentCount();
 
         const reviewPrompt = [
@@ -777,7 +785,7 @@ export async function finalReviewPhase(
         } finally {
             reviewerDispose?.();
         }
-        onStatus?.onAgentComplete?.({ agentId: "final-reviewer", profile: "final-reviewer", phase: "final_review" });
+        onStatus?.onAgentComplete?.({ agentId: "final-reviewer", profile: "final-reviewer", phase: "review" });
 
         await tracker.auditLog.append(
             structuredOutputEvent("final-reviewer", assessment),
@@ -818,8 +826,8 @@ export async function finalReviewPhase(
         );
 
         for (let i = 0; i < criticalIssues.length; i++) {
-            onStatus?.onAgentSpawn?.({ agentId: `fixer-${i}`, profile: "fixer", phase: "final_review" });
-            tracker.recordAgentSpawn({ agentId: `fixer-${i}`, profile: "fixer", phase: "final_review" });
+            onStatus?.onAgentSpawn?.({ agentId: `fixer-${i}`, profile: "fixer", phase: "review" });
+            tracker.recordAgentSpawn({ agentId: `fixer-${i}`, profile: "fixer", phase: "review" });
             tracker.incrementAgentCount();
         }
     }
@@ -933,24 +941,28 @@ export async function run(
     };
 
     // ── Execute phases from the starting point ──────────────────────
-    let currentIndex = PHASE_ORDER.indexOf(tracker.currentPhase as Phase);
-    if (currentIndex < 0) currentIndex = 0;
+    let currentIndex = PHASES.indexOf(tracker.currentPhase as Phase);
+    if (currentIndex < 0) {
+        // Fresh tracker — set the initial phase
+        currentIndex = 0;
+        tracker.setCurrentPhase(PHASES[0]);
+    }
 
     // ── Sidebar: initial phase metadata ─────────────────────────────
     // On resume, use truncated title and skip AI generation
     if (resumed) {
         const shortTitle = taskPrompt.length > 60 ? taskPrompt.slice(0, 57) + '...' : taskPrompt;
-        onStatus?.onSidebarUpdate?.({ title: shortTitle, indicator: getPhaseIndicator(PHASE_ORDER[currentIndex] as Phase), phases: SIDEBAR_PHASES });
+        onStatus?.onSidebarUpdate?.({ title: shortTitle, indicator: getPhaseIndicator(PHASES[currentIndex] as Phase), phases: SIDEBAR_PHASES });
     } else {
         // Run AI title generation before entering the main phase loop
         onStatus?.onSidebarUpdate?.({ title: 'Initializing...', indicator: '⚙', phases: SIDEBAR_PHASES });
         const title = await initializationPhase(profilesDirs, taskPrompt, cwd, apiKeys, onStatus, tracker);
-        onStatus?.onSidebarUpdate?.({ title, indicator: getPhaseIndicator(PHASE_ORDER[currentIndex] as Phase) });
+        onStatus?.onSidebarUpdate?.({ title, indicator: getPhaseIndicator(PHASES[currentIndex] as Phase) });
     }
 
     try {
-        while (currentIndex < PHASE_ORDER.length) {
-            const phase = PHASE_ORDER[currentIndex];
+        while (currentIndex < PHASES.length) {
+            const phase = PHASES[currentIndex];
             if (phase === "done") break;
 
             // Check for cancellation before starting the next phase
@@ -963,7 +975,7 @@ export async function run(
             );
 
             if (jumpTo) {
-                currentIndex = PHASE_ORDER.indexOf(jumpTo);
+                currentIndex = PHASES.indexOf(jumpTo);
             } else {
                 currentIndex++;
             }
