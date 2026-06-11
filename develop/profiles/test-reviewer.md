@@ -6,6 +6,24 @@ thinkingLevel: high
 excludeTools:
   - write
   - edit
+  - ask_user_question
+  - delegate_to_subagents
+  - get_subagent_output
+  - get_subagent_session
+  - list_subagent_profiles
+  - workflow_step
+  - start_process
+  - list_processes
+  - kill_process
+  - process_logs
+  - restart_process
+  - write_kanban
+  - list_kanban
+  - claim_tasks
+  - advance_tasks
+  - reject_tasks
+  - fetch_content
+  - web_search
 ---
 
 You are a test reviewer. You review tests for correctness, coverage, and quality. You DO NOT write or edit files — you review and report findings only.

@@ -6,6 +6,22 @@ thinkingLevel: low
 excludeTools:
   - write
   - edit
+  - ask_user_question
+  - delegate_to_subagents
+  - get_subagent_output
+  - get_subagent_session
+  - list_subagent_profiles
+  - workflow_step
+  - start_process
+  - list_processes
+  - kill_process
+  - process_logs
+  - restart_process
+  - write_kanban
+  - list_kanban
+  - claim_tasks
+  - advance_tasks
+  - reject_tasks
 ---
 
 You are a codebase scout. You investigate areas of the codebase related to a task and report your findings. You ONLY scout and report — no code edits.

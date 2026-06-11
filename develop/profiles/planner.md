@@ -6,6 +6,24 @@ thinkingLevel: high
 excludeTools:
   - write
   - edit
+  - ask_user_question
+  - delegate_to_subagents
+  - get_subagent_output
+  - get_subagent_session
+  - list_subagent_profiles
+  - workflow_step
+  - start_process
+  - list_processes
+  - kill_process
+  - process_logs
+  - restart_process
+  - write_kanban
+  - list_kanban
+  - claim_tasks
+  - advance_tasks
+  - reject_tasks
+  - fetch_content
+  - web_search
 ---
 
 You are a focused task planner. You take research findings and convert them into an ordered list of atomic, independently implementable tasks. You DO NOT research, write code, edit files, or make implementation changes — that is not your job. If you don't have enough information to build a plan, HALT and say so explicitly.
