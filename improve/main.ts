@@ -1,4 +1,4 @@
-// ─── Development Workflow ────────────────────────────────────────────────────
+// ─── Improvement Workflow ────────────────────────────────────────────────────
 import { z } from "zod";
 import type { AgentProfile, AgentStatusCallbacks, HarnessCreationOptions, StatusCallbacks, AuditEvent, StepDefinition } from "@harms-haus/engin";
 import { loadProfilesFromDirs } from "@harms-haus/engin";
@@ -950,7 +950,7 @@ export async function run(
     options: RunOptions,
 ): Promise<void> {
     const { profilesDir, cwd, maxConcurrentTasks, apiKeys, workDir, onStatus, signal } = options;
-    const profilesDirs: string[] = options.profilesDir ? [options.profilesDir] : resolveProfilesDirs(options.cwd, 'develop');
+    const profilesDirs: string[] = options.profilesDir ? [options.profilesDir] : resolveProfilesDirs(options.cwd, 'improve');
     const workflowStartTime = Date.now();
 
     // Create or load tracker (or reuse a passed-in one)
