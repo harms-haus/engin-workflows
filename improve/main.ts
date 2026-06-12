@@ -7,7 +7,7 @@ import { createHarness } from "@harms-haus/engin";
 import { promptForStructured } from "@harms-haus/engin";
 import { parallelAgents } from "@harms-haus/engin";
 import { WorkflowStatusTracker } from "@harms-haus/engin";
-import { LanePool, TaskTracker } from "@harms-haus/engin";
+import { LanePool, TaskTracker, WorkflowTUI } from "@harms-haus/engin";
 import { join } from "node:path";
 
 // ─── Zod Schemas ────────────────────────────────────────────────────────────
@@ -129,6 +129,8 @@ export interface DevelopWorkflowOptions {
     apiKeys?: Record<string, string>;
     /** Status callbacks for agent/workflow events */
     onStatus?: StatusCallbacks;
+    /** When true, disables the TUI and uses raw status callbacks instead */
+    verbose?: boolean;
     /** Existing workDir to resume from */
     workDir?: string;
     /** Abort signal for cooperative cancellation */
@@ -949,7 +951,7 @@ export async function run(
     taskPrompt: string,
     options: RunOptions,
 ): Promise<void> {
-    const { profilesDir, cwd, maxConcurrentTasks, apiKeys, workDir, onStatus, signal } = options;
+    const { profilesDir, cwd, maxConcurrentTasks, apiKeys, workDir, onStatus, signal, verbose } = options;
     const profilesDirs: string[] = options.profilesDir ? [options.profilesDir] : resolveProfilesDirs(options.cwd, 'improve');
     const workflowStartTime = Date.now();
 
@@ -979,7 +981,18 @@ export async function run(
     tracker.setTaskPrompt(taskPrompt);
     await tracker.save();
 
-    onStatus?.onWorkflowStart?.({ taskPrompt, resumed, workDir });
+    let tui: WorkflowTUI | undefined;
+    let effectiveStatus = onStatus;
+    if (!verbose && process.stdout.isTTY) {
+        tui = new WorkflowTUI({
+            maxConcurrentLanes: maxConcurrentTasks ?? 5,
+            agentLogLines: 20,
+        });
+        tui.start();
+        effectiveStatus = tui.getStatusCallbacks();
+    }
+
+    effectiveStatus?.onWorkflowStart?.({ taskPrompt, resumed, workDir });
 
     // ── Shared mutable state that flows between phases ────────────────
     const state: RunState = {
@@ -1005,12 +1018,12 @@ export async function run(
     // On resume, use truncated title and skip AI generation
     if (resumed) {
         const shortTitle = taskPrompt.length > 60 ? taskPrompt.slice(0, 57) + '...' : taskPrompt;
-        onStatus?.onSidebarUpdate?.({ title: shortTitle, indicator: getPhaseIndicator(PHASES[currentIndex] as Phase), phases: SIDEBAR_PHASES });
+        effectiveStatus?.onSidebarUpdate?.({ title: shortTitle, indicator: getPhaseIndicator(PHASES[currentIndex] as Phase), phases: SIDEBAR_PHASES });
     } else {
         // Run AI title generation before entering the main phase loop
-        onStatus?.onSidebarUpdate?.({ title: 'Initializing...', indicator: '⚙', phases: SIDEBAR_PHASES });
-        const title = await initializationPhase(profilesDirs, taskPrompt, cwd, apiKeys, onStatus, tracker);
-        onStatus?.onSidebarUpdate?.({ title, indicator: getPhaseIndicator(PHASES[currentIndex] as Phase) });
+        effectiveStatus?.onSidebarUpdate?.({ title: 'Initializing...', indicator: '⚙', phases: SIDEBAR_PHASES });
+        const title = await initializationPhase(profilesDirs, taskPrompt, cwd, apiKeys, effectiveStatus, tracker);
+        effectiveStatus?.onSidebarUpdate?.({ title, indicator: getPhaseIndicator(PHASES[currentIndex] as Phase) });
     }
 
     try {
@@ -1024,7 +1037,7 @@ export async function run(
             }
 
             const jumpTo = await executePhase(
-                phase, state, tracker, profilesDirs, taskPrompt, cwd, maxConcurrentTasks, workDir, apiKeys, onStatus, signal,
+                phase, state, tracker, profilesDirs, taskPrompt, cwd, maxConcurrentTasks, workDir, apiKeys, effectiveStatus, signal,
             );
 
             if (jumpTo) {
@@ -1037,13 +1050,15 @@ export async function run(
         const err = error instanceof Error ? error : new Error(String(error));
         if (err.message === 'Workflow cancelled') {
             await tracker.save();
-            onStatus?.onWorkflowFailed?.({ error: err, phase: tracker.currentPhase });
+            effectiveStatus?.onWorkflowFailed?.({ error: err, phase: tracker.currentPhase });
             return;
         }
-        onStatus?.onWorkflowFailed?.({ error: err, phase: tracker.currentPhase });
+        effectiveStatus?.onWorkflowFailed?.({ error: err, phase: tracker.currentPhase });
         throw error;
+    } finally {
+        tui?.stop();
     }
 
-    onStatus?.onSidebarUpdate?.({ indicator: '✅' });
-    onStatus?.onWorkflowComplete?.({ totalDurationMs: Date.now() - workflowStartTime, agentCount: tracker.stats.agentCount });
+    effectiveStatus?.onSidebarUpdate?.({ indicator: '✅' });
+    effectiveStatus?.onWorkflowComplete?.({ totalDurationMs: Date.now() - workflowStartTime, agentCount: tracker.stats.agentCount });
 }
