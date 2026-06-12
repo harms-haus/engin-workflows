@@ -1,7 +1,7 @@
 ---
-name: implementer
-provider: zai
-model: glm-5.1
+name: implementer-lite
+provider: opencode-go
+model: mimo-v2.5
 thinkingLevel: low
 excludeTools:
   - ask_user_question

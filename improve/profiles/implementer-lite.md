@@ -2,7 +2,7 @@
 name: implementer-lite
 provider: opencode-go
 model: mimo-v2.5
-thinkingLevel: high
+thinkingLevel: medium
 excludeTools:
   - ask_user_question
   - delegate_to_subagents

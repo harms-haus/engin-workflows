@@ -1,4 +1,4 @@
-// ─── Develop Workflow Callback Tests ────────────────────────────────────────
+// ─── Debug Workflow Callback Tests ──────────────────────────────────────────
 import { describe, it, expect, mock, beforeEach, afterAll } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,6 +14,7 @@ const mockCreateHarness = mock() as ReturnType<typeof mock> & ((...args: unknown
 const mockPromptForStructured = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLoadProfiles = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
+const mockResolveProfilesDirs = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
@@ -23,6 +24,7 @@ mock.module("@harms-haus/engin", () => ({
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
     loadProfiles: (...args: unknown[]) => mockLoadProfiles(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
+    resolveProfilesDirs: (...args: unknown[]) => mockResolveProfilesDirs(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
@@ -33,7 +35,7 @@ mock.module("@harms-haus/engin", () => ({
     resolveWorkflowsDirs: mock(),
     getDefaultWorkDir: mock(),
     ensureDir: mock(),
-}))
+}));
 
 // ─── Imports (after mocks) ─────────────────────────────────────────────────
 
@@ -91,7 +93,7 @@ function makeHarnessResult() {
 function tmpDir(): string {
     return path.join(
         os.tmpdir(),
-        `develop-callbacks-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        `debug-callbacks-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
     );
 }
 
@@ -99,6 +101,7 @@ function tmpDir(): string {
 function setupHappyPathMocks() {
     mockLoadProfiles.mockResolvedValue(makeAllProfiles());
     mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
+    mockResolveProfilesDirs.mockReturnValue(["/resolved/profiles"]);
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
     mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
 
@@ -121,6 +124,7 @@ function setupHappyPathMocks() {
 function setupRunWithTaskMocks() {
     mockLoadProfiles.mockResolvedValue(makeAllProfiles());
     mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
+    mockResolveProfilesDirs.mockReturnValue(["/resolved/profiles"]);
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
     mockLanePoolRun.mockResolvedValue({ completedTasks: 1, failedTasks: 0 });
 
@@ -153,7 +157,6 @@ function setupRunWithTaskMocks() {
         .mockResolvedValueOnce({ result: { ready: true, feedback: "Plan approved", suggestions: [] }, attempts: 1 })
         // final review: clean
         .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
-
 }
 
 /** Set up mocks for a run with one task where LanePool reports a failed task
@@ -161,6 +164,7 @@ function setupRunWithTaskMocks() {
 function setupRunWithFailedTaskMocks() {
     mockLoadProfiles.mockResolvedValue(makeAllProfiles());
     mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
+    mockResolveProfilesDirs.mockReturnValue(["/resolved/profiles"]);
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
     mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 1 });
 
@@ -237,6 +241,7 @@ describe("Workflow-level callbacks", () => {
 
         mockLoadProfiles.mockResolvedValue(makeAllProfiles());
         mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
+        mockResolveProfilesDirs.mockReturnValue(["/resolved/profiles"]);
         mockCreateHarness.mockResolvedValue(makeHarnessResult());
         mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
 
@@ -364,8 +369,28 @@ describe("Workflow-level callbacks", () => {
         const workDir = tmpDir();
         mockLoadProfiles.mockResolvedValue(makeAllProfiles());
         mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
+        mockResolveProfilesDirs.mockReturnValue(["/resolved/profiles"]);
         mockCreateHarness.mockResolvedValue(makeHarnessResult());
-        mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
+        mockLanePoolRun.mockImplementation(async function(this: unknown) {
+            const lastCall = mockLanePoolCtor.mock.calls[mockLanePoolCtor.mock.calls.length - 1];
+            if (lastCall?.[0]) {
+                const opts = lastCall[0] as Record<string, unknown>;
+                if (opts.taskTracker && typeof (opts.taskTracker as any).getAllTasks === 'function') {
+                    const tt = opts.taskTracker as any;
+                    for (const task of [...tt.getAllTasks()]) {
+                        const claimed = tt.claimTasks(1);
+                        if (claimed.length > 0) {
+                            tt.startTask(claimed[0].id, 'mock-lane');
+                            tt.submitForReview(claimed[0].id, { report: `scout report for ${claimed[0].title}` });
+                            tt.completeTask(claimed[0].id);
+                        }
+                    }
+                    const doneCount = tt.getAllTasks().filter((t: any) => t.status === 'done').length;
+                    return { completedTasks: doneCount, failedTasks: 0 };
+                }
+            }
+            return { completedTasks: 0, failedTasks: 0 };
+        });
 
         mockPromptForStructured
             // initialization: title generation
@@ -399,10 +424,13 @@ describe("Workflow-level callbacks", () => {
         const spawnCalls = onAgentSpawn.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string });
         const completeCalls = onAgentComplete.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string });
 
-        // Match scout agents by profile='scout' (not agentId, since 'scouting-reviewer' also contains 'scout')
-        // Exclude the title-generator which also uses the scout profile but has its own agentId
-        const scoutSpawns = spawnCalls.filter((c) => (c.profile === "scout" || c.profile === "scout-coordinator") && c.agentId !== "title-generator");
-        const scoutCompletes = completeCalls.filter((c) => (c.profile === "scout" || c.profile === "scout-coordinator") && c.agentId !== "title-generator");
+        // Match scout agents by profile 'scout' or 'scout-coordinator', excluding title-generator
+        const scoutSpawns = spawnCalls.filter((c) =>
+            (c.profile === "scout" || c.profile === "scout-coordinator") && c.agentId !== "title-generator",
+        );
+        const scoutCompletes = completeCalls.filter((c) =>
+            (c.profile === "scout" || c.profile === "scout-coordinator") && c.agentId !== "title-generator",
+        );
 
         expect(scoutSpawns.length).toBeGreaterThanOrEqual(1);
         expect(scoutCompletes.length).toBeGreaterThanOrEqual(1);
@@ -699,6 +727,7 @@ describe("Workflow-level callbacks", () => {
 
         mockLoadProfiles.mockResolvedValue(makeAllProfiles());
         mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
+        mockResolveProfilesDirs.mockReturnValue(["/resolved/profiles"]);
         mockCreateHarness.mockResolvedValue(makeHarnessResult());
         mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
 

@@ -2,7 +2,7 @@
 name: scouting-reviewer
 provider: opencode-go
 model: mimo-v2.5
-thinkingLevel: high
+thinkingLevel: medium
 excludeTools:
   - write
   - edit

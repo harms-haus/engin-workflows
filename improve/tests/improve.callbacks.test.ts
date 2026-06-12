@@ -12,7 +12,6 @@ const realModule = Object.assign({}, await import("@harms-haus/engin"));
 
 const mockCreateHarness = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockPromptForStructured = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
-const mockParallelAgents = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLoadProfiles = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
@@ -22,7 +21,6 @@ mock.module("@harms-haus/engin", () => ({
     ...realModule,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
-    parallelAgents: (...args: unknown[]) => mockParallelAgents(...args),
     loadProfiles: (...args: unknown[]) => mockLoadProfiles(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
@@ -59,6 +57,7 @@ function makeAllProfiles(): Map<string, AgentProfile> {
     const map = new Map<string, AgentProfile>();
     const ids = [
         "scout",
+        "scout-coordinator",
         "scouting-reviewer",
         "planner",
         "plan-reviewer",
@@ -116,8 +115,6 @@ function setupHappyPathMocks() {
         .mockResolvedValueOnce({ result: { ready: true, feedback: "Plan approved", suggestions: [] }, attempts: 1 })
         // final review: clean
         .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
-
-    mockParallelAgents.mockResolvedValue([]);
 }
 
 /** Set up mocks for a run with one implementation task (approved by LanePool). */
@@ -156,9 +153,6 @@ function setupRunWithTaskMocks() {
         .mockResolvedValueOnce({ result: { ready: true, feedback: "Plan approved", suggestions: [] }, attempts: 1 })
         // final review: clean
         .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
-
-    // parallelAgents for scouting (none) and final review fixers (none)
-    mockParallelAgents.mockResolvedValue([]);
 }
 
 /** Set up mocks for a run with one task where LanePool reports a failed task
@@ -198,8 +192,6 @@ function setupRunWithFailedTaskMocks() {
         .mockResolvedValueOnce({ result: { ready: true, feedback: "Plan approved", suggestions: [] }, attempts: 1 })
         // final review: clean
         .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
-
-    mockParallelAgents.mockResolvedValue([]);
 }
 
 // ─── Setup ──────────────────────────────────────────────────────────────────
@@ -256,8 +248,6 @@ describe("Workflow-level callbacks", () => {
             .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
             // final review: clean
             .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "OK", issues: [] }, attempts: 1 });
-
-        mockParallelAgents.mockResolvedValue([]);
 
         const onWorkflowStart = mock();
         await run("Resumed task", {
@@ -395,11 +385,6 @@ describe("Workflow-level callbacks", () => {
             // final review: clean
             .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "OK", issues: [] }, attempts: 1 });
 
-        // parallelAgents for the scout
-        mockParallelAgents.mockResolvedValue([
-            { status: "fulfilled", value: { report: "scout report" } },
-        ]);
-
         const onAgentSpawn = mock();
         const onAgentComplete = mock();
         await run("Build a feature", {
@@ -413,10 +398,10 @@ describe("Workflow-level callbacks", () => {
         const spawnCalls = onAgentSpawn.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string });
         const completeCalls = onAgentComplete.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string });
 
-        // Match scout agents by profile='scout' (not agentId, since 'scouting-reviewer' also contains 'scout')
+        // Match scout agents by profile being either 'scout' or 'scout-coordinator'
         // Exclude the title-generator which also uses the scout profile but has its own agentId
-        const scoutSpawns = spawnCalls.filter((c) => c.profile === "scout" && c.agentId !== "title-generator");
-        const scoutCompletes = completeCalls.filter((c) => c.profile === "scout" && c.agentId !== "title-generator");
+        const scoutSpawns = spawnCalls.filter((c) => (c.profile === "scout" || c.profile === "scout-coordinator") && c.agentId !== "title-generator");
+        const scoutCompletes = completeCalls.filter((c) => (c.profile === "scout" || c.profile === "scout-coordinator") && c.agentId !== "title-generator");
 
         expect(scoutSpawns.length).toBeGreaterThanOrEqual(1);
         expect(scoutCompletes.length).toBeGreaterThanOrEqual(1);
@@ -727,8 +712,6 @@ describe("Workflow-level callbacks", () => {
             .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
             // final review: clean
             .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "OK", issues: [] }, attempts: 1 });
-
-        mockParallelAgents.mockResolvedValue([]);
 
         const onAgentSpawn = mock();
         await run("Resumed task", {

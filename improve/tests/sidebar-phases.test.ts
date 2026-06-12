@@ -17,7 +17,6 @@ const realEngin = Object.assign({}, await import("@harms-haus/engin"));
 
 const mockCreateHarness = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockPromptForStructured = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
-const mockParallelAgents = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
@@ -26,7 +25,6 @@ mock.module("@harms-haus/engin", () => ({
     ...realEngin,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
-    parallelAgents: (...args: unknown[]) => mockParallelAgents(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
@@ -76,6 +74,7 @@ function makeAllProfiles(): Map<string, unknown> {
     const map = new Map<string, unknown>();
     const ids = [
         "scout",
+        "scout-coordinator",
         "scouting-reviewer",
         "planner",
         "plan-reviewer",
@@ -122,7 +121,6 @@ beforeEach(() => {
     mockPromptForStructured.mockImplementation(async (_harness: unknown, text: string) => {
         return defaultPromptHandler(text);
     });
-    mockParallelAgents.mockResolvedValue([]);
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -152,19 +150,14 @@ describe("SIDEBAR_PHASES", () => {
         const sidebarData = sidebarCalls[0];
         const phases = sidebarData.phases as Array<{ id: string; label: string; icon: string }>;
 
-        // Should have 5 entries (initialization + 4 phases)
-        expect(phases).toHaveLength(5);
+        // Should have 4 entries (scouting, planning, implementing, review)
+        expect(phases).toHaveLength(4);
 
-        // First entry must be initialization
-        expect(phases[0].id).toBe("initialization");
-        expect(phases[0].label).toBe("Initialization");
-        expect(phases[0].icon).toBe("⚙");
-
-        // Subsequent entries should match existing phases in order
-        expect(phases[1].id).toBe("scouting");
-        expect(phases[2].id).toBe("planning");
-        expect(phases[3].id).toBe("implementing");
-        expect(phases[4].id).toBe("review");
+        // Entries should match phases in order (no initialization phase entry)
+        expect(phases[0].id).toBe("scouting");
+        expect(phases[1].id).toBe("planning");
+        expect(phases[2].id).toBe("implementing");
+        expect(phases[3].id).toBe("review");
     });
 
     it("has correct structure for each entry", async () => {
@@ -233,13 +226,20 @@ describe("SIDEBAR_PHASES", () => {
             .filter((data: Record<string, unknown>) => data.phases !== undefined);
 
         const phases = sidebarCalls[0].phases as Array<{ id: string; icon: string }>;
+
+        // SIDEBAR_PHASES no longer includes an initialization entry.
+        // The initialization UI (⚙ indicator, "Initializing..." title) is
+        // emitted via onSidebarUpdate directly, not as a phase entry.
+        // Verify no initialization entry exists in the phases array.
         const initPhase = phases.find((p) => p.id === "initialization");
 
-        expect(initPhase).toBeDefined();
-        expect(initPhase!.icon).toBe("⚙");
+        expect(initPhase).toBeUndefined();
 
-        // Verify it's the actual gear emoji character (U+2699)
-        expect(initPhase!.icon.codePointAt(0)).toBe(0x2699);
+        // Verify all phase icons are defined strings
+        for (const phase of phases) {
+            expect(typeof phase.icon).toBe("string");
+            expect(phase.icon.length).toBeGreaterThan(0);
+        }
     });
 });
 

@@ -14,7 +14,6 @@ const realModule = Object.assign({}, await import("@harms-haus/engin"));
 
 const mockCreateHarness = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockPromptForStructured = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
-const mockParallelAgents = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
@@ -23,7 +22,6 @@ mock.module("@harms-haus/engin", () => ({
     ...realModule,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
-    parallelAgents: (...args: unknown[]) => mockParallelAgents(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
@@ -36,7 +34,6 @@ mock.module("@harms-haus/engin", () => ({
 import {
     createHarness,
     promptForStructured,
-    parallelAgents,
     loadProfilesFromDirs,
     WorkflowStatusTracker,
 } from "@harms-haus/engin";
@@ -120,6 +117,7 @@ function makeHarnessResult() {
 function makeAllProfiles(): Map<string, AgentProfile> {
     const map = new Map<string, AgentProfile>();
     map.set("scout", SCOUT_PROFILE);
+    map.set("scout-coordinator", { ...SCOUT_PROFILE, id: "scout-coordinator", name: "Scout Coordinator" });
     map.set("scouting-reviewer", {
         ...SCOUT_PROFILE,
         id: "scouting-reviewer",
@@ -403,7 +401,7 @@ describe("scoutingPhase", () => {
 
         await expect(
             scoutingPhase(tracker, ["/profiles"], "task", "/cwd", 3, workDir),
-        ).rejects.toThrow('Profile "scout" not found');
+        ).rejects.toThrow('Profile "scout-coordinator" not found');
     });
 });
 
@@ -874,7 +872,7 @@ describe("implementationPhase", () => {
         await implementationPhase(tracker, ["/profiles"], plan, "/cwd", undefined, "/workdir");
 
         const ctorOptions = mockLanePoolCtor.mock.calls[0][0] as Record<string, unknown>;
-        expect(ctorOptions.maxConcurrentLanes).toBe(3);
+        expect(ctorOptions.maxConcurrentLanes).toBe(5);
     });
 });
 
@@ -892,7 +890,7 @@ describe("finalReviewPhase", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
 
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
 
         expect(clean).toBe(true);
         expect(mockPromptForStructured).toHaveBeenCalledTimes(1);
@@ -912,11 +910,6 @@ describe("finalReviewPhase", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
 
-        // Fixers run in parallel
-        mockParallelAgents.mockResolvedValueOnce([
-            { status: "fulfilled", value: "fixed" },
-        ]);
-
         // Second review: clean
         const secondAssessment: FinalReviewTopics = {
             topics: [],
@@ -925,11 +918,11 @@ describe("finalReviewPhase", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
 
         expect(clean).toBe(true);
         expect(mockPromptForStructured).toHaveBeenCalledTimes(2); // two review rounds
-        expect(mockParallelAgents).toHaveBeenCalledTimes(1); // one fix round
+        expect(mockLanePoolCtor).toHaveBeenCalledTimes(1); // one fix round
     });
 
     it("returns true when only minor issues found", async () => {
@@ -945,11 +938,11 @@ describe("finalReviewPhase", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
 
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
 
         expect(clean).toBe(true);
         // No fixers spawned since only minor issues
-        expect(mockParallelAgents).not.toHaveBeenCalled();
+        expect(mockLanePoolCtor).not.toHaveBeenCalled();
     });
 
     it("gives up after max fix rounds and returns false", async () => {
@@ -966,17 +959,14 @@ describe("finalReviewPhase", () => {
         };
 
         mockPromptForStructured.mockResolvedValue({ result: assessmentWithCritical, attempts: 1 });
-        mockParallelAgents.mockResolvedValue([
-            { status: "fulfilled", value: "attempted fix" },
-        ]);
 
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
 
         expect(clean).toBe(false);
         // Should have run 3 rounds of review (all rounds exhausted)
         expect(mockPromptForStructured).toHaveBeenCalledTimes(3);
         // Should have run 3 rounds of fixing (one per round with critical issues)
-        expect(mockParallelAgents).toHaveBeenCalledTimes(3);
+        expect(mockLanePoolCtor).toHaveBeenCalledTimes(3);
     });
 });
 
@@ -1055,10 +1045,8 @@ describe("run", () => {
             // scouting round 1: topics
             .mockResolvedValueOnce({ result: { topics: [{ topic: "a", rationale: "A", files: [] }] }, attempts: 1 })
             // scouting review round 1: NOT ready
-            .mockResolvedValueOnce({ result: { ready: false, research: "Partial", gaps: ["need more"] }, attempts: 1 })
-            // scouting round 2: topics
-            .mockResolvedValueOnce({ result: { topics: [{ topic: "b", rationale: "B", files: [] }] }, attempts: 1 })
-            // scouting review round 2: ready
+            .mockResolvedValueOnce({ result: { ready: false, research: "Partial", gaps: [{ topic: "need more", rationale: "Need more investigation", files: [] }] }, attempts: 1 })
+            // scouting review round 2: ready (round 2 uses gaps directly as topics, no promptForStructured for topics)
             .mockResolvedValueOnce({ result: { ready: true, research: "Complete", gaps: [] }, attempts: 1 })
             // planning
             .mockResolvedValueOnce({ result: {
@@ -1314,8 +1302,6 @@ describe("run", () => {
                 issues: [],
             }, attempts: 1 });
 
-        mockParallelAgents.mockResolvedValue([]);
-
         await run("Test task", {
             profilesDir: "/profiles",
             cwd: "/project",
@@ -1372,8 +1358,6 @@ describe("run", () => {
                 overallAssessment: "Good",
                 issues: [],
             }, attempts: 1 });
-
-        mockParallelAgents.mockResolvedValue([]);
 
         await run("Fix something", {
             profilesDir: "/profiles",

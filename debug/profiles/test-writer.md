@@ -2,7 +2,7 @@
 name: test-writer
 provider: zai
 model: glm-5.1
-thinkingLevel: low
+thinkingLevel: medium
 excludeTools:
   - ask_user_question
   - delegate_to_subagents

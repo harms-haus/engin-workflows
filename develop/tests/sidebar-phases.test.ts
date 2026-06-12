@@ -17,7 +17,6 @@ const realEngin = Object.assign({}, await import("@harms-haus/engin"));
 
 const mockCreateHarness = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockPromptForStructured = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
-const mockParallelAgents = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
@@ -26,7 +25,6 @@ mock.module("@harms-haus/engin", () => ({
     ...realEngin,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
-    parallelAgents: (...args: unknown[]) => mockParallelAgents(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
@@ -76,6 +74,7 @@ function makeAllProfiles(): Map<string, unknown> {
     const map = new Map<string, unknown>();
     const ids = [
         "scout",
+        "scout-coordinator",
         "scouting-reviewer",
         "planner",
         "plan-reviewer",
@@ -122,7 +121,6 @@ beforeEach(() => {
     mockPromptForStructured.mockImplementation(async (_harness: unknown, text: string) => {
         return defaultPromptHandler(text);
     });
-    mockParallelAgents.mockResolvedValue([]);
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

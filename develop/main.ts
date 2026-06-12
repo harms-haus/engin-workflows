@@ -5,7 +5,6 @@ import { loadProfilesFromDirs } from "@harms-haus/engin";
 import { resolveProfilesDirs } from "@harms-haus/engin";
 import { createHarness } from "@harms-haus/engin";
 import { promptForStructured } from "@harms-haus/engin";
-import { parallelAgents } from "@harms-haus/engin";
 import { WorkflowStatusTracker } from "@harms-haus/engin";
 import { LanePool, TaskTracker, WorkflowTUI } from "@harms-haus/engin";
 import { join } from "node:path";
@@ -115,6 +114,8 @@ const NON_CODE_STEPS: StepDefinition[] = [
     { name: 'execute', profileId: 'implementer', isReadOnly: false },
     { name: 'review', profileId: 'implement-reviewer', isReadOnly: true, schema: ReviewResultSchema },
 ];
+
+const FIXER_STEPS: StepDefinition[] = [{ name: 'fix', profileId: 'fixer', isReadOnly: false }];
 
 // ─── Shared Options ─────────────────────────────────────────────────────────
 
@@ -404,7 +405,7 @@ async function executePhase(
 
         // ── Review: final quality check + fixer loop ──
         case "review": {
-            await finalReviewPhase(tracker, profilesDirs, cwd, apiKeys, onStatus);
+            await finalReviewPhase(tracker, profilesDirs, cwd, workDir, maxConcurrentTasks, apiKeys, onStatus, signal);
             await completePhase(phase, tracker, onStatus, phaseStartTime);
             break;
         }
@@ -463,10 +464,10 @@ export async function scoutingPhase(
         topics = phaseOptions.topics;
     } else {
         // First round: use the scout-coordinator to determine topics
-        const scoutOpts = await makeHarnessOptions(profilesDirs, "scout", cwd, "scout-coordinator", apiKeys, onStatus);
+        const scoutOpts = await makeHarnessOptions(profilesDirs, "scout-coordinator", cwd, "scout-coordinator", apiKeys, onStatus);
         const { session: scoutHarness, dispose: scoutDispose } = await createHarness(scoutOpts);
-        onStatus?.onAgentSpawn?.({ agentId: "scout-coordinator", profile: "scout", phase: "scouting" });
-        tracker.recordAgentSpawn({ agentId: "scout-coordinator", profile: "scout", phase: "scouting" });
+        onStatus?.onAgentSpawn?.({ agentId: "scout-coordinator", profile: "scout-coordinator", phase: "scouting" });
+        tracker.recordAgentSpawn({ agentId: "scout-coordinator", profile: "scout-coordinator", phase: "scouting" });
         tracker.incrementAgentCount();
 
         let coordinatorTopics: ScoutingTopics;
@@ -481,7 +482,7 @@ export async function scoutingPhase(
         } finally {
             scoutDispose?.();
         }
-        onStatus?.onAgentComplete?.({ agentId: "scout-coordinator", profile: "scout", phase: "scouting" });
+        onStatus?.onAgentComplete?.({ agentId: "scout-coordinator", profile: "scout-coordinator", phase: "scouting" });
 
         topics = coordinatorTopics.topics;
 
@@ -830,8 +831,11 @@ export async function finalReviewPhase(
     tracker: WorkflowStatusTracker,
     profilesDirs: string[],
     cwd: string,
+    workDir: string,
+    maxConcurrentTasks: number | undefined,
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
+    signal?: AbortSignal,
 ): Promise<boolean> {
     const maxFixRounds = 3;
     let clean = false;
@@ -874,34 +878,44 @@ export async function finalReviewPhase(
             break;
         }
 
-        // Spawn fixer agents before running
+        // Create fixer tasks and run via LanePool
+        const fixerTracker = new TaskTracker();
+
         for (let i = 0; i < criticalIssues.length; i++) {
-            onStatus?.onAgentSpawn?.({ agentId: `fixer-${i}`, profile: "fixer", phase: "review" });
-            tracker.recordAgentSpawn({ agentId: `fixer-${i}`, profile: "fixer", phase: "review" });
-            tracker.incrementAgentCount();
-        }
-
-        const fixerConfigs: HarnessCreationOptions[] = await Promise.all(
-            criticalIssues.map(async (_, i) => {
-                const profile = await getProfile(profilesDirs, "fixer");
-                return { profile, cwd, apiKeys, agentId: `fixer-${i}`, onAgentStatus: agentCallbacks(onStatus) };
-            }),
-        );
-
-        await parallelAgents(
-            fixerConfigs,
-            (_harness, i) => {
-                const issue = criticalIssues[i];
-                return [
+            const issue = criticalIssues[i];
+            fixerTracker.addTask({
+                id: `fixer-${i}`,
+                title: `Fix: ${issue.description.slice(0, 100)}`,
+                prompt: [
                     "You are a fix agent. Resolve the following issue:",
                     "",
                     `File: ${issue.file}`,
                     `Issue: ${issue.description}`,
                     "",
                     "Apply the necessary fix.",
-                ].join("\n");
-            },
-        );
+                ].join("\n"),
+                profile: "fixer",
+                files: [issue.file],
+                dependencies: [],
+                isCode: true,
+            });
+        }
+
+        const pool = new LanePool({
+            maxConcurrentLanes: maxConcurrentTasks ?? 5,
+            profilesDirs,
+            sessionBaseDir: join(workDir, 'sessions', `fix-round-${round}`),
+            cwd,
+            apiKeys,
+            onStatus,
+            auditLog: tracker.auditLog,
+            taskTracker: fixerTracker,
+            getStepsForTask: () => FIXER_STEPS,
+            signal,
+        });
+
+        await pool.run();
+
     }
 
     return clean;
