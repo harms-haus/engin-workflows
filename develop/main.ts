@@ -194,11 +194,12 @@ async function makeHarnessOptions(
     profilesDirs: string[],
     profileId: string,
     cwd: string,
+    agentId: string,
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
 ): Promise<HarnessCreationOptions> {
     const profile = await getProfile(profilesDirs, profileId);
-    return { profile, cwd, apiKeys, onAgentStatus: agentCallbacks(onStatus) };
+    return { profile, cwd, apiKeys, agentId, onAgentStatus: agentCallbacks(onStatus) };
 }
 
 // ─── Develop Workflow Phase Order ───────────────────────────────────────────
@@ -462,7 +463,7 @@ export async function scoutingPhase(
         topics = phaseOptions.topics;
     } else {
         // First round: use the scout-coordinator to determine topics
-        const scoutOpts = await makeHarnessOptions(profilesDirs, "scout", cwd, apiKeys, onStatus);
+        const scoutOpts = await makeHarnessOptions(profilesDirs, "scout", cwd, "scout-coordinator", apiKeys, onStatus);
         const { session: scoutHarness, dispose: scoutDispose } = await createHarness(scoutOpts);
         onStatus?.onAgentSpawn?.({ agentId: "scout-coordinator", profile: "scout", phase: "scouting" });
         tracker.recordAgentSpawn({ agentId: "scout-coordinator", profile: "scout", phase: "scouting" });
@@ -516,10 +517,6 @@ export async function scoutingPhase(
                 dependencies: [],
                 isCode: false,
             });
-
-            onStatus?.onAgentSpawn?.({ agentId: taskId, profile: "scout", phase: "scouting" });
-            tracker.recordAgentSpawn({ agentId: taskId, profile: "scout", phase: "scouting" });
-            tracker.incrementAgentCount();
         }
 
         const SCOUTING_STEPS: StepDefinition[] = [
@@ -570,7 +567,7 @@ export async function scoutingReviewPhase(
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
 ): Promise<ScoutingReview> {
-    const opts = await makeHarnessOptions(profilesDirs, "scouting-reviewer", cwd, apiKeys, onStatus);
+    const opts = await makeHarnessOptions(profilesDirs, "scouting-reviewer", cwd, "scouting-reviewer", apiKeys, onStatus);
     const { session: harness, dispose: unsub } = await createHarness(opts);
     onStatus?.onAgentSpawn?.({ agentId: "scouting-reviewer", profile: "scouting-reviewer", phase: "scouting" });
     tracker.recordAgentSpawn({ agentId: "scouting-reviewer", profile: "scouting-reviewer", phase: "scouting" });
@@ -628,7 +625,7 @@ export async function planningPhase(
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
 ): Promise<Plan> {
-    const opts = await makeHarnessOptions(profilesDirs, "planner", cwd, apiKeys, onStatus);
+    const opts = await makeHarnessOptions(profilesDirs, "planner", cwd, "planner", apiKeys, onStatus);
     const { session: harness, dispose: unsub } = await createHarness(opts);
     onStatus?.onAgentSpawn?.({ agentId: "planner", profile: "planner", phase: "planning" });
     tracker.recordAgentSpawn({ agentId: "planner", profile: "planner", phase: "planning" });
@@ -694,7 +691,7 @@ export async function planReviewPhase(
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
 ): Promise<PlanReview> {
-    const opts = await makeHarnessOptions(profilesDirs, "plan-reviewer", cwd, apiKeys, onStatus);
+    const opts = await makeHarnessOptions(profilesDirs, "plan-reviewer", cwd, "plan-reviewer", apiKeys, onStatus);
     const { session: harness, dispose: unsub } = await createHarness(opts);
     onStatus?.onAgentSpawn?.({ agentId: "plan-reviewer", profile: "plan-reviewer", phase: "planning" });
     tracker.recordAgentSpawn({ agentId: "plan-reviewer", profile: "plan-reviewer", phase: "planning" });
@@ -821,7 +818,7 @@ export async function finalReviewPhase(
 
     for (let round = 0; round < maxFixRounds; round++) {
         // 1. Get final review assessment
-        const reviewerOpts = await makeHarnessOptions(profilesDirs, "final-reviewer", cwd, apiKeys, onStatus);
+        const reviewerOpts = await makeHarnessOptions(profilesDirs, "final-reviewer", cwd, "final-reviewer", apiKeys, onStatus);
         const { session: reviewerHarness, dispose: reviewerDispose } = await createHarness(reviewerOpts);
         onStatus?.onAgentSpawn?.({ agentId: "final-reviewer", profile: "final-reviewer", phase: "review" });
         tracker.recordAgentSpawn({ agentId: "final-reviewer", profile: "final-reviewer", phase: "review" });
@@ -857,10 +854,17 @@ export async function finalReviewPhase(
             break;
         }
 
+        // Spawn fixer agents before running
+        for (let i = 0; i < criticalIssues.length; i++) {
+            onStatus?.onAgentSpawn?.({ agentId: `fixer-${i}`, profile: "fixer", phase: "review" });
+            tracker.recordAgentSpawn({ agentId: `fixer-${i}`, profile: "fixer", phase: "review" });
+            tracker.incrementAgentCount();
+        }
+
         const fixerConfigs: HarnessCreationOptions[] = await Promise.all(
-            criticalIssues.map(async () => {
+            criticalIssues.map(async (_, i) => {
                 const profile = await getProfile(profilesDirs, "fixer");
-                return { profile, cwd, apiKeys, onAgentStatus: agentCallbacks(onStatus) };
+                return { profile, cwd, apiKeys, agentId: `fixer-${i}`, onAgentStatus: agentCallbacks(onStatus) };
             }),
         );
 
@@ -878,12 +882,6 @@ export async function finalReviewPhase(
                 ].join("\n");
             },
         );
-
-        for (let i = 0; i < criticalIssues.length; i++) {
-            onStatus?.onAgentSpawn?.({ agentId: `fixer-${i}`, profile: "fixer", phase: "review" });
-            tracker.recordAgentSpawn({ agentId: `fixer-${i}`, profile: "fixer", phase: "review" });
-            tracker.incrementAgentCount();
-        }
     }
 
     return clean;
@@ -904,7 +902,7 @@ async function initializationPhase(
     tracker: WorkflowStatusTracker,
 ): Promise<string> {
     try {
-        const opts = await makeHarnessOptions(profilesDirs, 'scout', cwd, apiKeys, onStatus);
+        const opts = await makeHarnessOptions(profilesDirs, 'scout', cwd, 'title-generator', apiKeys, onStatus);
         const { session, dispose } = await createHarness(opts);
         onStatus?.onAgentSpawn?.({ agentId: 'title-generator', profile: 'scout', phase: 'initialization' });
         tracker.recordAgentSpawn({ agentId: 'title-generator', profile: 'scout', phase: 'initialization' });
