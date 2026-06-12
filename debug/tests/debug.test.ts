@@ -428,7 +428,7 @@ describe("scoutingPhase", () => {
 
         await expect(
             scoutingPhase(tracker, ["/profiles"], "task", "/cwd", 3, workDir),
-        ).rejects.toThrow('Profile "scout" not found');
+        ).rejects.toThrow('Profile "scout-coordinator" not found');
     });
 
     it("defaults maxConcurrentTasks to 3 when not specified", async () => {
@@ -915,7 +915,7 @@ describe("finalReviewPhase", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
 
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir");
 
         expect(clean).toBe(true);
         // Only one review round — no fixers spawned since only minor issues
@@ -944,7 +944,7 @@ describe("finalReviewPhase", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir");
 
         expect(clean).toBe(true);
         // Two review rounds
@@ -985,7 +985,7 @@ describe("finalReviewPhase", () => {
 
         mockPromptForStructured.mockResolvedValue({ result: assessmentWithCritical, attempts: 1 });
 
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir");
 
         expect(clean).toBe(false);
         // Should have run 3 rounds of review (all rounds exhausted)
@@ -1011,7 +1011,7 @@ describe("finalReviewPhase", () => {
         // If finalReviewPhase tried to call parallelAgents, it would get
         // the real module's version, but since our test verifies it uses
         // LanePool instead, this confirms no parallelAgents usage.
-        await finalReviewPhase(tracker, ["/profiles"], "/cwd");
+        await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir");
 
         // The key verification: LanePool should have been used for fixing
         // not parallelAgents. We can't directly check that parallelAgents
@@ -1047,10 +1047,10 @@ describe("finalReviewPhase", () => {
             tracker,
             ["/profiles"],
             "/cwd",
-            undefined,
-            undefined,
             "/workdir",
             3,
+            undefined,
+            undefined,
             controller.signal,
         );
 
@@ -1289,9 +1289,7 @@ describe("run", () => {
             .mockResolvedValueOnce({ result: { topics: [{ topic: "a", rationale: "A", files: [] }] }, attempts: 1 })
             // scouting review round 1: NOT ready
             .mockResolvedValueOnce({ result: { ready: false, research: "Partial", gaps: [{ topic: "need more", rationale: "gaps", files: [] }] }, attempts: 1 })
-            // scouting round 2
-            .mockResolvedValueOnce({ result: { topics: [{ topic: "b", rationale: "B", files: [] }] }, attempts: 1 })
-            // scouting review round 2: ready
+            // scouting review round 2: ready (scout-coordinator skipped because gaps exist)
             .mockResolvedValueOnce({ result: { ready: true, research: "Complete", gaps: [] }, attempts: 1 })
             // planning
             .mockResolvedValueOnce({ result: { tasks: [], strategy: "No tasks needed" }, attempts: 1 })
