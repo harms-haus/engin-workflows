@@ -102,35 +102,35 @@ function makeAllProfiles(): Map<string, unknown> {
 function defaultPromptHandler(text: string): unknown {
     // Title generator (initialization phase)
     if (text.includes("title generator") || text.includes("3-8 word title")) {
-        return { title: "Refactor auth module" };
+        return { result: { title: "Refactor auth module" }, attempts: 1 };
     }
 
     // Scouting coordinator: identify topics
     if (text.includes("codebase scout") || text.includes("Identify key areas")) {
-        return { topics: [] };
+        return { result: { topics: [] }, attempts: 1 };
     }
 
     // Scouting review
     if (text.includes("reviewing scouting reports")) {
-        return { ready: true, research: "All scouted", gaps: [] };
+        return { result: { ready: true, research: "All scouted", gaps: [] }, attempts: 1 };
     }
 
     // Planning
     if (text.includes("planning agent")) {
-        return { tasks: [], strategy: "none" };
+        return { result: { tasks: [], strategy: "none" }, attempts: 1 };
     }
 
     // Plan review
     if (text.includes("reviewing an implementation plan")) {
-        return { ready: true, feedback: "OK", suggestions: [] };
+        return { result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 };
     }
 
     // Final quality review
     if (text.includes("final quality review")) {
-        return { topics: [], overallAssessment: "Good", issues: [] };
+        return { result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 };
     }
 
-    return {};
+    return { result: {}, attempts: 1 };
 }
 
 // ─── Setup ──────────────────────────────────────────────────────────────────
@@ -289,25 +289,25 @@ describe("Initialization Phase on Resume", () => {
             }
             // Scouting topics
             if (text.includes("codebase scout") || text.includes("Identify key areas")) {
-                return { topics: [] };
+                return { result: { topics: [] }, attempts: 1 };
             }
             // Scouting review
             if (text.includes("reviewing scouting reports")) {
-                return { ready: true, research: "Resumed", gaps: [] };
+                return { result: { ready: true, research: "Resumed", gaps: [] }, attempts: 1 };
             }
             // Planning
             if (text.includes("planning agent")) {
-                return { tasks: [], strategy: "none" };
+                return { result: { tasks: [], strategy: "none" }, attempts: 1 };
             }
             // Plan review
             if (text.includes("reviewing an implementation plan")) {
-                return { ready: true, feedback: "OK", suggestions: [] };
+                return { result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 };
             }
             // Final quality review
             if (text.includes("final quality review")) {
-                return { topics: [], overallAssessment: "Good", issues: [] };
+                return { result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 };
             }
-            return {};
+            return { result: {}, attempts: 1 };
         });
 
         await run("Resumed task", {
@@ -338,25 +338,25 @@ describe("Initialization Phase on Resume", () => {
         mockPromptForStructured.mockImplementation(async (_harness: unknown, text: string) => {
             // Scouting topics
             if (text.includes("codebase scout") || text.includes("Identify key areas")) {
-                return { topics: [] };
+                return { result: { topics: [] }, attempts: 1 };
             }
             // Scouting review
             if (text.includes("reviewing scouting reports")) {
-                return { ready: true, research: "Resumed", gaps: [] };
+                return { result: { ready: true, research: "Resumed", gaps: [] }, attempts: 1 };
             }
             // Planning
             if (text.includes("planning agent")) {
-                return { tasks: [], strategy: "none" };
+                return { result: { tasks: [], strategy: "none" }, attempts: 1 };
             }
             // Plan review
             if (text.includes("reviewing an implementation plan")) {
-                return { ready: true, feedback: "OK", suggestions: [] };
+                return { result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 };
             }
             // Final quality review
             if (text.includes("final quality review")) {
-                return { topics: [], overallAssessment: "Good", issues: [] };
+                return { result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 };
             }
-            return {};
+            return { result: {}, attempts: 1 };
         });
 
         mockParallelAgents.mockResolvedValue([]);

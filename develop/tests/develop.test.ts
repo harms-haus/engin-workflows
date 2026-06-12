@@ -312,7 +312,7 @@ describe("scoutingPhase", () => {
         };
 
         // First call for topics; LanePool mock processes tasks automatically
-        mockPromptForStructured.mockResolvedValueOnce(topics);
+        mockPromptForStructured.mockResolvedValueOnce({ result: topics, attempts: 1 });
 
         const reports = await scoutingPhase(tracker, ["/profiles"], "Build a feature", "/cwd", 3, workDir);
 
@@ -338,7 +338,7 @@ describe("scoutingPhase", () => {
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        mockPromptForStructured.mockResolvedValueOnce({ topics: [] });
+        mockPromptForStructured.mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 });
 
         const reports = await scoutingPhase(tracker, ["/profiles"], "Build a feature", "/cwd", 3, workDir);
 
@@ -358,7 +358,7 @@ describe("scoutingPhase", () => {
             ],
         };
 
-        mockPromptForStructured.mockResolvedValueOnce(topics);
+        mockPromptForStructured.mockResolvedValueOnce({ result: topics, attempts: 1 });
 
         // Override mockLanePoolRun to fail the second task
         mockLanePoolRun.mockImplementation(async function(this: unknown) {
@@ -419,7 +419,7 @@ describe("scoutingReviewPhase", () => {
             research: "All areas investigated thoroughly",
             gaps: [],
         };
-        mockPromptForStructured.mockResolvedValueOnce(reviewResult);
+        mockPromptForStructured.mockResolvedValueOnce({ result: reviewResult, attempts: 1 });
 
         const result = await scoutingReviewPhase(
             tracker,
@@ -441,7 +441,7 @@ describe("scoutingReviewPhase", () => {
             research: "Partial findings",
             gaps: ["Need to investigate test coverage"],
         };
-        mockPromptForStructured.mockResolvedValueOnce(reviewResult);
+        mockPromptForStructured.mockResolvedValueOnce({ result: reviewResult, attempts: 1 });
 
         const result = await scoutingReviewPhase(
             tracker,
@@ -497,7 +497,7 @@ describe("planningPhase", () => {
             strategy: "Implement core first, then tests",
         };
 
-        mockPromptForStructured.mockResolvedValueOnce(plan);
+        mockPromptForStructured.mockResolvedValueOnce({ result: plan, attempts: 1 });
 
         const result = await planningPhase(
             tracker,
@@ -532,7 +532,7 @@ describe("planningPhase", () => {
             strategy: "Improved plan",
         };
 
-        mockPromptForStructured.mockResolvedValueOnce(plan);
+        mockPromptForStructured.mockResolvedValueOnce({ result: plan, attempts: 1 });
 
         await planningPhase(
             tracker,
@@ -577,7 +577,7 @@ describe("planReviewPhase", () => {
             feedback: "Plan is solid and well-structured",
             suggestions: [],
         };
-        mockPromptForStructured.mockResolvedValueOnce(review);
+        mockPromptForStructured.mockResolvedValueOnce({ result: review, attempts: 1 });
 
         const result = await planReviewPhase(
             tracker,
@@ -606,7 +606,7 @@ describe("planReviewPhase", () => {
             feedback: "Plan has no tasks",
             suggestions: ["Add concrete implementation tasks"],
         };
-        mockPromptForStructured.mockResolvedValueOnce(review);
+        mockPromptForStructured.mockResolvedValueOnce({ result: review, attempts: 1 });
 
         const result = await planReviewPhase(
             tracker,
@@ -890,7 +890,7 @@ describe("finalReviewPhase", () => {
             overallAssessment: "Code looks good",
             issues: [],
         };
-        mockPromptForStructured.mockResolvedValueOnce(assessment);
+        mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
 
@@ -910,7 +910,7 @@ describe("finalReviewPhase", () => {
                 { file: "src/a.ts", description: "Bug", severity: "critical" },
             ],
         };
-        mockPromptForStructured.mockResolvedValueOnce(firstAssessment);
+        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
 
         // Fixers run in parallel
         mockParallelAgents.mockResolvedValueOnce([
@@ -923,7 +923,7 @@ describe("finalReviewPhase", () => {
             overallAssessment: "All fixed",
             issues: [],
         };
-        mockPromptForStructured.mockResolvedValueOnce(secondAssessment);
+        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
 
@@ -943,7 +943,7 @@ describe("finalReviewPhase", () => {
                 { file: "src/a.ts", description: "Formatting", severity: "minor" },
             ],
         };
-        mockPromptForStructured.mockResolvedValueOnce(assessment);
+        mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
 
@@ -965,7 +965,7 @@ describe("finalReviewPhase", () => {
             ],
         };
 
-        mockPromptForStructured.mockResolvedValue(assessmentWithCritical);
+        mockPromptForStructured.mockResolvedValue({ result: assessmentWithCritical, attempts: 1 });
         mockParallelAgents.mockResolvedValue([
             { status: "fulfilled", value: "attempted fix" },
         ]);
@@ -989,19 +989,19 @@ describe("run", () => {
         // scoutingPhase: topics then LanePool
         mockPromptForStructured
             // initialization: title generation
-            .mockResolvedValueOnce({ title: "AI title" })
+            .mockResolvedValueOnce({ result: { title: "AI title" }, attempts: 1 })
             // scouting: topics
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 topics: [{ topic: "core", rationale: "Core module", files: ["src/core.ts"] }],
-            })
+            }, attempts: 1 })
             // scoutingReview: ready
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 ready: true,
                 research: "Found everything",
                 gaps: [],
-            })
+            }, attempts: 1 })
             // planning
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 tasks: [
                     {
                         id: "t1",
@@ -1014,19 +1014,19 @@ describe("run", () => {
                     },
                 ],
                 strategy: "Direct approach",
-            })
+            }, attempts: 1 })
             // planReview: approved
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 ready: true,
                 feedback: "Plan approved",
                 suggestions: [],
-            })
+            }, attempts: 1 })
             // finalReview: clean
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 topics: [],
                 overallAssessment: "Everything looks great",
                 issues: [],
-            });
+            }, attempts: 1 });
 
         await run("Build a feature", {
             profilesDir: "/profiles",
@@ -1051,28 +1051,28 @@ describe("run", () => {
 
         mockPromptForStructured
             // initialization: title generation
-            .mockResolvedValueOnce({ title: "AI title" })
+            .mockResolvedValueOnce({ result: { title: "AI title" }, attempts: 1 })
             // scouting round 1: topics
-            .mockResolvedValueOnce({ topics: [{ topic: "a", rationale: "A", files: [] }] })
+            .mockResolvedValueOnce({ result: { topics: [{ topic: "a", rationale: "A", files: [] }] }, attempts: 1 })
             // scouting review round 1: NOT ready
-            .mockResolvedValueOnce({ ready: false, research: "Partial", gaps: ["need more"] })
+            .mockResolvedValueOnce({ result: { ready: false, research: "Partial", gaps: ["need more"] }, attempts: 1 })
             // scouting round 2: topics
-            .mockResolvedValueOnce({ topics: [{ topic: "b", rationale: "B", files: [] }] })
+            .mockResolvedValueOnce({ result: { topics: [{ topic: "b", rationale: "B", files: [] }] }, attempts: 1 })
             // scouting review round 2: ready
-            .mockResolvedValueOnce({ ready: true, research: "Complete", gaps: [] })
+            .mockResolvedValueOnce({ result: { ready: true, research: "Complete", gaps: [] }, attempts: 1 })
             // planning
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 tasks: [],
                 strategy: "No tasks needed",
-            })
+            }, attempts: 1 })
             // plan review
-            .mockResolvedValueOnce({ ready: true, feedback: "OK", suggestions: [] })
+            .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
             // final review
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 topics: [],
                 overallAssessment: "Good",
                 issues: [],
-            });
+            }, attempts: 1 });
 
         await run("Build something", {
             profilesDir: "/profiles",
@@ -1093,24 +1093,24 @@ describe("run", () => {
 
         mockPromptForStructured
             // initialization: title generation
-            .mockResolvedValueOnce({ title: "AI title" })
+            .mockResolvedValueOnce({ result: { title: "AI title" }, attempts: 1 })
             // scouting
-            .mockResolvedValueOnce({ topics: [] })
+            .mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 })
             // scouting review: ready
-            .mockResolvedValueOnce({ ready: true, research: "Done", gaps: [] })
+            .mockResolvedValueOnce({ result: { ready: true, research: "Done", gaps: [] }, attempts: 1 })
             // planning round 1
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 tasks: [],
                 strategy: "Bad plan",
-            })
+            }, attempts: 1 })
             // plan review round 1: rejected
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 ready: false,
                 feedback: "Plan is too vague",
                 suggestions: ["Add tasks"],
-            })
+            }, attempts: 1 })
             // planning round 2
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 tasks: [
                     {
                         id: "t1",
@@ -1123,15 +1123,15 @@ describe("run", () => {
                     },
                 ],
                 strategy: "Better plan",
-            })
+            }, attempts: 1 })
             // plan review round 2: approved
-            .mockResolvedValueOnce({ ready: true, feedback: "Better", suggestions: [] })
+            .mockResolvedValueOnce({ result: { ready: true, feedback: "Better", suggestions: [] }, attempts: 1 })
             // final review
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 topics: [],
                 overallAssessment: "Good",
                 issues: [],
-            });
+            }, attempts: 1 });
 
         await run("Fix the bug", {
             profilesDir: "/profiles",
@@ -1156,16 +1156,16 @@ describe("run", () => {
 
         mockPromptForStructured
             // initialization: title generation
-            .mockResolvedValueOnce({ title: "AI title" })
-            .mockResolvedValueOnce({ topics: [] })
-            .mockResolvedValueOnce({ ready: true, research: "ok", gaps: [] })
-            .mockResolvedValueOnce({ tasks: [], strategy: "none" })
-            .mockResolvedValueOnce({ ready: true, feedback: "ok", suggestions: [] })
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: { title: "AI title" }, attempts: 1 })
+            .mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 })
+            .mockResolvedValueOnce({ result: { ready: true, research: "ok", gaps: [] }, attempts: 1 })
+            .mockResolvedValueOnce({ result: { tasks: [], strategy: "none" }, attempts: 1 })
+            .mockResolvedValueOnce({ result: { ready: true, feedback: "ok", suggestions: [] }, attempts: 1 })
+            .mockResolvedValueOnce({ result: {
                 topics: [],
                 overallAssessment: "ok",
                 issues: [],
-            });
+            }, attempts: 1 });
 
         await run("Test task", {
             profilesDir: "/profiles",
@@ -1191,9 +1191,9 @@ describe("run", () => {
         // Setup mocks for planning and beyond
         mockPromptForStructured
             // scouting review (to get research)
-            .mockResolvedValueOnce({ ready: true, research: "From saved reports", gaps: [] })
+            .mockResolvedValueOnce({ result: { ready: true, research: "From saved reports", gaps: [] }, attempts: 1 })
             // planning
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 tasks: [
                     {
                         id: "t1",
@@ -1206,15 +1206,15 @@ describe("run", () => {
                     },
                 ],
                 strategy: "Strategy",
-            })
+            }, attempts: 1 })
             // plan review
-            .mockResolvedValueOnce({ ready: true, feedback: "OK", suggestions: [] })
+            .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
             // final review
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 topics: [],
                 overallAssessment: "Done",
                 issues: [],
-            });
+            }, attempts: 1 });
 
         await run("Resumed task", {
             profilesDir: "/profiles",
@@ -1244,19 +1244,19 @@ describe("run", () => {
             }
 
             // initialization: title generation
-            if (promptForStructuredCallCount === 1) return { title: "AI title" };
+            if (promptForStructuredCallCount === 1) return { result: { title: "AI title" }, attempts: 1 };
             // scouting topics
-            if (promptForStructuredCallCount === 2) return { topics: [] };
+            if (promptForStructuredCallCount === 2) return { result: { topics: [] }, attempts: 1 };
             // scouting review
-            if (promptForStructuredCallCount === 3) return { ready: true, research: "ok", gaps: [] };
+            if (promptForStructuredCallCount === 3) return { result: { ready: true, research: "ok", gaps: [] }, attempts: 1 };
             // planning
-            if (promptForStructuredCallCount === 4) return { tasks: [], strategy: "none" };
+            if (promptForStructuredCallCount === 4) return { result: { tasks: [], strategy: "none" }, attempts: 1 };
             // plan review
-            if (promptForStructuredCallCount === 5) return { ready: true, feedback: "ok", suggestions: [] };
+            if (promptForStructuredCallCount === 5) return { result: { ready: true, feedback: "ok", suggestions: [] }, attempts: 1 };
             // final review
-            if (promptForStructuredCallCount === 6) return { topics: [], overallAssessment: "ok", issues: [] };
+            if (promptForStructuredCallCount === 6) return { result: { topics: [], overallAssessment: "ok", issues: [] }, attempts: 1 };
 
-            return {};
+            return { result: {}, attempts: 1 };
         });
 
         await run("Test", {
@@ -1276,22 +1276,22 @@ describe("run", () => {
 
         mockPromptForStructured
             // initialization: title generation
-            .mockResolvedValueOnce({ title: "AI title" })
-            .mockResolvedValueOnce({ topics: [] })
-            .mockResolvedValueOnce({ ready: true, research: "Done", gaps: [] })
+            .mockResolvedValueOnce({ result: { title: "AI title" }, attempts: 1 })
+            .mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 })
+            .mockResolvedValueOnce({ result: { ready: true, research: "Done", gaps: [] }, attempts: 1 })
             // planning round 1
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 tasks: [],
                 strategy: "Weak plan",
-            })
+            }, attempts: 1 })
             // plan review round 1: rejected
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 ready: false,
                 feedback: "Plan is too vague",
                 suggestions: ["Add tasks"],
-            })
+            }, attempts: 1 })
             // planning round 2
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 tasks: [
                     {
                         id: "t1",
@@ -1304,15 +1304,15 @@ describe("run", () => {
                     },
                 ],
                 strategy: "Better plan",
-            })
+            }, attempts: 1 })
             // plan review round 2: approved
-            .mockResolvedValueOnce({ ready: true, feedback: "Plan approved", suggestions: [] })
+            .mockResolvedValueOnce({ result: { ready: true, feedback: "Plan approved", suggestions: [] }, attempts: 1 })
             // final review
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 topics: [],
                 overallAssessment: "Good",
                 issues: [],
-            });
+            }, attempts: 1 });
 
         mockParallelAgents.mockResolvedValue([]);
 
@@ -1335,22 +1335,22 @@ describe("run", () => {
 
         mockPromptForStructured
             // initialization: title generation
-            .mockResolvedValueOnce({ title: "AI title" })
-            .mockResolvedValueOnce({ topics: [] })
-            .mockResolvedValueOnce({ ready: true, research: "Done", gaps: [] })
+            .mockResolvedValueOnce({ result: { title: "AI title" }, attempts: 1 })
+            .mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 })
+            .mockResolvedValueOnce({ result: { ready: true, research: "Done", gaps: [] }, attempts: 1 })
             // planning round 1
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 tasks: [],
                 strategy: "Bad plan",
-            })
+            }, attempts: 1 })
             // plan review round 1: rejected
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 ready: false,
                 feedback: "Plan is too vague",
                 suggestions: ["Add tasks"],
-            })
+            }, attempts: 1 })
             // planning round 2
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 tasks: [
                     {
                         id: "t1",
@@ -1363,15 +1363,15 @@ describe("run", () => {
                     },
                 ],
                 strategy: "Better plan",
-            })
+            }, attempts: 1 })
             // plan review round 2: approved
-            .mockResolvedValueOnce({ ready: true, feedback: "Improved", suggestions: [] })
+            .mockResolvedValueOnce({ result: { ready: true, feedback: "Improved", suggestions: [] }, attempts: 1 })
             // final review
-            .mockResolvedValueOnce({
+            .mockResolvedValueOnce({ result: {
                 topics: [],
                 overallAssessment: "Good",
                 issues: [],
-            });
+            }, attempts: 1 });
 
         mockParallelAgents.mockResolvedValue([]);
 
@@ -1395,25 +1395,25 @@ describe("run", () => {
 
         mockPromptForStructured
             // initialization: title generation
-            .mockResolvedValueOnce({ title: "AI title" })
+            .mockResolvedValueOnce({ result: { title: "AI title" }, attempts: 1 })
             // scouting
-            .mockResolvedValueOnce({ topics: [] })
+            .mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 })
             // scouting review: ready
-            .mockResolvedValueOnce({ ready: true, research: "Done", gaps: [] })
+            .mockResolvedValueOnce({ result: { ready: true, research: "Done", gaps: [] }, attempts: 1 })
             // planning round 1
-            .mockResolvedValueOnce({ tasks: [], strategy: "Bad" })
+            .mockResolvedValueOnce({ result: { tasks: [], strategy: "Bad" }, attempts: 1 })
             // plan review round 1: rejected
-            .mockResolvedValueOnce({ ready: false, feedback: "Vague", suggestions: ["Add tasks"] })
+            .mockResolvedValueOnce({ result: { ready: false, feedback: "Vague", suggestions: ["Add tasks"] }, attempts: 1 })
             // planning round 2
-            .mockResolvedValueOnce({ tasks: [], strategy: "Still bad" })
+            .mockResolvedValueOnce({ result: { tasks: [], strategy: "Still bad" }, attempts: 1 })
             // plan review round 2: rejected
-            .mockResolvedValueOnce({ ready: false, feedback: "Still vague", suggestions: ["More detail"] })
+            .mockResolvedValueOnce({ result: { ready: false, feedback: "Still vague", suggestions: ["More detail"] }, attempts: 1 })
             // planning round 3
-            .mockResolvedValueOnce({ tasks: [], strategy: "Better" })
+            .mockResolvedValueOnce({ result: { tasks: [], strategy: "Better" }, attempts: 1 })
             // plan review round 3: rejected (exhausted)
-            .mockResolvedValueOnce({ ready: false, feedback: "Not good enough", suggestions: [] })
+            .mockResolvedValueOnce({ result: { ready: false, feedback: "Not good enough", suggestions: [] }, attempts: 1 })
             // final review
-            .mockResolvedValueOnce({ topics: [], overallAssessment: "ok", issues: [] });
+            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "ok", issues: [] }, attempts: 1 });
 
         await run("Fix something", {
             profilesDir: "/profiles",

@@ -474,7 +474,7 @@ export async function scoutingPhase(
                 `Task: ${taskPrompt}`,
             ].join("\n");
 
-            coordinatorTopics = await promptForStructured(scoutHarness, topicPrompt, ScoutingTopicSchema);
+            ({ result: coordinatorTopics } = await promptForStructured(scoutHarness, topicPrompt, ScoutingTopicSchema));
         } finally {
             scoutDispose?.();
         }
@@ -587,7 +587,7 @@ export async function scoutingReviewPhase(
 
     let review: ScoutingReview;
     try {
-        review = await promptForStructured(harness, prompt, ScoutingReviewSchema);
+        ({ result: review } = await promptForStructured(harness, prompt, ScoutingReviewSchema));
     } finally {
         unsub?.();
     }
@@ -662,7 +662,7 @@ export async function planningPhase(
 
     let plan: Plan;
     try {
-        plan = await promptForStructured(harness, prompt, PlanSchema);
+        ({ result: plan } = await promptForStructured(harness, prompt, PlanSchema));
     } finally {
         unsub?.();
     }
@@ -714,7 +714,7 @@ export async function planReviewPhase(
 
     let review: PlanReview;
     try {
-        review = await promptForStructured(harness, prompt, PlanReviewSchema);
+        ({ result: review } = await promptForStructured(harness, prompt, PlanReviewSchema));
     } finally {
         unsub?.();
     }
@@ -833,7 +833,7 @@ export async function finalReviewPhase(
 
         let assessment: FinalReviewTopics;
         try {
-            assessment = await promptForStructured(reviewerHarness, reviewPrompt, FinalReviewTopicsSchema);
+            ({ result: assessment } = await promptForStructured(reviewerHarness, reviewPrompt, FinalReviewTopicsSchema));
         } finally {
             reviewerDispose?.();
         }
@@ -918,7 +918,7 @@ async function initializationPhase(
 
         let result: { title: string };
         try {
-            result = await promptForStructured(session, prompt, TitleSchema);
+            ({ result } = await promptForStructured(session, prompt, TitleSchema));
         } finally {
             dispose?.();
         }

@@ -105,17 +105,17 @@ function setupHappyPathMocks() {
 
     mockPromptForStructured
         // initialization: title generation
-        .mockResolvedValueOnce({ title: "AI generated title" })
+        .mockResolvedValueOnce({ result: { title: "AI generated title" }, attempts: 1 })
         // scouting: topics (empty)
-        .mockResolvedValueOnce({ topics: [] })
+        .mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 })
         // scouting review: ready
-        .mockResolvedValueOnce({ ready: true, research: "All scouted", gaps: [] })
+        .mockResolvedValueOnce({ result: { ready: true, research: "All scouted", gaps: [] }, attempts: 1 })
         // planning
-        .mockResolvedValueOnce({ tasks: [], strategy: "none" })
+        .mockResolvedValueOnce({ result: { tasks: [], strategy: "none" }, attempts: 1 })
         // plan review: approved
-        .mockResolvedValueOnce({ ready: true, feedback: "Plan approved", suggestions: [] })
+        .mockResolvedValueOnce({ result: { ready: true, feedback: "Plan approved", suggestions: [] }, attempts: 1 })
         // final review: clean
-        .mockResolvedValueOnce({ topics: [], overallAssessment: "Good", issues: [] });
+        .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
 
     mockParallelAgents.mockResolvedValue([]);
 }
@@ -129,30 +129,33 @@ function setupRunWithTaskMocks() {
 
     mockPromptForStructured
         // initialization: title generation
-        .mockResolvedValueOnce({ title: "AI generated title" })
+        .mockResolvedValueOnce({ result: { title: "AI generated title" }, attempts: 1 })
         // scouting: topics (empty)
-        .mockResolvedValueOnce({ topics: [] })
+        .mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 })
         // scouting review: ready
-        .mockResolvedValueOnce({ ready: true, research: "All scouted", gaps: [] })
+        .mockResolvedValueOnce({ result: { ready: true, research: "All scouted", gaps: [] }, attempts: 1 })
         // planning
         .mockResolvedValueOnce({
-            tasks: [
-                {
-                    id: "t1",
-                    title: "Implement feature",
-                    prompt: "Do it",
-                    profile: "implementer",
-                    files: ["src/a.ts"],
-                    dependencies: [],
-                    is_code: true,
-                },
-            ],
-            strategy: "Direct",
+            result: {
+                tasks: [
+                    {
+                        id: "t1",
+                        title: "Implement feature",
+                        prompt: "Do it",
+                        profile: "implementer",
+                        files: ["src/a.ts"],
+                        dependencies: [],
+                        is_code: true,
+                    },
+                ],
+                strategy: "Direct",
+            },
+            attempts: 1,
         })
         // plan review: approved
-        .mockResolvedValueOnce({ ready: true, feedback: "Plan approved", suggestions: [] })
+        .mockResolvedValueOnce({ result: { ready: true, feedback: "Plan approved", suggestions: [] }, attempts: 1 })
         // final review: clean
-        .mockResolvedValueOnce({ topics: [], overallAssessment: "Good", issues: [] });
+        .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
 
     // parallelAgents for scouting (none) and final review fixers (none)
     mockParallelAgents.mockResolvedValue([]);
@@ -168,30 +171,33 @@ function setupRunWithFailedTaskMocks() {
 
     mockPromptForStructured
         // initialization: title generation
-        .mockResolvedValueOnce({ title: "AI generated title" })
+        .mockResolvedValueOnce({ result: { title: "AI generated title" }, attempts: 1 })
         // scouting: topics (empty)
-        .mockResolvedValueOnce({ topics: [] })
+        .mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 })
         // scouting review: ready
-        .mockResolvedValueOnce({ ready: true, research: "All scouted", gaps: [] })
+        .mockResolvedValueOnce({ result: { ready: true, research: "All scouted", gaps: [] }, attempts: 1 })
         // planning
         .mockResolvedValueOnce({
-            tasks: [
-                {
-                    id: "t1",
-                    title: "Bad task",
-                    prompt: "Do it badly",
-                    profile: "implementer",
-                    files: ["src/a.ts"],
-                    dependencies: [],
-                    is_code: true,
-                },
-            ],
-            strategy: "Direct",
+            result: {
+                tasks: [
+                    {
+                        id: "t1",
+                        title: "Bad task",
+                        prompt: "Do it badly",
+                        profile: "implementer",
+                        files: ["src/a.ts"],
+                        dependencies: [],
+                        is_code: true,
+                    },
+                ],
+                strategy: "Direct",
+            },
+            attempts: 1,
         })
         // plan review: approved
-        .mockResolvedValueOnce({ ready: true, feedback: "Plan approved", suggestions: [] })
+        .mockResolvedValueOnce({ result: { ready: true, feedback: "Plan approved", suggestions: [] }, attempts: 1 })
         // final review: clean
-        .mockResolvedValueOnce({ topics: [], overallAssessment: "Good", issues: [] });
+        .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
 
     mockParallelAgents.mockResolvedValue([]);
 }
@@ -243,13 +249,13 @@ describe("Workflow-level callbacks", () => {
 
         mockPromptForStructured
             // scoutingReviewPhase (deriving research from empty reports)
-            .mockResolvedValueOnce({ ready: true, research: "Resumed research", gaps: [] })
+            .mockResolvedValueOnce({ result: { ready: true, research: "Resumed research", gaps: [] }, attempts: 1 })
             // planning
-            .mockResolvedValueOnce({ tasks: [], strategy: "none" })
+            .mockResolvedValueOnce({ result: { tasks: [], strategy: "none" }, attempts: 1 })
             // plan review: approved
-            .mockResolvedValueOnce({ ready: true, feedback: "OK", suggestions: [] })
+            .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
             // final review: clean
-            .mockResolvedValueOnce({ topics: [], overallAssessment: "OK", issues: [] });
+            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "OK", issues: [] }, attempts: 1 });
 
         mockParallelAgents.mockResolvedValue([]);
 
@@ -372,19 +378,22 @@ describe("Workflow-level callbacks", () => {
 
         mockPromptForStructured
             // initialization: title generation
-            .mockResolvedValueOnce({ title: "AI generated title" })
+            .mockResolvedValueOnce({ result: { title: "AI generated title" }, attempts: 1 })
             // scouting: topics (with one topic)
             .mockResolvedValueOnce({
-                topics: [{ topic: "core", rationale: "Core module", files: ["src/core.ts"] }],
+                result: {
+                    topics: [{ topic: "core", rationale: "Core module", files: ["src/core.ts"] }],
+                },
+                attempts: 1,
             })
             // scouting review: ready
-            .mockResolvedValueOnce({ ready: true, research: "Scouted", gaps: [] })
+            .mockResolvedValueOnce({ result: { ready: true, research: "Scouted", gaps: [] }, attempts: 1 })
             // planning
-            .mockResolvedValueOnce({ tasks: [], strategy: "none" })
+            .mockResolvedValueOnce({ result: { tasks: [], strategy: "none" }, attempts: 1 })
             // plan review: approved
-            .mockResolvedValueOnce({ ready: true, feedback: "OK", suggestions: [] })
+            .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
             // final review: clean
-            .mockResolvedValueOnce({ topics: [], overallAssessment: "OK", issues: [] });
+            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "OK", issues: [] }, attempts: 1 });
 
         // parallelAgents for the scout
         mockParallelAgents.mockResolvedValue([
@@ -709,15 +718,15 @@ describe("Workflow-level callbacks", () => {
 
         mockPromptForStructured
             // scouting topics
-            .mockResolvedValueOnce({ topics: [] })
+            .mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 })
             // scouting review: ready
-            .mockResolvedValueOnce({ ready: true, research: "Resumed", gaps: [] })
+            .mockResolvedValueOnce({ result: { ready: true, research: "Resumed", gaps: [] }, attempts: 1 })
             // planning
-            .mockResolvedValueOnce({ tasks: [], strategy: "none" })
+            .mockResolvedValueOnce({ result: { tasks: [], strategy: "none" }, attempts: 1 })
             // plan review: approved
-            .mockResolvedValueOnce({ ready: true, feedback: "OK", suggestions: [] })
+            .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
             // final review: clean
-            .mockResolvedValueOnce({ topics: [], overallAssessment: "OK", issues: [] });
+            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "OK", issues: [] }, attempts: 1 });
 
         mockParallelAgents.mockResolvedValue([]);
 

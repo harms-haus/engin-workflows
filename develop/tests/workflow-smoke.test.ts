@@ -108,63 +108,78 @@ function defaultPromptHandler(_text: string): unknown {
     // Scouting coordinator: identify topics
     if (_text.includes("codebase scout") || _text.includes("Identify key areas")) {
         return {
-            topics: [
-                {
-                    topic: "core-module",
-                    rationale: "Core logic needs investigation",
-                    files: ["src/core.ts"],
-                },
-            ],
+            result: {
+                topics: [
+                    {
+                        topic: "core-module",
+                        rationale: "Core logic needs investigation",
+                        files: ["src/core.ts"],
+                    },
+                ],
+            },
+            attempts: 1,
         };
     }
 
     // Scouting review
     if (_text.includes("reviewing scouting reports")) {
         return {
-            ready: true,
-            research: "All areas have been investigated thoroughly. No gaps remain.",
-            gaps: [],
+            result: {
+                ready: true,
+                research: "All areas have been investigated thoroughly. No gaps remain.",
+                gaps: [],
+            },
+            attempts: 1,
         };
     }
 
     // Planning
     if (_text.includes("planning agent")) {
         return {
-            tasks: [
-                {
-                    id: "t1",
-                    title: "Implement core feature",
-                    prompt: "Implement the core feature as described",
-                    profile: "implementer",
-                    files: ["src/core.ts"],
-                    dependencies: [],
-                    is_code: true,
-                },
-            ],
-            strategy: "Implement directly in the core module",
+            result: {
+                tasks: [
+                    {
+                        id: "t1",
+                        title: "Implement core feature",
+                        prompt: "Implement the core feature as described",
+                        profile: "implementer",
+                        files: ["src/core.ts"],
+                        dependencies: [],
+                        is_code: true,
+                    },
+                ],
+                strategy: "Implement directly in the core module",
+            },
+            attempts: 1,
         };
     }
 
     // Plan review
     if (_text.includes("reviewing an implementation plan")) {
         return {
-            ready: true,
-            feedback: "Plan is well-structured and feasible",
-            suggestions: [],
+            result: {
+                ready: true,
+                feedback: "Plan is well-structured and feasible",
+                suggestions: [],
+            },
+            attempts: 1,
         };
     }
 
     // Final quality review
     if (_text.includes("final quality review")) {
         return {
-            topics: [{ topic: "overall quality", files: ["src/core.ts"] }],
-            overallAssessment: "Code quality is good",
-            issues: [],
+            result: {
+                topics: [{ topic: "overall quality", files: ["src/core.ts"] }],
+                overallAssessment: "Code quality is good",
+                issues: [],
+            },
+            attempts: 1,
         };
     }
 
     // Default
-    return {};
+    return { result: {}, attempts: 1 };
 }
 
 // ─── Setup ──────────────────────────────────────────────────────────────────

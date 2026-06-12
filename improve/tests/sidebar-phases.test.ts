@@ -95,21 +95,21 @@ function makeAllProfiles(): Map<string, unknown> {
 /** Default mock prompt handler for a successful run. */
 function defaultPromptHandler(_text: string): unknown {
     if (_text.includes("codebase scout") || _text.includes("Identify key areas")) {
-        return { topics: [] };
+        return { result: { topics: [] }, attempts: 1 };
     }
     if (_text.includes("reviewing scouting reports")) {
-        return { ready: true, research: "All scouted", gaps: [] };
+        return { result: { ready: true, research: "All scouted", gaps: [] }, attempts: 1 };
     }
     if (_text.includes("planning agent")) {
-        return { tasks: [], strategy: "none" };
+        return { result: { tasks: [], strategy: "none" }, attempts: 1 };
     }
     if (_text.includes("reviewing an implementation plan")) {
-        return { ready: true, feedback: "OK", suggestions: [] };
+        return { result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 };
     }
     if (_text.includes("final quality review")) {
-        return { topics: [], overallAssessment: "Good", issues: [] };
+        return { result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 };
     }
-    return {};
+    return { result: {}, attempts: 1 };
 }
 
 // ─── Setup ──────────────────────────────────────────────────────────────────
