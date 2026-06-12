@@ -771,6 +771,9 @@ export async function implementationPhase(
         }
     }
 
+    // Validate that all dependency references are valid
+    tracker.taskTracker.validateAllDependencies();
+
     // 2. Create and run the lane pool
     const pool = new LanePool({
         maxConcurrentLanes: maxConcurrentTasks,
@@ -797,7 +800,24 @@ export async function implementationPhase(
         signal,
     });
 
-    await pool.run();
+    const result = await pool.run();
+
+    // Defense-in-depth: check pool result against tracker state
+    const totalTasks = tracker.taskTracker.getAllTasks().length;
+    const settledTasks = result.completedTasks + result.failedTasks;
+    if (settledTasks !== totalTasks) {
+        console.warn(
+            `[implementationPhase] Pool result discrepancy: ${settledTasks} settled tasks (${result.completedTasks} completed + ${result.failedTasks} failed) vs ${totalTasks} total tasks in tracker`,
+        );
+    }
+
+    const blockedWithMissingDeps = tracker.taskTracker.getBlockedWithMissingDeps();
+    if (blockedWithMissingDeps.length > 0) {
+        console.warn(
+            `[implementationPhase] ${blockedWithMissingDeps.length} task(s) blocked with missing dependencies:`,
+            blockedWithMissingDeps.map(({ taskId, missingDepIds }) => `${taskId} missing ${missingDepIds.join(', ')}`),
+        );
+    }
 }
 
 // ─── Phase 6: Final Review ──────────────────────────────────────────────────
