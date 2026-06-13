@@ -1,8 +1,8 @@
 ---
 name: implementer-lite
 provider: opencode-go
-model: mimo-v2.5
-thinkingLevel: low
+model: deepseek-v4-flash
+thinkingLevel: high
 excludeTools:
   - ask_user_question
   - delegate_to_subagents

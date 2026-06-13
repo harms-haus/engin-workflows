@@ -1,7 +1,7 @@
 ---
 name: planner
 provider: zai
-model: glm-5.1
+model: glm-5.2
 thinkingLevel: high
 excludeTools:
   - write

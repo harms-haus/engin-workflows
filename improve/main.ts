@@ -6,7 +6,7 @@ import { resolveProfilesDirs } from "@harms-haus/engin";
 import { createHarness } from "@harms-haus/engin";
 import { promptForStructured } from "@harms-haus/engin";
 import { WorkflowStatusTracker } from "@harms-haus/engin";
-import { LanePool, TaskTracker, WorkflowTUI } from "@harms-haus/engin";
+import { LanePool, TaskTracker, WorkflowTUI, composeStatusCallbacks } from "@harms-haus/engin";
 import { join } from "node:path";
 
 // ─── Zod Schemas ────────────────────────────────────────────────────────────
@@ -1020,8 +1020,11 @@ export async function run(
             agentLogLines: 20,
         });
         tui.start();
-        effectiveStatus = tui.getStatusCallbacks();
+        effectiveStatus = onStatus
+            ? composeStatusCallbacks([onStatus, tui.getStatusCallbacks()])
+            : tui.getStatusCallbacks();
     }
+
 
     effectiveStatus?.onWorkflowStart?.({ taskPrompt, resumed, workDir });
 

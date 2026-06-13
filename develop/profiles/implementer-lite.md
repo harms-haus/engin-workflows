@@ -1,7 +1,7 @@
 ---
 name: implementer-lite
 provider: opencode-go
-model: mimo-v2.5
+model: deepseek-v4-flash
 thinkingLevel: high
 excludeTools:
   - ask_user_question

@@ -1,7 +1,7 @@
 ---
 name: scouting-reviewer
 provider: opencode-go
-model: mimo-v2.5
+model: deepseek-v4-flash
 thinkingLevel: medium
 excludeTools:
   - write

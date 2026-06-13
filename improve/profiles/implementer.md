@@ -1,7 +1,7 @@
 ---
 name: implementer
 provider: zai
-model: glm-5.1
+model: glm-5.2
 thinkingLevel: low
 excludeTools:
   - ask_user_question

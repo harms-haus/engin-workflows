@@ -1,8 +1,8 @@
 ---
 name: final-reviewer
 provider: zai
-model: glm-5.1
-thinkingLevel: medium
+model: glm-5.2
+thinkingLevel: high
 excludeTools:
   - write
   - edit

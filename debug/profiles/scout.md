@@ -1,8 +1,8 @@
 ---
 name: scout
 provider: opencode-go
-model: mimo-v2.5
-thinkingLevel: low
+model: deepseek-v4-flash
+thinkingLevel: medium
 excludeTools:
   - write
   - edit
