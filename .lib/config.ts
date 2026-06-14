@@ -6,10 +6,30 @@ import type { StepDefinition, WorkflowRunOptions } from "@harms-haus/engin";
 // DATA, not boolean flags. Each workflow supplies its own WorkflowConfig; the
 // shared backbone reads from it to drive behaviour.
 
+/**
+ * A specialized final-review dimension. The final review phase runs one
+ * `FinalReviewerConfig` per dimension in parallel; each maps to an agent
+ * profile (`profileId`) that knows how to assess that dimension.
+ */
+export interface FinalReviewerConfig {
+    /** Agent profile id to load for this reviewer (e.g. 'efficiency-reviewer'). */
+    profileId: string;
+    /** Stable machine key for this dimension (e.g. 'efficiency', 'ui-ux'). Used to bucket review history across rounds. */
+    dimension: string;
+    /** Human-readable label shown in task titles / status (e.g. 'Efficiency'). */
+    label: string;
+}
+
 export interface WorkflowConfig {
     name: string;
     defaultMaxConcurrentTasks: number;
     fixerSteps: StepDefinition[];
+    /**
+     * Specialized reviewers run in the final review phase. Each is invoked in
+     * parallel every round. When omitted, `final-review.ts` falls back to
+     * `DEFAULT_FINAL_REVIEWERS` (efficiency, code-quality, ui-ux, security).
+     */
+    finalReviewers?: FinalReviewerConfig[];
     phases: { id: string; label: string; icon: string }[];
     titleFormatter: (description: string) => string;
 }

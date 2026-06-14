@@ -53,7 +53,9 @@ import {
     PlanReviewSchema,
     ReviewResultSchema,
     FinalReviewTopicsSchema,
+    FinalReviewResultSchema,
     TitleSchema,
+    workflowConfig,
 } from "../main";
 
 // ─── Test Fixtures ──────────────────────────────────────────────────────────
@@ -153,8 +155,8 @@ function smartRunStepTask(opts: Record<string, unknown>): unknown {
     if (taskId === "scouting-reviewer") return { ready: true, research: "All scouted", gaps: [] };
     if (taskId === "planner") return { tasks: [], strategy: "none" };
     if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-    if (typeof taskId === "string" && taskId.startsWith("final-reviewer-round-")) {
-        return { topics: [{ topic: "Review", files: [] }], overallAssessment: "Looks good", issues: [] };
+    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+        return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
     }
     return {};
 }
@@ -240,6 +242,12 @@ describe("Zod Schemas", () => {
         expect(FinalReviewTopicsSchema.safeParse(data).success).toBe(true);
     });
 
+    it("FinalReviewResultSchema is exported and parseable", () => {
+        expect(typeof FinalReviewResultSchema.parse).toBe("function");
+        const clean = { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
+        expect(FinalReviewResultSchema.safeParse(clean).success).toBe(true);
+    });
+
     it("TitleSchema validates a concise title string", () => {
         expect(TitleSchema.safeParse({ title: "Refactor auth module" }).success).toBe(true);
     });
@@ -254,6 +262,21 @@ describe("Zod Schemas", () => {
 
     it("TitleSchema accepts title up to any length", () => {
         expect(TitleSchema.safeParse({ title: "A very long title that exceeds eight words easily" }).success).toBe(true);
+    });
+});
+
+// ─── workflowConfig ─────────────────────────────────────────────────────────
+
+describe("workflowConfig", () => {
+    it("finalReviewers lists the four specialized reviewers in order", () => {
+        expect(Array.isArray(workflowConfig.finalReviewers)).toBe(true);
+        expect(workflowConfig.finalReviewers).toHaveLength(4);
+        expect(workflowConfig.finalReviewers!.map((r) => r.profileId)).toEqual([
+            "efficiency-reviewer",
+            "code-quality-reviewer",
+            "ui-ux-reviewer",
+            "security-reviewer",
+        ]);
     });
 });
 
@@ -584,17 +607,32 @@ describe("implementationPhase", () => {
 // ─── finalReviewPhase ───────────────────────────────────────────────────────
 
 describe("finalReviewPhase", () => {
+    /** Clean FinalReviewResult keyed off the reviewer's dimension. */
+    const cleanResult = (taskId: string) => ({
+        dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""),
+        applicable: true,
+        notApplicableReason: "",
+        summary: "No issues",
+        findings: [],
+    });
+    const isReviewerCall = (taskId: string) => /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId);
+
     it("returns true when no issues found", async () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValueOnce({ topics: [{ topic: "Code quality", files: ["src/main.ts"] }], overallAssessment: "Code looks good", issues: [] });
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (typeof taskId === "string" && isReviewerCall(taskId)) return cleanResult(taskId);
+            return {};
+        });
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
         expect(clean).toBe(true);
-        const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => (c[0] as Record<string, unknown>).taskId?.toString().startsWith("final-reviewer-round-"));
-        expect(finalReviewCalls).toHaveLength(1);
+        // 4 reviewers run in parallel every round → 4 runStepTask calls for round 0.
+        const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => isReviewerCall((c[0] as Record<string, unknown>).taskId?.toString() ?? ""));
+        expect(finalReviewCalls).toHaveLength(4);
     });
 
     it("spawns fixers for critical issues and returns true when fixed", async () => {
@@ -602,23 +640,41 @@ describe("finalReviewPhase", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask
-            .mockResolvedValueOnce({ topics: [], overallAssessment: "Needs fixes", issues: [{ file: "src/a.ts", description: "Bug", severity: "critical" }] })
-            .mockResolvedValueOnce({ topics: [], overallAssessment: "All fixed", issues: [] });
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (typeof taskId !== "string") return {};
+            // Round 0: only the efficiency reviewer reports a critical finding.
+            if (taskId === "efficiency-reviewer-round-0") {
+                return { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "Needs fixes", findings: [{ id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Why it matters", fixPrompt: "Fix it by ..." }] };
+            }
+            // All other reviewers (and round 1+) are clean.
+            if (isReviewerCall(taskId)) return cleanResult(taskId);
+            return {};
+        });
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
         expect(clean).toBe(true);
-        const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => (c[0] as Record<string, unknown>).taskId?.toString().startsWith("final-reviewer-round-"));
-        expect(finalReviewCalls).toHaveLength(2);
+        // Round 0: 4 reviewer calls. Round 1: 4 reviewer calls → 8 total.
+        const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => isReviewerCall((c[0] as Record<string, unknown>).taskId?.toString() ?? ""));
+        expect(finalReviewCalls).toHaveLength(8);
         expect(mockLanePoolCtor).toHaveBeenCalledTimes(1);
     });
 
-    it("returns true when only minor issues found", async () => {
+    it("returns true when only low-severity issues found", async () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValueOnce({ topics: [], overallAssessment: "Mostly good", issues: [{ file: "src/a.ts", description: "Formatting", severity: "minor" }] });
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (typeof taskId !== "string") return {};
+            // efficiency reviewer reports a LOW finding (non-actionable); rest clean.
+            if (taskId === "efficiency-reviewer-round-0") {
+                return { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "Minor nit", findings: [{ id: "f1", severity: "low", file: "src/a.ts", title: "Formatting", description: "Nit", fixPrompt: "Fix" }] };
+            }
+            if (isReviewerCall(taskId)) return cleanResult(taskId);
+            return {};
+        });
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
         expect(clean).toBe(true);
@@ -629,14 +685,22 @@ describe("finalReviewPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const assessmentWithCritical = { topics: [], overallAssessment: "Still broken", issues: [{ file: "src/a.ts", description: "Persistent bug", severity: "critical" }] };
         mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValue(assessmentWithCritical);
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (typeof taskId !== "string") return {};
+            // Every reviewer every round reports a critical finding.
+            if (isReviewerCall(taskId)) {
+                return { dimension: cleanResult(taskId).dimension, applicable: true, notApplicableReason: "", summary: "Still broken", findings: [{ id: "f1", severity: "critical", file: "src/a.ts", title: "Persistent bug", description: "Why", fixPrompt: "Fix it" }] };
+            }
+            return {};
+        });
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
         expect(clean).toBe(false);
-        const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => (c[0] as Record<string, unknown>).taskId?.toString().startsWith("final-reviewer-round-"));
-        expect(finalReviewCalls).toHaveLength(3);
+        // 3 rounds × 4 reviewers = 12 reviewer calls.
+        const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => isReviewerCall((c[0] as Record<string, unknown>).taskId?.toString() ?? ""));
+        expect(finalReviewCalls).toHaveLength(12);
         expect(mockLanePoolCtor).toHaveBeenCalledTimes(3);
     });
 });

@@ -1,10 +1,15 @@
 // ─── Final Review Phase Tests ───────────────────────────────────────────────
 //
-// Tests for final-review.ts: adoption of runStepTask for final-reviewer,
-// phaseId threading for both reviewer and fixer tasks, and loop behavior.
+// Tests for final-review.ts: the multi-dimensional review design. Each round
+// runs N specialized reviewers IN PARALLEL (default 4: efficiency, code-quality,
+// ui-ux, security). Findings rated medium/high/critical ("actionable") spawn
+// one fixer task each; low findings and not-applicable reviews do not. After
+// fixers settle, reviewers run again — each receiving its OWN complete prior
+// history so it does not re-report fixed findings.
 // ────────────────────────────────────────────────────────────────────────────
 
 import { describe, expect, it, jest, mock, beforeEach } from 'bun:test';
+import type { FinalReviewResult, FinalReviewFinding, FinalReviewSeverity } from './schemas';
 
 // ─── Mock @harms-haus/engin ────────────────────────────────────────────────
 const mockRunStepTask = jest.fn<(opts: any) => Promise<unknown>>();
@@ -54,7 +59,17 @@ mock.module('@harms-haus/engin', () => ({
 }));
 
 // Dynamic import to ensure mock is applied first
-const { finalReviewPhase } = await import('./final-review');
+const { finalReviewPhase, DEFAULT_FINAL_REVIEWERS, isActionableSeverity } = await import('./final-review');
+const { FinalReviewResultSchema } = await import('./schemas');
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+/** Reviewer dimensions/profiles in the order the default config lists them. */
+const DEFAULT_DIMENSIONS = ['efficiency', 'code-quality', 'ui-ux', 'security'] as const;
+const DEFAULT_PROFILE_IDS = DEFAULT_DIMENSIONS.map(
+  (d) => `${d.replace('ui-ux', 'ui-ux')}-reviewer`.replace('code-quality-reviewer', 'code-quality-reviewer'),
+);
+const EXPECTED_REVIEWER_COUNT = DEFAULT_FINAL_REVIEWERS.length; // 4
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -66,161 +81,120 @@ function makeMockTracker() {
   } as never;
 }
 
-/**
- * Build a final-review assessment result matching FinalReviewTopics shape.
- */
-function makeAssessment(issues: { file: string; description: string; severity: string }[] = []) {
+function makeCleanResult(dimension: string): FinalReviewResult {
   return {
-    topics: [{ topic: 'Code Quality', files: ['src/main.ts'] }],
-    overallAssessment: 'Some issues found',
-    issues: issues.map((i) => ({
-      file: i.file,
-      description: i.description,
-      severity: i.severity as 'critical' | 'minor',
-    })),
+    dimension,
+    applicable: true,
+    notApplicableReason: '',
+    summary: 'No issues found',
+    findings: [],
   };
 }
 
-// ─── runStepTask for Final Reviewer ─────────────────────────────────────────
+function makeNotApplicable(dimension: string, reason = 'Not relevant to these changes'): FinalReviewResult {
+  return {
+    dimension,
+    applicable: false,
+    notApplicableReason: reason,
+    summary: 'Dimension not applicable',
+    findings: [],
+  };
+}
 
-describe('finalReviewPhase — runStepTask for final reviewer', () => {
-  beforeEach(() => {
-    mockRunStepTask.mockClear();
-    mockPoolRun.mockClear();
-    mockAddTask.mockClear();
-    mockGetAllTasks.mockClear();
-    MockLanePool.mockClear();
-    MockTaskTracker.mockClear();
-    mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
+function makeFinding(
+  severity: FinalReviewSeverity,
+  overrides: Partial<FinalReviewFinding> = {},
+): FinalReviewFinding {
+  return {
+    id: overrides.id ?? `finding-${severity}`,
+    severity,
+    file: overrides.file ?? 'src/main.ts',
+    title: overrides.title ?? `${severity} issue`,
+    description: overrides.description ?? 'A problem was found that needs fixing.',
+    fixPrompt: overrides.fixPrompt ?? 'Apply the targeted fix to src/main.ts.',
+    ...overrides,
+  };
+}
+
+function makeResultWithFindings(
+  dimension: string,
+  findings: FinalReviewFinding[],
+): FinalReviewResult {
+  return {
+    dimension,
+    applicable: true,
+    notApplicableReason: '',
+    summary: `${findings.length} finding(s)`,
+    findings,
+  };
+}
+
+/** Set every reviewer (all 4 dimensions) to return clean for every round. */
+function allReviewersClean() {
+  // runStepTask is called 4× per round; returning a clean result keyed by the
+  // requested dimension keeps every reviewer happy regardless of call order.
+  mockRunStepTask.mockImplementation(async (opts: any) =>
+    makeCleanResult(opts.profileId.replace('-reviewer', '')),
+  );
+}
+
+beforeEach(() => {
+  mockRunStepTask.mockReset();
+  mockPoolRun.mockReset();
+  mockAddTask.mockReset();
+  mockGetAllTasks.mockReset();
+  MockLanePool.mockClear();
+  MockTaskTracker.mockClear();
+  mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
+  allReviewersClean();
+});
+
+// ─── runStepTask usage ─────────────────────────────────────────────────────
+
+describe('finalReviewPhase — runStepTask usage per reviewer', () => {
+  it('runs one runStepTask per reviewer per round (4 for a single clean round)', async () => {
+    const tracker = makeMockTracker();
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(mockRunStepTask).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT);
   });
 
-  it('uses runStepTask instead of manual createHarness + promptForStructured', async () => {
+  it('uses phaseId: "review", stepName: "final-review", isReadOnly: true', async () => {
     const tracker = makeMockTracker();
-    // Return an assessment with no issues (clean)
-    mockRunStepTask.mockResolvedValue(makeAssessment([]));
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-    const result = await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    // runStepTask should be called (not createHarness)
-    expect(mockRunStepTask).toHaveBeenCalledTimes(1);
-    expect(result).toBe(true);
+    for (const call of mockRunStepTask.mock.calls) {
+      const opts = call[0];
+      expect(opts.phaseId).toBe('review');
+      expect(opts.stepName).toBe('final-review');
+      expect(opts.isReadOnly).toBe(true);
+      expect(opts.schema).toBe(FinalReviewResultSchema);
+    }
   });
 
-  it('calls runStepTask with phaseId: "review"', async () => {
+  it('uses one profileId per default reviewer dimension', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue(makeAssessment([]));
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    const callOpts = mockRunStepTask.mock.calls[0][0];
-    expect(callOpts).toHaveProperty('phaseId', 'review');
+    const profileIds = mockRunStepTask.mock.calls.map((c) => c[0].profileId).sort();
+    expect(profileIds).toEqual([...DEFAULT_PROFILE_IDS].sort());
   });
 
-  it('calls runStepTask with stepName: "final-review"', async () => {
+  it('taskIds follow the pattern "<profileId>-round-<n>"', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue(makeAssessment([]));
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    const callOpts = mockRunStepTask.mock.calls[0][0];
-    expect(callOpts).toHaveProperty('stepName', 'final-review');
-  });
-
-  it('calls runStepTask with profileId: "final-reviewer"', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    const callOpts = mockRunStepTask.mock.calls[0][0];
-    expect(callOpts).toHaveProperty('profileId', 'final-reviewer');
-  });
-
-  it('taskId follows the pattern "final-reviewer-round-N"', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    const callOpts = mockRunStepTask.mock.calls[0][0];
-    expect(callOpts).toHaveProperty('taskId', 'final-reviewer-round-0');
-  });
-
-  it('increments round number in taskId on subsequent rounds', async () => {
-    const tracker = makeMockTracker();
-    // Round 0: return critical issues
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Security vulnerability', severity: 'critical' },
-    ]));
-    // Round 1: return clean
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    // Should have been called twice (round 0 and round 1)
-    expect(mockRunStepTask).toHaveBeenCalledTimes(2);
-    expect(mockRunStepTask.mock.calls[0][0].taskId).toBe('final-reviewer-round-0');
-    expect(mockRunStepTask.mock.calls[1][0].taskId).toBe('final-reviewer-round-1');
-  });
-
-  it('passes FinalReviewTopicsSchema to runStepTask', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    const callOpts = mockRunStepTask.mock.calls[0][0];
-    expect(callOpts).toHaveProperty('schema');
-    expect(callOpts.schema).toBeDefined();
+    for (const call of mockRunStepTask.mock.calls) {
+      const opts = call[0];
+      expect(opts.taskId).toMatch(/^(efficiency|code-quality|ui-ux|security)-reviewer-round-0$/);
+      expect(opts.taskId).toBe(`${opts.profileId}-round-0`);
+    }
   });
 
   it('passes profilesDirs, cwd, apiKeys, onStatus, signal through to runStepTask', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue(makeAssessment([]));
     const onStatus = { onAgentSpawn: jest.fn() };
-    const abortController = new AbortController();
+    const ac = new AbortController();
 
     await finalReviewPhase(
       tracker,
@@ -230,208 +204,146 @@ describe('finalReviewPhase — runStepTask for final reviewer', () => {
       5,
       { ANTHROPIC: 'sk-test' },
       onStatus as never,
-      abortController.signal,
+      ac.signal,
     );
 
-    const callOpts = mockRunStepTask.mock.calls[0][0];
-    expect(callOpts).toHaveProperty('profilesDirs', ['/profiles/a', '/profiles/b']);
-    expect(callOpts).toHaveProperty('cwd', '/cwd');
-    expect(callOpts).toHaveProperty('apiKeys', { ANTHROPIC: 'sk-test' });
-    expect(callOpts).toHaveProperty('onStatus', onStatus);
-    expect(callOpts).toHaveProperty('signal', abortController.signal);
-  });
-
-  it('passes isReadOnly: true to runStepTask', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    const callOpts = mockRunStepTask.mock.calls[0][0];
-    expect(callOpts).toHaveProperty('isReadOnly', true);
+    for (const call of mockRunStepTask.mock.calls) {
+      const opts = call[0];
+      expect(opts.profilesDirs).toEqual(['/profiles/a', '/profiles/b']);
+      expect(opts.cwd).toBe('/cwd');
+      expect(opts.apiKeys).toEqual({ ANTHROPIC: 'sk-test' });
+      expect(opts.onStatus).toBe(onStatus);
+      expect(opts.signal).toBe(ac.signal);
+    }
   });
 });
 
-// ─── Clean Assessment (No Issues) ──────────────────────────────────────────
+// ─── Clean Assessment ──────────────────────────────────────────────────────
 
 describe('finalReviewPhase — clean assessment', () => {
-  beforeEach(() => {
-    mockRunStepTask.mockClear();
-    mockPoolRun.mockClear();
-    mockAddTask.mockClear();
-    mockGetAllTasks.mockClear();
-    MockLanePool.mockClear();
-    MockTaskTracker.mockClear();
-    mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
-  });
-
-  it('returns true when assessment has no issues', async () => {
+  it('returns true when all reviewers are clean', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue(makeAssessment([]));
-
-    const result = await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
     expect(result).toBe(true);
   });
 
-  it('does not create fixer tasks or LanePool when no issues', async () => {
+  it('does not create fixer tasks or a LanePool when clean', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
     expect(mockAddTask).not.toHaveBeenCalled();
-    // The first round does not create a LanePool if no issues
-    // (LanePool is only created for fixers)
-    // But MockLanePool might have been called zero times
-    // Actually runStepTask doesn't use LanePool, so:
     expect(MockLanePool).not.toHaveBeenCalled();
+    expect(mockPoolRun).not.toHaveBeenCalled();
   });
 
-  it('auditLogs the assessment', async () => {
+  it('auditLogs each reviewer result (4 events for one round)', async () => {
     const append = jest.fn().mockResolvedValue(undefined);
-    const tracker = {
-      auditLog: { append },
-    } as never;
-    const assessment = makeAssessment([]);
-    mockRunStepTask.mockResolvedValue(assessment);
+    const tracker = { auditLog: { append } } as never;
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    expect(append).toHaveBeenCalledTimes(1);
-    expect(append).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: 'structured_output',
-        agentId: 'final-reviewer',
-        output: assessment,
-      }),
-    );
+    expect(append).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT);
+    for (const call of append.mock.calls) {
+      const event = call[0];
+      expect(event.type).toBe('structured_output');
+      expect(event.output).toBeDefined();
+      expect(event.output.findings).toEqual([]);
+    }
   });
 });
 
-// ─── Critical Issues → Fixer Tasks ─────────────────────────────────────────
+// ─── Actionable findings → fixers ──────────────────────────────────────────
 
-describe('finalReviewPhase — critical issues trigger fixers', () => {
-  beforeEach(() => {
-    mockRunStepTask.mockClear();
-    mockPoolRun.mockClear();
-    mockAddTask.mockClear();
-    mockGetAllTasks.mockClear();
-    MockLanePool.mockClear();
-    MockTaskTracker.mockClear();
-    mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
+describe('finalReviewPhase — actionable findings spawn fixers', () => {
+  it('creates one fixer task per medium/high/critical finding', async () => {
+    const tracker = makeMockTracker();
+    // Only the efficiency reviewer returns findings; the other three are clean.
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [
+        makeFinding('medium', { id: 'm1', title: 'medium issue' }),
+        makeFinding('high', { id: 'h1', title: 'high issue' }),
+        makeFinding('critical', { id: 'c1', title: 'critical issue' }),
+      ]),
+    );
+    // round 1: clean (default impl returns clean for all)
+
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(mockAddTask).toHaveBeenCalledTimes(3);
+    const titles = mockAddTask.mock.calls.map((c) => c[0].title);
+    expect(titles).toEqual(
+      expect.arrayContaining([
+        'Fix [medium]: medium issue',
+        'Fix [high]: high issue',
+        'Fix [critical]: critical issue',
+      ]),
+    );
   });
 
-  it('creates fixer tasks for critical issues', async () => {
+  it('does NOT spawn a fixer for low-severity findings', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/auth.ts', description: 'Missing input validation', severity: 'critical' },
-      { file: 'src/db.ts', description: 'SQL injection risk', severity: 'critical' },
-    ]));
-    // Second round returns clean
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [makeFinding('low', { title: 'nit' })]),
     );
 
-    // Should create two fixer tasks
-    expect(mockAddTask).toHaveBeenCalledTimes(2);
-    expect(mockAddTask).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      id: 'fixer-0',
-      title: expect.stringContaining('Fix: Missing input validation'),
-      profile: 'fixer',
-      files: ['src/auth.ts'],
-      isCode: true,
-    }));
-    expect(mockAddTask).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      id: 'fixer-1',
-      title: expect.stringContaining('Fix: SQL injection risk'),
-      profile: 'fixer',
-      files: ['src/db.ts'],
-      isCode: true,
-    }));
-  });
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-  it('skips minor issues (only critical issues spawn fixers)', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/style.css', description: 'Minor formatting', severity: 'minor' },
-      { file: 'src/main.ts', description: 'Critical bug', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    // Only 1 critical issue → 1 fixer task
-    expect(mockAddTask).toHaveBeenCalledTimes(1);
-    expect(mockAddTask).toHaveBeenCalledWith(expect.objectContaining({
-      id: 'fixer-0',
-      files: ['src/main.ts'],
-    }));
-  });
-
-  it('returns true when only minor issues exist (no critical)', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue(makeAssessment([
-      { file: 'README.md', description: 'Typo', severity: 'minor' },
-    ]));
-
-    const result = await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    expect(result).toBe(true);
+    // low is not actionable → no fixers → clean
     expect(mockAddTask).not.toHaveBeenCalled();
+    expect(result).toBe(true);
   });
 
-  it('applies titleFormatter to fixer task titles', async () => {
+  it('ignores findings from reviews marked not-applicable', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'A very long description that should be truncated by the formatter', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
+    // security reviewer says not-applicable but (incorrectly) includes a finding
+    mockRunStepTask.mockImplementationOnce(async () => ({
+      ...makeResultWithFindings('security', [makeFinding('critical')]),
+      applicable: false,
+      notApplicableReason: 'No security surface',
+    }));
 
-    // Custom titleFormatter: always returns "Fixed!"
-    const customFormatter = () => 'Fixed!';
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(mockAddTask).not.toHaveBeenCalled();
+    expect(result).toBe(true);
+  });
+
+  it('builds the fixer prompt from the finding and embeds fixPrompt', async () => {
+    const tracker = makeMockTracker();
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [
+        makeFinding('critical', {
+          file: 'src/db.ts:10-20',
+          title: 'N+1 query',
+          description: 'Query runs inside a loop.',
+          fixPrompt: 'Batch the query outside the loop.',
+        }),
+      ]),
+    );
+
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(mockAddTask).toHaveBeenCalledTimes(1);
+    const task = mockAddTask.mock.calls[0][0];
+    expect(task.profile).toBe('fixer');
+    expect(task.isCode).toBe(true);
+    expect(task.dependencies).toEqual([]);
+    expect(task.phaseId).toBe('review');
+    // file line-range stripped for the `files` array
+    expect(task.files).toEqual(['src/db.ts']);
+    // prompt carries the finding + fixPrompt
+    expect(task.prompt).toContain('Efficiency');
+    expect(task.prompt).toContain('critical');
+    expect(task.prompt).toContain('src/db.ts:10-20');
+    expect(task.prompt).toContain('N+1 query');
+    expect(task.prompt).toContain('Query runs inside a loop.');
+    expect(task.prompt).toContain('Batch the query outside the loop.');
+  });
+
+  it('applies titleFormatter to the finding title', async () => {
+    const tracker = makeMockTracker();
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [makeFinding('high', { title: 'slow loop' })]),
+    );
 
     await finalReviewPhase(
       tracker,
@@ -442,233 +354,91 @@ describe('finalReviewPhase — critical issues trigger fixers', () => {
       undefined,
       undefined,
       undefined,
-      undefined,
-      customFormatter,
+      undefined, // finalReviewers (default)
+      undefined, // fixerSteps (default)
+      () => 'TRUNC',
     );
 
-    expect(mockAddTask).toHaveBeenCalledWith(expect.objectContaining({
-      title: 'Fix: Fixed!',
-    }));
+    expect(mockAddTask).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Fix [high]: TRUNC' }),
+    );
   });
 });
 
-// ─── Fixer LanePool with phaseId ───────────────────────────────────────────
+// ─── Fixer LanePool options ────────────────────────────────────────────────
 
-describe('finalReviewPhase — fixer LanePool phaseId', () => {
-  beforeEach(() => {
-    mockRunStepTask.mockClear();
-    mockPoolRun.mockClear();
-    mockAddTask.mockClear();
-    mockGetAllTasks.mockClear();
-    MockLanePool.mockClear();
-    MockTaskTracker.mockClear();
-    mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
-  });
-
-  it('creates LanePool with phaseId: "review" for fixer tasks', async () => {
+describe('finalReviewPhase — fixer LanePool', () => {
+  it('creates a LanePool with phaseId "review" and the resolved maxConcurrentLanes', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [makeFinding('critical')]),
     );
+
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 3);
 
     expect(MockLanePool).toHaveBeenCalledTimes(1);
-    const poolOptions = MockLanePool.mock.calls[0][0];
-    expect(poolOptions).toHaveProperty('phaseId', 'review');
-  });
-
-  it('passes maxConcurrentLanes from maxConcurrentTasks parameter', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      3,
-    );
-
-    expect(MockLanePool).toHaveBeenCalledWith(
-      expect.objectContaining({ maxConcurrentLanes: 3 }),
-    );
+    expect(MockLanePool.mock.calls[0][0]).toMatchObject({
+      phaseId: 'review',
+      maxConcurrentLanes: 3,
+      sessionBaseDir: '/work/sessions/fix-round-0',
+      cwd: '/cwd',
+      profilesDirs: ['/profiles'],
+    });
   });
 
   it('defaults maxConcurrentLanes to 5 when maxConcurrentTasks is undefined', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      undefined,
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [makeFinding('critical')]),
     );
 
-    expect(MockLanePool).toHaveBeenCalledWith(
-      expect.objectContaining({ maxConcurrentLanes: 5 }),
-    );
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', undefined);
+
+    expect(MockLanePool.mock.calls[0][0].maxConcurrentLanes).toBe(5);
   });
 
-  it('passes sessionBaseDir with fix-round-N suffix', async () => {
+  it('passes fixerSteps via getStepsForTask', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [makeFinding('critical')]),
+    );
+    const customSteps = [{ name: 'my-fix', profileId: 'my-fixer', isReadOnly: false }];
 
     await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
+      tracker, ['/profiles'], '/cwd', '/work', 5,
+      undefined, undefined, undefined,
+      undefined, // finalReviewers
+      customSteps,
     );
 
-    expect(MockLanePool).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionBaseDir: '/work/sessions/fix-round-0',
-      }),
-    );
+    const poolOpts = MockLanePool.mock.calls[0][0];
+    expect(poolOpts.getStepsForTask).toEqual(expect.any(Function));
+    expect(poolOpts.getStepsForTask({})).toEqual(customSteps);
   });
 
-  it('passes profilesDirs, cwd, apiKeys, onStatus, signal to fixer LanePool', async () => {
+  it('does not pass a legacy "phase" field to LanePool', async () => {
     const tracker = makeMockTracker();
-    const onStatus = { onAgentSpawn: jest.fn() };
-    const abortController = new AbortController();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles/x'],
-      '/cwd',
-      '/work',
-      5,
-      { KEY: 'val' },
-      onStatus as never,
-      abortController.signal,
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [makeFinding('critical')]),
     );
 
-    expect(MockLanePool).toHaveBeenCalledWith(
-      expect.objectContaining({
-        profilesDirs: ['/profiles/x'],
-        cwd: '/cwd',
-        apiKeys: { KEY: 'val' },
-        onStatus,
-        signal: abortController.signal,
-      }),
-    );
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(MockLanePool.mock.calls[0][0]).not.toHaveProperty('phase');
   });
 
-  it('passes auditLog and taskTracker to fixer LanePool', async () => {
+  it('passes auditLog + a taskTracker to the LanePool and runs it', async () => {
     const append = jest.fn().mockResolvedValue(undefined);
-    const tracker = {
-      auditLog: { append },
-    } as never;
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
+    const tracker = { auditLog: { append } } as never;
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [makeFinding('critical')]),
     );
 
-    expect(MockLanePool).toHaveBeenCalledWith(
-      expect.objectContaining({
-        auditLog: { append },
-        taskTracker: expect.any(Object),
-      }),
-    );
-  });
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-  it('getStepsForTask returns the fixerSteps passed to the function', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    const customFixerSteps = [{ name: 'my-fix', profileId: 'my-fixer', isReadOnly: false }];
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-      undefined,
-      undefined,
-      undefined,
-      customFixerSteps,
-    );
-
-    expect(MockLanePool).toHaveBeenCalledWith(
-      expect.objectContaining({
-        getStepsForTask: expect.any(Function),
-      }),
-    );
-    const poolOptions = MockLanePool.mock.calls[0][0];
-    const steps = poolOptions.getStepsForTask({} as never);
-    expect(steps).toEqual(customFixerSteps);
-  });
-
-  it('does not pass legacy phase field to LanePool', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    const poolOptions = MockLanePool.mock.calls[0][0];
-    expect(poolOptions).not.toHaveProperty('phase');
-  });
-
-  it('calls pool.run() for the fixer LanePool', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
+    const poolOpts = MockLanePool.mock.calls[0][0];
+    expect(poolOpts.auditLog).toEqual({ append });
+    expect(poolOpts.taskTracker).toBeDefined();
     expect(mockPoolRun).toHaveBeenCalledTimes(1);
   });
 });
@@ -676,219 +446,142 @@ describe('finalReviewPhase — fixer LanePool phaseId', () => {
 // ─── Loop Behavior ──────────────────────────────────────────────────────────
 
 describe('finalReviewPhase — loop behavior', () => {
-  beforeEach(() => {
-    mockRunStepTask.mockClear();
-    mockPoolRun.mockClear();
-    mockAddTask.mockClear();
-    mockGetAllTasks.mockClear();
-    MockLanePool.mockClear();
-    MockTaskTracker.mockClear();
-    mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
+  it('stops after one clean round (4 calls, returns true)', async () => {
+    const tracker = makeMockTracker();
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(mockRunStepTask).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT);
+    expect(result).toBe(true);
   });
 
-  it('loops up to maxFixRounds (3) when issues keep appearing', async () => {
+  it('re-runs all reviewers after fixers and stops when clean (8 calls)', async () => {
     const tracker = makeMockTracker();
-    // All three rounds return critical issues
-    mockRunStepTask.mockResolvedValue(makeAssessment([
-      { file: 'src/main.ts', description: 'Issue persists', severity: 'critical' },
-    ]));
+    // Round 0: efficiency has a critical finding; others clean
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [makeFinding('critical')]),
+    );
+    // Round 1: all clean (default impl)
 
-    const result = await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(mockRunStepTask).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT * 2);
+    expect(MockLanePool).toHaveBeenCalledTimes(1);
+    expect(result).toBe(true);
+  });
+
+  it('loops up to 3 rounds (12 calls) and returns false when issues persist', async () => {
+    const tracker = makeMockTracker();
+    // Every reviewer every round returns a critical finding.
+    mockRunStepTask.mockImplementation(async (opts: any) =>
+      makeResultWithFindings(opts.profileId.replace('-reviewer', ''), [makeFinding('critical')]),
     );
 
-    // runStepTask called 3 times (rounds 0, 1, 2), then exits
-    expect(mockRunStepTask).toHaveBeenCalledTimes(3);
-    expect(mockAddTask).toHaveBeenCalledTimes(3); // 1 fixer per round
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(mockRunStepTask).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT * 3);
     expect(MockLanePool).toHaveBeenCalledTimes(3);
     expect(result).toBe(false);
   });
 
-  it('stops early when assessment has no issues', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue(makeAssessment([]));
-
-    const result = await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
+  it('auditLogs every reviewer result across all rounds', async () => {
+    const append = jest.fn().mockResolvedValue(undefined);
+    const tracker = { auditLog: { append } } as never;
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [makeFinding('critical')]),
     );
 
-    expect(mockRunStepTask).toHaveBeenCalledTimes(1);
-    expect(result).toBe(true);
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    // 4 (round 0) + 4 (round 1, clean) = 8
+    expect(append).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT * 2);
   });
+});
 
-  it('stops early when only minor issues remain', async () => {
+// ─── Reviewer history is passed on re-review ───────────────────────────────
+
+describe('finalReviewPhase — passes full prior-round history to reviewers', () => {
+  it('round-0 prompts contain NO history; round-1 prompts DO', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical bug', severity: 'critical' },
-    ]));
-    // Second round: only minor issues
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'README.md', description: 'Typo', severity: 'minor' },
-    ]));
+    mockRunStepTask.mockImplementationOnce(async () =>
+      makeResultWithFindings('efficiency', [makeFinding('critical', { title: 'round0 issue' })]),
+    );
 
-    const result = await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    // Calls 0..3 = round 0; calls 4..7 = round 1
+    const round0Prompts = mockRunStepTask.mock.calls.slice(0, 4).map((c) => c[0].prompt as string);
+    const round1Prompts = mockRunStepTask.mock.calls.slice(4, 8).map((c) => c[0].prompt as string);
+
+    for (const p of round0Prompts) expect(p).not.toContain('PRIOR REVIEW HISTORY');
+    for (const p of round1Prompts) expect(p).toContain('PRIOR REVIEW HISTORY');
+
+    // The efficiency reviewer's round-1 prompt references its round-0 finding.
+    const efficiencyRound1 = mockRunStepTask.mock.calls
+      .map((c) => c[0])
+      .filter((o) => o.profileId === 'efficiency-reviewer' && o.taskId.endsWith('-round-1'))[0];
+    expect(efficiencyRound1.prompt).toContain('round0 issue');
+    expect(efficiencyRound1.prompt).toContain('do NOT re-report resolved findings');
+  });
+});
+
+// ─── Custom reviewer set ───────────────────────────────────────────────────
+
+describe('finalReviewPhase — custom finalReviewers', () => {
+  it('runs exactly the supplied reviewers (not the defaults)', async () => {
+    const tracker = makeMockTracker();
+    const custom = [
+      { profileId: 'a-reviewer', dimension: 'a', label: 'A' },
+      { profileId: 'b-reviewer', dimension: 'b', label: 'B' },
+    ];
+    mockRunStepTask.mockImplementation(async (opts: any) => makeCleanResult(opts.profileId.replace('-reviewer', '')));
+
+    await finalReviewPhase(
+      tracker, ['/profiles'], '/cwd', '/work', 5,
+      undefined, undefined, undefined,
+      custom,
     );
 
     expect(mockRunStepTask).toHaveBeenCalledTimes(2);
-    // First round had critical → created fixer
-    // Second round had only minor → no fixers, returns true
-    expect(result).toBe(true);
+    const ids = mockRunStepTask.mock.calls.map((c) => c[0].profileId).sort();
+    expect(ids).toEqual(['a-reviewer', 'b-reviewer']);
   });
 
-  it('returns false if max rounds exhausted with critical issues remaining', async () => {
+  it('uses the custom dimension in the result dimension field', async () => {
     const tracker = makeMockTracker();
-    // All 3 rounds return critical issues
-    mockRunStepTask.mockResolvedValue(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-
-    const result = await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    expect(result).toBe(false);
-  });
-
-  it('auditLogs each round assessment', async () => {
-    const append = jest.fn().mockResolvedValue(undefined);
-    const tracker = {
-      auditLog: { append },
-    } as never;
-
-    const assessment1 = makeAssessment([
-      { file: 'src/main.ts', description: 'Critical bug', severity: 'critical' },
-    ]);
-    const assessment2 = makeAssessment([]);
-
-    mockRunStepTask.mockResolvedValueOnce(assessment1);
-    mockRunStepTask.mockResolvedValueOnce(assessment2);
+    const custom = [{ profileId: 'perf', dimension: 'perf', label: 'Perf' }];
+    mockRunStepTask.mockImplementation(async () => makeCleanResult('perf'));
 
     await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
+      tracker, ['/profiles'], '/cwd', '/work', 5,
+      undefined, undefined, undefined, custom,
     );
 
-    expect(append).toHaveBeenCalledTimes(2);
-    expect(append).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      agentId: 'final-reviewer',
-      output: assessment1,
-    }));
-    expect(append).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      agentId: 'final-reviewer',
-      output: assessment2,
-    }));
+    expect(mockRunStepTask.mock.calls[0][0].prompt).toContain('Perf');
+    expect(mockRunStepTask.mock.calls[0][0].prompt).toContain('"perf"');
   });
 });
 
-// ─── Type-level: LanePoolOptions uses phaseId (not phase) ──────────────────
+// ─── Pure helpers ───────────────────────────────────────────────────────────
 
-describe('finalReviewPhase — LanePoolOptions type for fixers', () => {
-  beforeEach(() => {
-    mockRunStepTask.mockClear();
-    mockPoolRun.mockClear();
-    mockAddTask.mockClear();
-    mockGetAllTasks.mockClear();
-    MockLanePool.mockClear();
-    MockTaskTracker.mockClear();
-    mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
+describe('isActionableSeverity', () => {
+  it('returns true for medium, high, critical', () => {
+    expect(isActionableSeverity('medium')).toBe(true);
+    expect(isActionableSeverity('high')).toBe(true);
+    expect(isActionableSeverity('critical')).toBe(true);
   });
 
-  it('fixer LanePool is constructed with phaseId (not phase)', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    const callArg = MockLanePool.mock.calls[0][0];
-    expect(callArg).toHaveProperty('phaseId', 'review');
-  });
-
-  it('fixer LanePool does not receive legacy phase field', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    const callArg = MockLanePool.mock.calls[0][0];
-    expect(callArg).not.toHaveProperty('phase');
+  it('returns false for low', () => {
+    expect(isActionableSeverity('low')).toBe(false);
   });
 });
 
-// ─── Fixer Tasks: phaseId in addTask ───────────────────────────────────────
-
-describe('finalReviewPhase — fixer task phaseId', () => {
-  beforeEach(() => {
-    mockRunStepTask.mockClear();
-    mockPoolRun.mockClear();
-    mockAddTask.mockClear();
-    mockGetAllTasks.mockClear();
-    MockLanePool.mockClear();
-    MockTaskTracker.mockClear();
-    mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
-  });
-
-  it('passes phaseId to fixer addTask calls', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([
-      { file: 'src/main.ts', description: 'Critical issue', severity: 'critical' },
-    ]));
-    mockRunStepTask.mockResolvedValueOnce(makeAssessment([]));
-
-    await finalReviewPhase(
-      tracker,
-      ['/profiles'],
-      '/cwd',
-      '/work',
-      5,
-    );
-
-    expect(mockAddTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        id: 'fixer-0',
-        title: expect.any(String),
-        profile: 'fixer',
-        files: ['src/main.ts'],
-        isCode: true,
-        dependencies: [],
-      }),
-    );
+describe('DEFAULT_FINAL_REVIEWERS', () => {
+  it('contains the four expected reviewers', () => {
+    const byDim = Object.fromEntries(DEFAULT_FINAL_REVIEWERS.map((r) => [r.dimension, r]));
+    expect(Object.keys(byDim).sort()).toEqual(['code-quality', 'efficiency', 'security', 'ui-ux']);
+    expect(byDim.efficiency.profileId).toBe('efficiency-reviewer');
+    expect(byDim['code-quality'].profileId).toBe('code-quality-reviewer');
+    expect(byDim['ui-ux'].profileId).toBe('ui-ux-reviewer');
+    expect(byDim.security.profileId).toBe('security-reviewer');
   });
 });

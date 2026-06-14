@@ -53,7 +53,9 @@ import {
     PlanReviewSchema,
     ReviewResultSchema,
     FinalReviewTopicsSchema,
+    FinalReviewResultSchema,
     TitleSchema,
+    workflowConfig,
 } from "../main.ts";
 
 // ─── Test Fixtures ──────────────────────────────────────────────────────────
@@ -315,6 +317,37 @@ describe("Zod Schemas", () => {
     it("TitleSchema accepts title up to any length", () => {
         const data = { title: "A very long title that exceeds eight words easily" };
         expect(TitleSchema.safeParse(data).success).toBe(true);
+    });
+});
+
+// ─── workflowConfig & multi-dimensional final-review schema ─────────────────
+
+describe("workflowConfig.finalReviewers & FinalReviewResultSchema re-export", () => {
+    it("workflowConfig.finalReviewers declares the four default reviewers", () => {
+        expect(Array.isArray(workflowConfig.finalReviewers)).toBe(true);
+        expect(workflowConfig.finalReviewers).toHaveLength(4);
+        expect(workflowConfig.finalReviewers.map((r) => r.profileId)).toEqual([
+            "efficiency-reviewer",
+            "code-quality-reviewer",
+            "ui-ux-reviewer",
+            "security-reviewer",
+        ]);
+    });
+
+    it("FinalReviewResultSchema is re-exported from ../main.ts and is a parseable schema", () => {
+        expect(typeof FinalReviewResultSchema.parse).toBe("function");
+        expect(typeof FinalReviewResultSchema.safeParse).toBe("function");
+    });
+
+    it("FinalReviewResultSchema validates a clean multi-dimensional result", () => {
+        const data = {
+            dimension: "efficiency",
+            applicable: true,
+            notApplicableReason: "",
+            summary: "No issues",
+            findings: [],
+        };
+        expect(FinalReviewResultSchema.safeParse(data).success).toBe(true);
     });
 });
 
@@ -885,22 +918,37 @@ describe("implementationPhase", () => {
 // ─── finalReviewPhase ───────────────────────────────────────────────────────
 
 describe("finalReviewPhase", () => {
+    /** Clean multi-dimensional reviewer result keyed off the taskId dimension. */
+    function cleanReviewerResult(taskId: string) {
+        return {
+            dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""),
+            applicable: true,
+            notApplicableReason: "",
+            summary: "No issues",
+            findings: [] as unknown[],
+        };
+    }
+
     it("returns true when no issues found", async () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValueOnce({
-            topics: [],
-            overallAssessment: "Everything looks good",
-            issues: [],
+        // All four reviewers return a clean result every round.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+                return cleanReviewerResult(taskId);
+            }
+            return {};
         });
 
         const workDir = tmpDir();
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
         expect(clean).toBe(true);
-        expect(mockRunStepTask).toHaveBeenCalledTimes(1);
+        // One round × 4 parallel reviewers = 4 runStepTask calls.
+        expect(mockRunStepTask).toHaveBeenCalledTimes(4);
     });
 
     it("spawns fixers for critical issues and returns true when fixed", async () => {
@@ -908,14 +956,36 @@ describe("finalReviewPhase", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask
-            .mockResolvedValueOnce({ topics: [], overallAssessment: "Needs fixes", issues: [{ file: "src/a.ts", description: "Bug", severity: "critical" }] })
-            .mockResolvedValueOnce({ topics: [], overallAssessment: "All fixed", issues: [] });
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+                const round = Number(taskId.match(/-round-(\d+)$/)![1]);
+                // Round 0: ONLY efficiency-reviewer reports an actionable finding;
+                // the other three dimensions are clean. Round 1: all clean.
+                if (round === 0 && taskId.startsWith("efficiency-reviewer-round-")) {
+                    return {
+                        dimension: "efficiency",
+                        applicable: true,
+                        notApplicableReason: "",
+                        summary: "Needs fixes",
+                        findings: [
+                            { id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Why it matters", fixPrompt: "Fix it by ..." },
+                        ],
+                    };
+                }
+                return cleanReviewerResult(taskId);
+            }
+            return {};
+        });
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
         expect(clean).toBe(true);
-        const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => (c[0] as Record<string, unknown>).taskId?.toString().startsWith("final-reviewer-round-"));
-        expect(finalReviewCalls).toHaveLength(2);
+        const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => {
+            const id = (c[0] as Record<string, unknown>).taskId?.toString();
+            return id !== undefined && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(id);
+        });
+        // 2 rounds × 4 reviewers = 8 reviewer calls; one fixer LanePool round.
+        expect(finalReviewCalls).toHaveLength(8);
         expect(mockLanePoolCtor).toHaveBeenCalledTimes(1);
     });
 
@@ -924,10 +994,29 @@ describe("finalReviewPhase", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValueOnce({ topics: [], overallAssessment: "Mostly good", issues: [{ file: "src/a.ts", description: "Formatting", severity: "minor" }] });
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+                // Only efficiency-reviewer reports a low-severity (non-actionable) finding.
+                if (taskId.startsWith("efficiency-reviewer-round-")) {
+                    return {
+                        dimension: "efficiency",
+                        applicable: true,
+                        notApplicableReason: "",
+                        summary: "Mostly good",
+                        findings: [
+                            { id: "f1", severity: "low", file: "src/a.ts", title: "Formatting", description: "Minor nit", fixPrompt: "Optional cleanup" },
+                        ],
+                    };
+                }
+                return cleanReviewerResult(taskId);
+            }
+            return {};
+        });
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
         expect(clean).toBe(true);
+        // Low-severity findings are recorded but do NOT spawn fixers.
         expect(mockLanePoolCtor).not.toHaveBeenCalled();
     });
 
@@ -935,14 +1024,35 @@ describe("finalReviewPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const assessmentWithCritical = { topics: [], overallAssessment: "Still broken", issues: [{ file: "src/a.ts", description: "Persistent bug", severity: "critical" }] };
         mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValue(assessmentWithCritical);
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+                // efficiency-reviewer always reports a critical finding; others clean.
+                if (taskId.startsWith("efficiency-reviewer-round-")) {
+                    return {
+                        dimension: "efficiency",
+                        applicable: true,
+                        notApplicableReason: "",
+                        summary: "Still broken",
+                        findings: [
+                            { id: "f1", severity: "critical", file: "src/a.ts", title: "Persistent bug", description: "Why it matters", fixPrompt: "Fix it by ..." },
+                        ],
+                    };
+                }
+                return cleanReviewerResult(taskId);
+            }
+            return {};
+        });
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
         expect(clean).toBe(false);
-        const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => (c[0] as Record<string, unknown>).taskId?.toString().startsWith("final-reviewer-round-"));
-        expect(finalReviewCalls).toHaveLength(3);
+        const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => {
+            const id = (c[0] as Record<string, unknown>).taskId?.toString();
+            return id !== undefined && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(id);
+        });
+        // 3 rounds × 4 reviewers = 12 reviewer calls; one fixer LanePool per round.
+        expect(finalReviewCalls).toHaveLength(12);
         expect(mockLanePoolCtor).toHaveBeenCalledTimes(3);
     });
 });
@@ -961,7 +1071,7 @@ describe("run", () => {
             if (taskId === "scouting-reviewer") return { ready: true, research: "Found everything", gaps: [] };
             if (taskId === "planner") return { tasks: [{ id: "t1", title: "Implement", prompt: "Do it", profile: "implementer", files: ["src/core.ts"], dependencies: [], is_code: true }], strategy: "Direct approach" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "Plan approved", suggestions: [] };
-            if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "Everything looks great", issues: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         setupPromptMocks();
@@ -999,7 +1109,7 @@ describe("run", () => {
             }
             if (taskId === "planner") return { tasks: [], strategy: "No tasks needed" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-            if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "Good", issues: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         setupPromptMocks();
@@ -1037,7 +1147,7 @@ describe("run", () => {
                 if (plannerCalls <= 1) return { tasks: [], strategy: "Bad plan" };
                 return { tasks: [{ id: "t1", title: "Real task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], is_code: true }], strategy: "Better plan" };
             }
-            if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "Good", issues: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         setupPromptMocks();
@@ -1065,7 +1175,7 @@ describe("run", () => {
             if (taskId === "scouting-reviewer") return { ready: true, research: "ok", gaps: [] };
             if (taskId === "planner") return { tasks: [], strategy: "none" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "ok", suggestions: [] };
-            if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "ok", issues: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         setupPromptMocks();
@@ -1099,7 +1209,7 @@ describe("run", () => {
             if (taskId === "scouting-reviewer") return { ready: true, research: "From saved reports", gaps: [] };
             if (taskId === "planner") return { tasks: [{ id: "t1", title: "Task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], is_code: true }], strategy: "Strategy" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-            if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "Done", issues: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         mockPromptForStructured.mockReset();
@@ -1128,7 +1238,7 @@ describe("run", () => {
             if (taskId === "scouting-reviewer") return { ready: true, research: "ok", gaps: [] };
             if (taskId === "planner") return { tasks: [], strategy: "none" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "ok", suggestions: [] };
-            if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "ok", issues: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         setupPromptMocks();
@@ -1166,7 +1276,7 @@ describe("run", () => {
                 if (plannerCalls <= 1) return { tasks: [], strategy: "Weak plan" };
                 return { tasks: [{ id: "t1", title: "Task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], is_code: true }], strategy: "Better plan" };
             }
-            if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "Good", issues: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         setupPromptMocks();
@@ -1206,7 +1316,7 @@ describe("run", () => {
                 if (plannerCalls <= 1) return { tasks: [], strategy: "Bad plan" };
                 return { tasks: [{ id: "t1", title: "Task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], is_code: true }], strategy: "Better plan" };
             }
-            if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "Good", issues: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         setupPromptMocks();
@@ -1237,7 +1347,7 @@ describe("run", () => {
             if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
             if (taskId === "plan-reviewer") return { ready: false, feedback: "Not good enough", suggestions: [] };
             if (taskId === "planner") return { tasks: [], strategy: "Bad" };
-            if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "ok", issues: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         setupPromptMocks();

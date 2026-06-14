@@ -257,7 +257,7 @@ export async function executePhase(
         case "review": {
             await finalReviewPhase(
                 tracker, profilesDirs, cwd, workDir, maxConcurrentTasks, apiKeys, onStatus, signal,
-                config.fixerSteps, config.titleFormatter,
+                config.finalReviewers, config.fixerSteps, config.titleFormatter,
             );
             await completePhase(phase, tracker, onStatus, phaseStartTime);
             break;

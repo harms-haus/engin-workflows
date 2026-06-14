@@ -103,7 +103,7 @@ function smartRunStepTask(opts: Record<string, unknown>): unknown {
     if (taskId === "scouting-reviewer") return { ready: true, research: "All scouted", gaps: [] };
     if (taskId === "planner") return { tasks: [], strategy: "none" };
     if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-    if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "Good", issues: [] };
+    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
     return {};
 }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import type { WorkflowRunOptions } from '@harms-haus/engin';
-import type { WorkflowConfig, SpirRunOptions } from './config';
+import type { WorkflowConfig, SpirRunOptions, FinalReviewerConfig } from './config';
 import { normalizeOptions } from './config';
 
 // ─── WorkflowConfig: phases field (replaces sidebarPhases) ─────────────────
@@ -82,6 +82,39 @@ describe('WorkflowConfig', () => {
     // @ts-expect-error — sidebarPhases should no longer exist on WorkflowConfig
     const _check: typeof config.sidebarPhases = undefined;
     expect(_check).toBeUndefined();
+  });
+});
+
+// ─── WorkflowConfig: finalReviewers field ──────────────────────────────────
+
+describe('WorkflowConfig.finalReviewers', () => {
+  it('is optional (config without it still satisfies the interface)', () => {
+    const config: WorkflowConfig = {
+      name: 'no-reviewers',
+      defaultMaxConcurrentTasks: 1,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+    };
+    expect(config.finalReviewers).toBeUndefined();
+  });
+
+  it('accepts a FinalReviewerConfig[] with profileId, dimension, and label', () => {
+    const reviewers: FinalReviewerConfig[] = [
+      { profileId: 'efficiency-reviewer', dimension: 'efficiency', label: 'Efficiency' },
+      { profileId: 'ui-ux-reviewer', dimension: 'ui-ux', label: 'UI/UX' },
+    ];
+    const config: WorkflowConfig = {
+      name: 'with-reviewers',
+      defaultMaxConcurrentTasks: 5,
+      fixerSteps: [],
+      finalReviewers: reviewers,
+      phases: [],
+      titleFormatter: (d: string) => d,
+    };
+    expect(config.finalReviewers).toHaveLength(2);
+    expect(config.finalReviewers![0].profileId).toBe('efficiency-reviewer');
+    expect(config.finalReviewers![1].dimension).toBe('ui-ux');
   });
 });
 

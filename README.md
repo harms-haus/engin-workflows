@@ -41,7 +41,7 @@ workflows/
 │   └── tsconfig.json
 ├── develop/
 │   ├── main.ts               # thin wrapper
-│   ├── profiles/             # 13 agent-profile .md files
+│   ├── profiles/             # 17 agent-profile .md files
 │   ├── tests/                # structure + behaviour tests
 │   ├── package.json
 │   ├── tsconfig.json
@@ -50,7 +50,7 @@ workflows/
 ├── improve/
 │   ├── main.ts               # thin wrapper
 │   ├── jsdom-setup.ts        # DOM test setup (improve only)
-│   ├── profiles/             # 13 agent-profile .md files
+│   ├── profiles/             # 17 agent-profile .md files
 │   ├── tests/
 │   ├── package.json
 │   ├── tsconfig.json
@@ -58,7 +58,7 @@ workflows/
 │   └── bun.lock
 ├── debug/
 │   ├── main.ts               # thin wrapper
-│   ├── profiles/             # 12 agent-profile .md files (no worker.md)
+│   ├── profiles/             # 16 agent-profile .md files (no worker.md)
 │   ├── tests/
 │   ├── package.json
 │   ├── tsconfig.json
@@ -89,7 +89,7 @@ Each `main.ts` does four things and nothing else:
 This is the complete `develop/main.ts`:
 
 ```ts
-import { runSpir, type SpirRunOptions, normalizeOptions } from '../.lib/spir';
+import { runSpir, type SpirRunOptions, type FinalReviewerConfig, normalizeOptions } from '../.lib/spir';
 import type { StepDefinition } from '@harms-haus/engin';
 
 export * from '../.lib/spir';
@@ -100,7 +100,13 @@ export const workflowConfig = {
     fixerSteps: [
         { name: 'fix', profileId: 'fixer', isReadOnly: false },
     ] as StepDefinition[],
-    sidebarPhases: [
+    finalReviewers: [
+        { profileId: 'efficiency-reviewer',   dimension: 'efficiency',   label: 'Efficiency' },
+        { profileId: 'code-quality-reviewer', dimension: 'code-quality', label: 'Code Quality' },
+        { profileId: 'ui-ux-reviewer',        dimension: 'ui-ux',        label: 'UI/UX' },
+        { profileId: 'security-reviewer',     dimension: 'security',     label: 'Security' },
+    ] as FinalReviewerConfig[],
+    phases: [
         { id: 'initialization', label: 'Initialization', icon: '⚙' },
         { id: 'scouting',       label: 'Scouting',       icon: '🔍' },
         { id: 'planning',       label: 'Planning',       icon: '📋' },
@@ -128,10 +134,11 @@ export async function run(taskPrompt: string, options: RunOptions): Promise<void
 | `name` | `'develop'` | `'improve'` | `'debug'` |
 | `defaultMaxConcurrentTasks` | `5` | `5` | `3` |
 | `fixerSteps` | `fix` (writable) | `fix` + `verify` (read-only review) | `fix` (writable) |
-| `sidebarPhases` | 5 (incl. initialization) | 4 (no initialization) | 5 (incl. initialization) |
+| `finalReviewers` | efficiency / code-quality / ui-ux / security (same 4) | same 4 | same 4 |
+| `phases` | 5 (incl. initialization) | 4 (no initialization) | 5 (incl. initialization) |
 | `titleFormatter` | `d.slice(0, 100)` | `d.slice(0, 100)` | `d.slice(0, 100)` |
 
-These five fields are the *entire* code-level difference between the workflows.
+These six fields are the *entire* code-level difference between the workflows.
 Everything else — scouting, planning, implementation, review — is identical code
 shared from `.lib/`. See [`WorkflowConfig`](./.lib/config.ts) for the interface
 definition.
@@ -154,13 +161,20 @@ definition.
 4. **Set `defaultMaxConcurrentTasks`** — the fallback lane-pool width when the
    caller does not pass `maxConcurrentTasks`.
 
-5. **Define `fixerSteps`** — the ordered review/repair steps run in the final
-   `review` phase. Each step is a `StepDefinition` (`{ name, profileId,
-   isReadOnly, schema? }`). `develop`/`debug` use one writable `fix` step;
-   `improve` chains a read-only `verify` step (with `ReviewResultSchema`)
-   after it.
+5. **Define `fixerSteps`** — the ordered repair steps run on each actionable
+   finding in the final `review` phase. Each step is a `StepDefinition`
+   (`{ name, profileId, isReadOnly, schema? }`). `develop`/`debug` use one
+   writable `fix` step; `improve` chains a read-only `verify` step (with
+   `ReviewResultSchema`) after it.
 
-6. **Customize `sidebarPhases`** *(optional)* — the phase chips shown in the UI.
+5b. **Define `finalReviewers`** *(optional)* — the specialized reviewers run in
+   parallel each round of the final review. Each entry is a `FinalReviewerConfig`
+   (`{ profileId, dimension, label }`). All three shipped workflows use the same
+   four: `efficiency-reviewer`, `code-quality-reviewer`, `ui-ux-reviewer`,
+   `security-reviewer`. Omit it to fall back to `.lib`'s `DEFAULT_FINAL_REVIEWERS`
+   (the same four).
+
+6. **Customize `phases`** *(optional)* — the phase chips shown in the UI.
    The `id` of each entry is matched against the backbone's `Phase` type
    (`scouting` | `planning` | `implementing` | `review`) plus the purely-UI
    `initialization` label for the title-generation step. Omit `initialization`
@@ -207,15 +221,16 @@ option). The backbone and step definitions reference profiles by `profileId`:
 | `NON_CODE_STEPS` (`.lib/steps.ts`) | `implementer`, `implement-reviewer` |
 | Scouting phase | `scout-coordinator`, `scout`, `scouting-reviewer` |
 | Planning phase | `planner`, `plan-reviewer` |
-| Final review phase | `final-reviewer` |
+| Final review phase | `efficiency-reviewer`, `code-quality-reviewer`, `ui-ux-reviewer`, `security-reviewer` (run in parallel; `final-reviewer` is the legacy single-reviewer) |
 | Initialization (title) | `scout` |
 
 Concrete differences across the three shipped workflows:
 
-- **`develop/` and `improve/`** ship 13 profiles, including `worker.md`.
-  **`debug/`** ships 12 — no `worker.md`. (Note: `worker.md` exists in
-  `develop/` and `improve/` profile dirs but is not currently consumed by
-  the backbone code.)
+- **`develop/` and `improve/`** ship 17 profiles each (including `worker.md`
+  and the four specialized final-reviewer profiles added with the
+  multi-dimensional review). **`debug/`** ships 16 — no `worker.md`.
+  (Note: `worker.md` exists in `develop/` and `improve/` profile dirs but is
+  not currently consumed by the backbone code.)
 - **`fixer.md`** uses `thinkingLevel: medium` in `develop`, but
   `thinkingLevel: low` in both `improve` and `debug`.
 
@@ -248,7 +263,7 @@ which verifies the thin-wrapper contract:
 - `runSpir` and `normalizeOptions` are imported from `'../.lib/spir'`.
 - `main.ts` does `export * from '../.lib/spir'` (so test imports resolve).
 - `workflowConfig` has the expected `name`, `defaultMaxConcurrentTasks`,
-  `fixerSteps` shape, `sidebarPhases` ids, and a working `titleFormatter`.
+  `fixerSteps` shape, `finalReviewers` shape, `phases` ids, and a working `titleFormatter`.
 - All re-exported phase functions, Zod schemas, and step arrays resolve.
 - Negative invariants: no `parallelAgents` references (in `main.ts` *or* `.lib/`),
   no stale `errorEvent` / web-renderer imports, correct header comment.

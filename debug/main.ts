@@ -1,5 +1,5 @@
 // ─── Debug Workflow ─────────────────────────────────────────────────────────
-import { runSpir, type SpirRunOptions, normalizeOptions } from '../.lib/spir';
+import { runSpir, type SpirRunOptions, type FinalReviewerConfig, normalizeOptions } from '../.lib/spir';
 import type { StepDefinition } from '@harms-haus/engin';
 
 // Re-export everything from the SPIR backbone (schemas, phase fns, types, etc.)
@@ -13,6 +13,12 @@ export const workflowConfig = {
     fixerSteps: [
         { name: 'fix', profileId: 'fixer', isReadOnly: false },
     ] as StepDefinition[],
+    finalReviewers: [
+        { profileId: 'efficiency-reviewer', dimension: 'efficiency', label: 'Efficiency' },
+        { profileId: 'code-quality-reviewer', dimension: 'code-quality', label: 'Code Quality' },
+        { profileId: 'ui-ux-reviewer', dimension: 'ui-ux', label: 'UI/UX' },
+        { profileId: 'security-reviewer', dimension: 'security', label: 'Security' },
+    ] as FinalReviewerConfig[],
     phases: [
         { id: 'initialization', label: 'Initialization', icon: '⚙' },
         { id: 'scouting', label: 'Scouting', icon: '🔍' },

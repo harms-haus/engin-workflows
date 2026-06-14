@@ -19,7 +19,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import type { AgentProfile } from "@harms-haus/engin";
-import type { Plan, ScoutingReview, PlanReview, ReviewResult, FinalReviewTopics } from "../main.ts";
+import type { Plan, ScoutingReview, PlanReview, ReviewResult, FinalReviewResult, FinalReviewFinding } from "../main.ts";
 
 // Capture real module before mocking so we can restore it in afterAll.
 const realModule = Object.assign({}, await import("@harms-haus/engin"));
@@ -72,6 +72,7 @@ import {
     ReviewResult as ReviewResultType,
     FinalReviewTopicsSchema,
     FinalReviewTopics as FinalReviewTopicsType,
+    FinalReviewResultSchema,
     TitleSchema,
     DebugWorkflowOptions,
     RunOptions,
@@ -139,6 +140,10 @@ function makeAllProfiles(): Map<string, AgentProfile> {
         "implementer-lite",
         "fixer",
         "final-reviewer",
+        "efficiency-reviewer",
+        "code-quality-reviewer",
+        "ui-ux-reviewer",
+        "security-reviewer",
         "test-writer",
         "test-reviewer",
     ];
@@ -155,6 +160,65 @@ function tmpDir(): string {
     );
 }
 
+// ─── Final Review mock helpers ──────────────────────────────────────────────
+//
+// The multi-dimensional final review runs 4 reviewers IN PARALLEL each round.
+// Each reviewer's prompt identifies its dimension, so these helpers key the
+// returned FinalReviewResult off the prompt text — robust to the parallel call
+// ordering. The default impl returns a clean result for every reviewer and is
+// installed in beforeEach so the `run`/callbacks tests (which mock the earlier
+// phases via mockResolvedValueOnce) get clean reviewer results once their
+// per-test queue is spent.
+
+function parseFinalReviewDimension(prompt: unknown): string | null {
+    if (typeof prompt !== "string") return null;
+    const m = /focused on a single dimension: [^(]+ \(([^)]+)\)/.exec(prompt);
+    return m ? m[1] : null;
+}
+
+function finalReviewRound0(prompt: unknown): boolean {
+    return typeof prompt === "string" && !prompt.includes("PRIOR REVIEW HISTORY");
+}
+
+function cleanFinalReviewResult(dimension: string): FinalReviewResult {
+    return { dimension, applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
+}
+
+/** Default promptForStructured impl: clean FinalReviewResult for any reviewer. */
+function defaultFinalReviewCleanImpl() {
+    return async (_session: unknown, prompt: unknown): Promise<{ result: unknown; attempts: number }> => {
+        const dimension = parseFinalReviewDimension(prompt);
+        if (dimension) return { result: cleanFinalReviewResult(dimension), attempts: 1 };
+        return { result: {}, attempts: 1 };
+    };
+}
+
+/**
+ * Build a final-review promptForStructured impl for the finalReviewPhase unit
+ * tests.
+ *  - criticalEveryRound: every reviewer, every round returns one critical finding.
+ *  - criticalRound0Dim:   one dimension returns a critical finding in round 0 only.
+ *  - lowEveryRound:       every reviewer returns a low (non-actionable) finding.
+ */
+function finalReviewImpl(opts: {
+    criticalEveryRound?: boolean;
+    criticalRound0Dim?: string;
+    lowEveryRound?: boolean;
+} = {}) {
+    return async (_session: unknown, prompt: unknown): Promise<{ result: FinalReviewResult; attempts: number }> => {
+        const dimension = parseFinalReviewDimension(prompt) ?? "unknown";
+        let findings: FinalReviewFinding[] = [];
+        if (opts.criticalEveryRound) {
+            findings = [{ id: "f1", severity: "critical", file: "src/a.ts", title: "Persistent bug", description: "Why it matters", fixPrompt: "Fix it by ..." }];
+        } else if (opts.lowEveryRound) {
+            findings = [{ id: "f1", severity: "low", file: "src/a.ts", title: "Nit", description: "Formatting", fixPrompt: "Fix it by ..." }];
+        } else if (opts.criticalRound0Dim && finalReviewRound0(prompt) && dimension === opts.criticalRound0Dim) {
+            findings = [{ id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Why it matters", fixPrompt: "Fix it by ..." }];
+        }
+        return { result: { dimension, applicable: true, notApplicableReason: "", summary: findings.length ? "Has findings" : "No issues", findings }, attempts: 1 };
+    };
+}
+
 // ─── Setup ──────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
@@ -162,6 +226,11 @@ beforeEach(() => {
     mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
     mockResolveProfilesDirs.mockReturnValue(["/resolved/profiles"]);
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
+    // Default: any final-review reviewer call returns a clean FinalReviewResult.
+    // Per-test mockResolvedValueOnce values (for the sequential phases) take
+    // priority; this impl only handles the 4 parallel reviewer calls once those
+    // are spent.
+    mockPromptForStructured.mockImplementation(defaultFinalReviewCleanImpl());
     mockLanePoolRun.mockImplementation(async function(this: unknown) {
         // Auto-process tasks from the LanePool's taskTracker so tests
         // don't need to manually drive the pool.
@@ -348,6 +417,37 @@ describe("Zod Schemas", () => {
             ],
         };
         expect(FinalReviewTopicsSchema.safeParse(data).success).toBe(true);
+    });
+
+    it("FinalReviewResultSchema validates a clean (no findings) result", () => {
+        const data = {
+            dimension: "efficiency",
+            applicable: true,
+            notApplicableReason: "",
+            summary: "No issues",
+            findings: [],
+        };
+        expect(FinalReviewResultSchema.safeParse(data).success).toBe(true);
+    });
+
+    it("FinalReviewResultSchema validates a result with a finding", () => {
+        const data = {
+            dimension: "security",
+            applicable: true,
+            notApplicableReason: "",
+            summary: "1 finding",
+            findings: [
+                {
+                    id: "sqli-in-user-query",
+                    severity: "critical",
+                    file: "src/auth.ts:42-58",
+                    title: "SQL injection",
+                    description: "User input is concatenated into the query.",
+                    fixPrompt: "Parameterize the query.",
+                },
+            ],
+        };
+        expect(FinalReviewResultSchema.safeParse(data).success).toBe(true);
     });
 
     it("TitleSchema validates a concise title string", () => {
@@ -839,66 +939,43 @@ describe("finalReviewPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const assessment: FinalReviewTopics = {
-            topics: [{ topic: "Code quality", files: ["src/main.ts"] }],
-            overallAssessment: "Code looks good",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
+        // All 4 reviewers return a clean FinalReviewResult.
+        mockPromptForStructured.mockImplementation(finalReviewImpl());
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
 
         expect(clean).toBe(true);
-        expect(mockPromptForStructured).toHaveBeenCalledTimes(1);
+        // 4 reviewers run in parallel each round; one clean round = 4 calls.
+        expect(mockPromptForStructured).toHaveBeenCalledTimes(4);
     });
 
-    it("returns true when only minor issues found", async () => {
+    it("returns true when only low-severity (non-actionable) findings found", async () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const assessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Mostly good",
-            issues: [
-                { file: "src/a.ts", description: "Formatting", severity: "minor" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
+        // Low findings are recorded but do NOT spawn fixers.
+        mockPromptForStructured.mockImplementation(finalReviewImpl({ lowEveryRound: true }));
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir");
 
         expect(clean).toBe(true);
-        // Only one review round — no fixers spawned since only minor issues
-        expect(mockPromptForStructured).toHaveBeenCalledTimes(1);
+        // Only one review round — no fixers spawned since low is not actionable.
+        expect(mockPromptForStructured).toHaveBeenCalledTimes(4);
     });
 
     it("uses LanePool with FIXER_STEPS for critical issues (not parallelAgents)", async () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        // First review: finds critical issue
-        const firstAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Bug", severity: "critical" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
-
-        // Second review: clean
-        const secondAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "All fixed",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
+        // Round 0: the efficiency reviewer returns a critical finding; the
+        // other 3 reviewers are clean. Round 1: all clean.
+        mockPromptForStructured.mockImplementation(finalReviewImpl({ criticalRound0Dim: "efficiency" }));
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir");
 
         expect(clean).toBe(true);
-        // Two review rounds
-        expect(mockPromptForStructured).toHaveBeenCalledTimes(2);
+        // Two review rounds × 4 reviewers = 8 reviewer calls.
+        expect(mockPromptForStructured).toHaveBeenCalledTimes(8);
 
         // LanePool should have been constructed for the fixer round
         // (at least once — for the fixer LanePool)
@@ -924,37 +1001,22 @@ describe("finalReviewPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        // Every review finds critical issues
-        const assessmentWithCritical: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Still broken",
-            issues: [
-                { file: "src/a.ts", description: "Persistent bug", severity: "critical" },
-            ],
-        };
-
-        mockPromptForStructured.mockResolvedValue({ result: assessmentWithCritical, attempts: 1 });
+        // Every reviewer, every round returns a critical finding.
+        mockPromptForStructured.mockImplementation(finalReviewImpl({ criticalEveryRound: true }));
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir");
 
         expect(clean).toBe(false);
-        // Should have run 3 rounds of review (all rounds exhausted)
-        expect(mockPromptForStructured).toHaveBeenCalledTimes(3);
+        // 3 rounds × 4 reviewers = 12 reviewer calls (all rounds exhausted).
+        expect(mockPromptForStructured).toHaveBeenCalledTimes(12);
     });
 
     it("finalReviewPhase does not use parallelAgents", async () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const assessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Bug", severity: "critical" },
-            ],
-        };
-
-        mockPromptForStructured.mockResolvedValue({ result: assessment, attempts: 1 });
+        // A critical finding in round 0 forces a fixer LanePool; round 1 is clean.
+        mockPromptForStructured.mockImplementation(finalReviewImpl({ criticalRound0Dim: "efficiency" }));
 
         // Import the engin module and verify parallelAgents is not called
         // by checking that our mock for it doesn't exist (we didn't mock it)
@@ -974,23 +1036,8 @@ describe("finalReviewPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const assessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Bug", severity: "critical" },
-            ],
-        };
-
-        // First review finds issue, second is clean
-        const cleanAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Fixed",
-            issues: [],
-        };
-        mockPromptForStructured
-            .mockResolvedValueOnce({ result: assessment, attempts: 1 })
-            .mockResolvedValueOnce({ result: cleanAssessment, attempts: 1 });
+        // Round 0: efficiency reviewer returns a critical finding; round 1: clean.
+        mockPromptForStructured.mockImplementation(finalReviewImpl({ criticalRound0Dim: "efficiency" }));
 
         const controller = new AbortController();
         const clean = await finalReviewPhase(
@@ -1063,12 +1110,14 @@ describe("run", () => {
                     suggestions: [],
                 }, attempts: 1,
             })
-            // finalReview: clean
+            // finalReview: clean (4 parallel reviewers; default impl returns clean)
             .mockResolvedValueOnce({
                 result: {
-                    topics: [],
-                    overallAssessment: "Everything looks great",
-                    issues: [],
+                    dimension: "efficiency",
+                    applicable: true,
+                    notApplicableReason: "",
+                    summary: "No issues",
+                    findings: [],
                 }, attempts: 1,
             });
 
@@ -1099,7 +1148,7 @@ describe("run", () => {
             .mockResolvedValueOnce({ result: { ready: true, research: "ok", gaps: [] }, attempts: 1 })
             .mockResolvedValueOnce({ result: { tasks: [], strategy: "none" }, attempts: 1 })
             .mockResolvedValueOnce({ result: { ready: true, feedback: "ok", suggestions: [] }, attempts: 1 })
-            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "ok", issues: [] }, attempts: 1 });
+            .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 
         // Call run without profilesDir — should trigger resolveProfilesDirs
         await run("Build a feature", {
@@ -1120,7 +1169,7 @@ describe("run", () => {
             .mockResolvedValueOnce({ result: { ready: true, research: "ok", gaps: [] }, attempts: 1 })
             .mockResolvedValueOnce({ result: { tasks: [], strategy: "none" }, attempts: 1 })
             .mockResolvedValueOnce({ result: { ready: true, feedback: "ok", suggestions: [] }, attempts: 1 })
-            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "ok", issues: [] }, attempts: 1 });
+            .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 
         await run("Build a feature", {
             profilesDir: "/my-profiles",
@@ -1141,7 +1190,7 @@ describe("run", () => {
             .mockResolvedValueOnce({ result: { ready: true, research: "ok", gaps: [] }, attempts: 1 })
             .mockResolvedValueOnce({ result: { tasks: [], strategy: "none" }, attempts: 1 })
             .mockResolvedValueOnce({ result: { ready: true, feedback: "ok", suggestions: [] }, attempts: 1 })
-            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "ok", issues: [] }, attempts: 1 });
+            .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 
         // Note: WorkflowTUI is not mocked here, but we can verify the behavior
         // by checking that the run completes without error when no maxConcurrentTasks
@@ -1164,7 +1213,7 @@ describe("run", () => {
             .mockResolvedValueOnce({ result: { ready: true, research: "ok", gaps: [] }, attempts: 1 })
             .mockResolvedValueOnce({ result: { tasks: [], strategy: "none" }, attempts: 1 })
             .mockResolvedValueOnce({ result: { ready: true, feedback: "ok", suggestions: [] }, attempts: 1 })
-            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "ok", issues: [] }, attempts: 1 });
+            .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 
         await run("Test task", {
             profilesDir: "/profiles",
@@ -1209,12 +1258,14 @@ describe("run", () => {
             })
             // plan review
             .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
-            // final review
+            // final review (4 parallel reviewers; default impl returns clean)
             .mockResolvedValueOnce({
                 result: {
-                    topics: [],
-                    overallAssessment: "Done",
-                    issues: [],
+                    dimension: "efficiency",
+                    applicable: true,
+                    notApplicableReason: "",
+                    summary: "No issues",
+                    findings: [],
                 }, attempts: 1,
             });
 
@@ -1246,7 +1297,7 @@ describe("run", () => {
             // plan review
             .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
             // final review
-            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
+            .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 
         await run("Build something", {
             profilesDir: "/profiles",
@@ -1296,7 +1347,7 @@ describe("run", () => {
             // plan review round 2: approved
             .mockResolvedValueOnce({ result: { ready: true, feedback: "Better", suggestions: [] }, attempts: 1 })
             // final review
-            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
+            .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 
         await run("Fix the bug", {
             profilesDir: "/profiles",

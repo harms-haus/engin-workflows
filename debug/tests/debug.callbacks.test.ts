@@ -66,6 +66,10 @@ function makeAllProfiles(): Map<string, AgentProfile> {
         "implementer",
         "fixer",
         "final-reviewer",
+        "efficiency-reviewer",
+        "code-quality-reviewer",
+        "ui-ux-reviewer",
+        "security-reviewer",
         "test-writer",
         "test-reviewer",
     ];
@@ -96,6 +100,29 @@ function tmpDir(): string {
     );
 }
 
+// ─── Final Review mock helper ───────────────────────────────────────────────
+//
+// The multi-dimensional final review runs 4 reviewers in parallel each round.
+// This default promptForStructured implementation returns a clean
+// FinalReviewResult for any reviewer prompt (keyed off the dimension in the
+// prompt), so the `run`-based callback tests get clean reviewer results once
+// their per-test mockResolvedValueOnce queue is spent. It returns an empty
+// object for non-final-review prompts (which are always served by the queued
+// mockResolvedValueOnce values anyway).
+function defaultFinalReviewCleanImpl() {
+    return async (_session: unknown, prompt: unknown): Promise<{ result: unknown; attempts: number }> => {
+        if (typeof prompt === "string" && prompt.includes("FINAL review of the codebase")) {
+            const m = /focused on a single dimension: [^(]+ \(([^)]+)\)/.exec(prompt);
+            const dimension = m ? m[1] : "efficiency";
+            return {
+                result: { dimension, applicable: true, notApplicableReason: "", summary: "No issues", findings: [] },
+                attempts: 1,
+            };
+        }
+        return { result: {}, attempts: 1 };
+    };
+}
+
 /** Set up default mocks for a minimal successful run (no tasks). */
 function setupHappyPathMocks() {
     mockLoadProfiles.mockResolvedValue(makeAllProfiles());
@@ -116,7 +143,7 @@ function setupHappyPathMocks() {
         // plan review: approved
         .mockResolvedValueOnce({ result: { ready: true, feedback: "Plan approved", suggestions: [] }, attempts: 1 })
         // final review: clean
-        .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
+        .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 }
 
 /** Set up mocks for a run with one implementation task (approved by LanePool). */
@@ -155,7 +182,7 @@ function setupRunWithTaskMocks() {
         // plan review: approved
         .mockResolvedValueOnce({ result: { ready: true, feedback: "Plan approved", suggestions: [] }, attempts: 1 })
         // final review: clean
-        .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
+        .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 }
 
 /** Set up mocks for a run with one task where LanePool reports a failed task
@@ -195,7 +222,7 @@ function setupRunWithFailedTaskMocks() {
         // plan review: approved
         .mockResolvedValueOnce({ result: { ready: true, feedback: "Plan approved", suggestions: [] }, attempts: 1 })
         // final review: clean
-        .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
+        .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 }
 
 // ─── Setup ──────────────────────────────────────────────────────────────────
@@ -208,6 +235,11 @@ beforeEach(() => {
     mockResolveProfilesDirs.mockReset();
     mockLanePoolRun.mockReset();
     mockLanePoolCtor.mockReset();
+    // Default: any final-review reviewer call returns a clean FinalReviewResult.
+    // Per-test mockResolvedValueOnce values (for the sequential phases) take
+    // priority; this impl only handles the 4 parallel reviewer calls once those
+    // are spent.
+    mockPromptForStructured.mockImplementation(defaultFinalReviewCleanImpl());
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -258,7 +290,7 @@ describe("Workflow-level callbacks", () => {
             // plan review: approved
             .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
             // final review: clean
-            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "OK", issues: [] }, attempts: 1 });
+            .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 
         const onWorkflowStart = mock();
         await run("Resumed task", {
@@ -412,7 +444,7 @@ describe("Workflow-level callbacks", () => {
             // plan review: approved
             .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
             // final review: clean
-            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "OK", issues: [] }, attempts: 1 });
+            .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 
         const onAgentSpawn = mock();
         const onAgentComplete = mock();
@@ -744,7 +776,7 @@ describe("Workflow-level callbacks", () => {
             // plan review: approved
             .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
             // final review: clean
-            .mockResolvedValueOnce({ result: { topics: [], overallAssessment: "OK", issues: [] }, attempts: 1 });
+            .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 
         const onAgentSpawn = mock();
         await run("Resumed task", {

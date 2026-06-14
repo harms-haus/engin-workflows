@@ -144,6 +144,52 @@ function tmpDir(): string {
     );
 }
 
+// ─── Multi-dimensional final-review mock helpers ─────────────────────────────
+//
+// The final review now runs four reviewers in parallel each round
+// (efficiency / code-quality / ui-ux / security), each producing a
+// FinalReviewResult. To keep fixer-task counts predictable these helpers make
+// ONLY the efficiency-reviewer report findings (rounds <= lastIssueRound); the
+// other three dimensions always return a clean result.
+
+/** Clean FinalReviewResult keyed off the reviewer taskId dimension. */
+function cleanReviewerResult(taskId: string) {
+    return {
+        dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""),
+        applicable: true,
+        notApplicableReason: "",
+        summary: "No issues",
+        findings: [] as unknown[],
+    };
+}
+
+/**
+ * runStepTask implementation for finalReviewPhase tests. Only the
+ * efficiency-reviewer reports `efficiencyFindings` on rounds <= lastIssueRound
+ * (default: round 0 only); every other reviewer is clean on every round.
+ */
+function reviewerRunStepTaskImpl(
+    opts: Record<string, unknown>,
+    efficiencyFindings: unknown[],
+    lastIssueRound = 0,
+): unknown {
+    const taskId = opts.taskId as string;
+    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+        const round = Number(taskId.match(/-round-(\d+)$/)![1]);
+        if (taskId.startsWith("efficiency-reviewer-round-") && round <= lastIssueRound) {
+            return {
+                dimension: "efficiency",
+                applicable: true,
+                notApplicableReason: "",
+                summary: "Needs fixes",
+                findings: efficiencyFindings,
+            };
+        }
+        return cleanReviewerResult(taskId);
+    }
+    return {};
+}
+
 // ─── Setup ──────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
@@ -228,11 +274,8 @@ describe("CHANGE 7: finalReviewPhase signature includes workDir, maxConcurrentTa
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValueOnce({
-            topics: [],
-            overallAssessment: "Clean",
-            issues: [],
-        });
+        // All four reviewers return a clean result every round.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => reviewerRunStepTaskImpl(opts, []));
 
         // Should accept the new signature: (tracker, profilesDirs, cwd, workDir, maxConcurrentTasks, ...)
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
@@ -247,11 +290,8 @@ describe("CHANGE 7: finalReviewPhase signature includes workDir, maxConcurrentTa
         const controller = new AbortController();
 
         mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValueOnce({
-            topics: [],
-            overallAssessment: "Clean",
-            issues: [],
-        });
+        // All four reviewers return a clean result every round.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => reviewerRunStepTaskImpl(opts, []));
 
         // Full new signature: (tracker, profilesDirs, cwd, workDir, maxConcurrentTasks, apiKeys, onStatus, signal)
         const clean = await finalReviewPhase(
@@ -274,22 +314,13 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        // First review: finds critical issues
-        mockRunStepTask
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Needs fixes",
-                issues: [
-                    { file: "src/a.ts", description: "Critical bug in auth", severity: "critical" },
-                    { file: "src/b.ts", description: "Critical bug in db", severity: "critical" },
-                ],
-            })
-            // Second review: all fixed
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "All fixed",
-                issues: [],
-            });
+        // Round 0: ONLY efficiency-reviewer reports a critical finding; the
+        // other three dimensions are clean. Round 1: all clean.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) =>
+            reviewerRunStepTaskImpl(opts, [
+                { id: "f1", severity: "critical", file: "src/a.ts", title: "Critical bug in auth", description: "Critical bug in auth", fixPrompt: "Fix it by ..." },
+            ]),
+        );
 
         const clean = await finalReviewPhase(
             tracker, ["/profiles"], "/cwd", workDir, 3,
@@ -326,21 +357,14 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Needs fixes",
-                issues: [
-                    { file: "src/a.ts", description: "Bug A", severity: "critical" },
-                    { file: "src/b.ts", description: "Bug B", severity: "critical" },
-                    { file: "src/c.ts", description: "Bug C", severity: "critical" },
-                ],
-            })
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Fixed",
-                issues: [],
-            });
+        // Round 0: efficiency-reviewer reports 3 critical findings → 3 fixer tasks.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) =>
+            reviewerRunStepTaskImpl(opts, [
+                { id: "f1", severity: "critical", file: "src/a.ts", title: "Bug A", description: "Bug A", fixPrompt: "Fix it by ..." },
+                { id: "f2", severity: "critical", file: "src/b.ts", title: "Bug B", description: "Bug B", fixPrompt: "Fix it by ..." },
+                { id: "f3", severity: "critical", file: "src/c.ts", title: "Bug C", description: "Bug C", fixPrompt: "Fix it by ..." },
+            ]),
+        );
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -369,19 +393,12 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Needs fixes",
-                issues: [
-                    { file: "src/auth.ts", description: "Missing null check on token", severity: "critical" },
-                ],
-            })
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Fixed",
-                issues: [],
-            });
+        // Round 0: efficiency-reviewer reports 1 critical finding.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) =>
+            reviewerRunStepTaskImpl(opts, [
+                { id: "f1", severity: "critical", file: "src/auth.ts", title: "Missing null check", description: "Missing null check on token", fixPrompt: "Fix it by ..." },
+            ]),
+        );
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -411,19 +428,12 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Needs fixes",
-                issues: [
-                    { file: "src/a.ts", description: "Bug", severity: "critical" },
-                ],
-            })
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Fixed",
-                issues: [],
-            });
+        // Round 0: efficiency-reviewer reports 1 critical finding; round 1 clean.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) =>
+            reviewerRunStepTaskImpl(opts, [
+                { id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Bug", fixPrompt: "Fix it by ..." },
+            ]),
+        );
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 7);
 
@@ -451,19 +461,12 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Needs fixes",
-                issues: [
-                    { file: "src/a.ts", description: "Bug", severity: "critical" },
-                ],
-            })
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Fixed",
-                issues: [],
-            });
+        // Round 0: efficiency-reviewer reports 1 critical finding; round 1 clean.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) =>
+            reviewerRunStepTaskImpl(opts, [
+                { id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Bug", fixPrompt: "Fix it by ..." },
+            ]),
+        );
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -491,19 +494,12 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Needs fixes",
-                issues: [
-                    { file: "src/a.ts", description: "Bug", severity: "critical" },
-                ],
-            })
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Fixed",
-                issues: [],
-            });
+        // Round 0: efficiency-reviewer reports 1 critical finding; round 1 clean.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) =>
+            reviewerRunStepTaskImpl(opts, [
+                { id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Bug", fixPrompt: "Fix it by ..." },
+            ]),
+        );
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -532,19 +528,12 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Needs fixes",
-                issues: [
-                    { file: "src/a.ts", description: "Bug", severity: "critical" },
-                ],
-            })
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Fixed",
-                issues: [],
-            });
+        // Round 0: efficiency-reviewer reports 1 critical finding; round 1 clean.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) =>
+            reviewerRunStepTaskImpl(opts, [
+                { id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Bug", fixPrompt: "Fix it by ..." },
+            ]),
+        );
 
         const onAgentSpawn = mock();
         const onAgentComplete = mock();
@@ -572,19 +561,12 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const controller = new AbortController();
 
         mockRunStepTask.mockReset();
-        mockRunStepTask
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Needs fixes",
-                issues: [
-                    { file: "src/a.ts", description: "Bug", severity: "critical" },
-                ],
-            })
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Fixed",
-                issues: [],
-            });
+        // Round 0: efficiency-reviewer reports 1 critical finding; round 1 clean.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) =>
+            reviewerRunStepTaskImpl(opts, [
+                { id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Bug", fixPrompt: "Fix it by ..." },
+            ]),
+        );
 
         await finalReviewPhase(
             tracker, ["/profiles"], "/cwd", workDir, 5,
@@ -615,19 +597,12 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Needs fixes",
-                issues: [
-                    { file: "src/a.ts", description: "Bug", severity: "critical" },
-                ],
-            })
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Fixed",
-                issues: [],
-            });
+        // Round 0: efficiency-reviewer reports 1 critical finding; round 1 clean.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) =>
+            reviewerRunStepTaskImpl(opts, [
+                { id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Bug", fixPrompt: "Fix it by ..." },
+            ]),
+        );
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -655,19 +630,12 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         mockRunStepTask.mockReset();
-        mockRunStepTask
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Needs fixes",
-                issues: [
-                    { file: "src/a.ts", description: "Bug", severity: "critical" },
-                ],
-            })
-            .mockResolvedValueOnce({
-                topics: [],
-                overallAssessment: "Fixed",
-                issues: [],
-            });
+        // Round 0: efficiency-reviewer reports 1 critical finding; round 1 clean.
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) =>
+            reviewerRunStepTaskImpl(opts, [
+                { id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Bug", fixPrompt: "Fix it by ..." },
+            ]),
+        );
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -706,7 +674,7 @@ describe("CHANGE 9: executePhase passes workDir, maxConcurrentTasks, signal to f
             if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
             if (taskId === "planner") return { tasks: [], strategy: "none" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-            if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "Good", issues: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         mockPromptForStructured.mockReset();
@@ -757,7 +725,6 @@ describe("CHANGE 9: executePhase passes workDir, maxConcurrentTasks, signal to f
         const workDir = tmpDir();
 
         mockRunStepTask.mockReset();
-        let finalReviewCalls = 0;
         mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
             const taskId = opts.taskId as string;
             if (taskId === "title-generator") return { title: "AI title" };
@@ -765,18 +732,12 @@ describe("CHANGE 9: executePhase passes workDir, maxConcurrentTasks, signal to f
             if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
             if (taskId === "planner") return { tasks: [], strategy: "none" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-            if (taskId?.toString().startsWith("final-reviewer-round-")) {
-                finalReviewCalls++;
-                if (finalReviewCalls <= 1) {
-                    return {
-                        topics: [],
-                        overallAssessment: "Needs fix",
-                        issues: [
-                            { file: "src/a.ts", description: "Critical bug", severity: "critical" },
-                        ],
-                    };
-                }
-                return { topics: [], overallAssessment: "Fixed", issues: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+                // Round 0: efficiency-reviewer reports a critical finding; round 1: all clean.
+                return reviewerRunStepTaskImpl(
+                    opts,
+                    [{ id: "f1", severity: "critical", file: "src/a.ts", title: "Critical bug", description: "Critical bug", fixPrompt: "Fix it by ..." }],
+                );
             }
             return {};
         });

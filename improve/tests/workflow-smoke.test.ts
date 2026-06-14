@@ -153,11 +153,13 @@ function smartRunStepTask(opts: Record<string, unknown>): unknown {
         };
     }
 
-    if (taskId?.toString().startsWith("final-reviewer-round-")) {
+    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
         return {
-            topics: [{ topic: "overall quality", files: ["src/core.ts"] }],
-            overallAssessment: "Code quality is good",
-            issues: [],
+            dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""),
+            applicable: true,
+            notApplicableReason: "",
+            summary: "Code quality is good",
+            findings: [],
         };
     }
 
