@@ -382,12 +382,16 @@ export async function runSpir(
         }
     } catch (error: unknown) {
         const err = error instanceof Error ? error : new Error(String(error));
+        // Always durably persist the tracker state before exiting, regardless of
+        // the error type. Without this, a Ctrl+C that aborts mid-execution throws
+        // an AbortError (not 'Workflow cancelled') and skips the save — losing the
+        // in-memory task statuses (completed tasks, in-flight 'active' tasks) so
+        // the next resume can't tell what already ran and re-runs everything.
+        await tracker.save();
+        onStatus?.onWorkflowFailed?.({ error: err, phaseId: tracker.currentPhaseId });
         if (err.message === 'Workflow cancelled') {
-            await tracker.save();
-            onStatus?.onWorkflowFailed?.({ error: err, phaseId: tracker.currentPhaseId });
             return;
         }
-        onStatus?.onWorkflowFailed?.({ error: err, phaseId: tracker.currentPhaseId });
         throw error;
     }
 
