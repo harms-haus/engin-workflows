@@ -12,5 +12,5 @@
     },
     "baseUrl": "."
   },
-  "include": ["**/*.ts", "**/*.tsx"]
+  "include": ["**/*.ts", "**/*.tsx", "../.lib/**/*.ts"]
 }

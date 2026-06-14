@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "engin-workflow-develop",
+      "name": "engin-workflow-lib",
       "dependencies": {
         "@harms-haus/engin": "link:@harms-haus/engin",
         "zod": "^3.25.0",

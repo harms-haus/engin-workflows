@@ -3,14 +3,10 @@
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "jsx": "react-jsx",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "paths": {
-      "@app/*": ["./node_modules/@harms-haus/engin/web/src/*"]
-    },
-    "baseUrl": "."
+    "noEmit": true
   },
-  "include": ["**/*.ts", "**/*.tsx", "../.lib/**/*.ts"]
+  "include": ["**/*.ts"]
 }

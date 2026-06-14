@@ -1,166 +1,250 @@
 // ─── Debug Workflow Structural Verification Tests ──────────────────────────
 //
-// Tests that verify structural properties of the debug/main.ts source file
-// by reading it as text. These tests ensure:
-//   1. No parallelAgents import or reference
-//   2. No DevelopWorkflowOptions reference (should be DebugWorkflowOptions)
-//   3. resolveProfilesDirs uses 'debug' as the workflow name
-//   4. FIXER_STEPS is defined and used (at least 2 occurrences)
-//   5. scout-coordinator is used (at least 4 occurrences)
-//   6. No errorEvent function
-//   7. No web renderer imports or references
-//   8. Comment header says 'Debug Workflow'
-//   9. Default maxConcurrentTasks is 3 (not 5)
+// Tests that verify structural properties of the debug workflow.
+//
+// Part A: Import-based (runtime) — import from debug/main.ts and verify the
+//   config shape, exported functions, and re-exported symbols.
+// Part B: Text-based (static) — read main.ts and .lib/ as source text and
+//   verify structural invariants (no forbidden patterns, correct imports,
+//   header comments, etc.).
 // ────────────────────────────────────────────────────────────────────────────
 
-import { describe, it, expect, beforeAll } from "bun:test";
+import { describe, it, expect, beforeAll, mock } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-let source: string;
+// Capture real module before mocking so we can spread it into the mock.
+const realModule = Object.assign({}, await import("@harms-haus/engin"));
+
+mock.module("@harms-haus/engin", () => ({
+    ...realModule,
+    createHarness: mock(() => { throw new Error("not mocked"); }),
+    promptForStructured: mock(() => { throw new Error("not mocked"); }),
+    loadProfilesFromDirs: mock(() => { throw new Error("not mocked"); }),
+    resolveProfilesDirs: mock(() => []),
+    LanePool: mock(function (this: { run: unknown }) {
+        this.run = mock(() => { throw new Error("not mocked"); });
+    }),
+}));
+
+// ─── Runtime imports (after mocks) ─────────────────────────────────────────
+
+import {
+    run,
+    workflowConfig,
+    scoutingPhase,
+    scoutingReviewPhase,
+    planningPhase,
+    planReviewPhase,
+    implementationPhase,
+    finalReviewPhase,
+    ScoutingTopicSchema,
+    ScoutingGapSchema,
+    ScoutingReviewSchema,
+    PlanSchema,
+    PlanReviewSchema,
+    ReviewResultSchema,
+    FinalReviewTopicsSchema,
+    TitleSchema,
+    CODE_STEPS,
+    NON_CODE_STEPS,
+} from "../main";
+
+// ─── Static source text ─────────────────────────────────────────────────────
+
+let mainSource: string;
+let libScoutingSource: string;
 
 beforeAll(async () => {
-    const filePath = path.resolve(import.meta.dir, "..", "main.ts");
-    source = await fs.readFile(filePath, "utf-8");
+    mainSource = await fs.readFile(
+        path.resolve(import.meta.dir, "..", "main.ts"),
+        "utf-8",
+    );
+    libScoutingSource = await fs.readFile(
+        path.resolve(import.meta.dir, "..", "..", ".lib", "scouting.ts"),
+        "utf-8",
+    );
 });
 
-// ─── 1. No parallelAgents ───────────────────────────────────────────────────
+// ─── A. Runtime: workflowConfig shape ───────────────────────────────────────
 
-describe("No parallelAgents", () => {
-    it("contains zero references to parallelAgents", () => {
-        const matches = source.match(/parallelAgents/g);
-        expect(matches).toBeNull();
+describe("workflowConfig", () => {
+    it("is exported and is an object", () => {
+        expect(workflowConfig).toBeDefined();
+        expect(typeof workflowConfig).toBe("object");
     });
 
-    it("does not import parallelAgents", () => {
-        const importLine = source.split("\n").find((line) =>
-            line.includes("import") && line.includes("parallelAgents"),
-        );
-        expect(importLine).toBeUndefined();
-    });
-});
-
-// ─── 2. No DevelopWorkflowOptions ───────────────────────────────────────────
-
-describe("No DevelopWorkflowOptions", () => {
-    it("contains zero references to DevelopWorkflowOptions", () => {
-        const matches = source.match(/DevelopWorkflowOptions/g);
-        expect(matches).toBeNull();
+    it("has name: 'debug'", () => {
+        expect(workflowConfig.name).toBe("debug");
     });
 
-    it("uses DebugWorkflowOptions instead", () => {
-        const matches = source.match(/DebugWorkflowOptions/g);
-        expect(matches).not.toBeNull();
-        expect(matches!.length).toBeGreaterThanOrEqual(2); // definition + RunOptions extends
-    });
-});
-
-// ─── 3. resolveProfilesDirs uses 'debug' ────────────────────────────────────
-
-describe("resolveProfilesDirs uses 'debug' workflow name", () => {
-    it("calls resolveProfilesDirs with 'debug' as the second argument", () => {
-        // Should contain resolveProfilesDirs(..., 'debug')
-        const lines = source.split("\n");
-        const resolveLine = lines.find((line) =>
-            line.includes("resolveProfilesDirs") && !line.includes("import"),
-        );
-        expect(resolveLine).toBeDefined();
-        expect(resolveLine!).toContain("'debug'");
-        expect(resolveLine!).not.toContain("'develop'");
+    it("has defaultMaxConcurrentTasks: 3", () => {
+        expect(workflowConfig.defaultMaxConcurrentTasks).toBe(3);
     });
 
-    it("does not call resolveProfilesDirs with 'develop'", () => {
-        const lines = source.split("\n");
-        const developResolve = lines.find((line) =>
-            line.includes("resolveProfilesDirs") && line.includes("'develop'"),
-        );
-        expect(developResolve).toBeUndefined();
-    });
-});
-
-// ─── 4. FIXER_STEPS defined and used ────────────────────────────────────────
-
-describe("FIXER_STEPS", () => {
-    it("contains at least 2 references to FIXER_STEPS (definition + usage)", () => {
-        const matches = source.match(/FIXER_STEPS/g);
-        expect(matches).not.toBeNull();
-        expect(matches!.length).toBeGreaterThanOrEqual(2);
+    it("has fixerSteps with exactly 1 step", () => {
+        expect(Array.isArray(workflowConfig.fixerSteps)).toBe(true);
+        expect(workflowConfig.fixerSteps).toHaveLength(1);
     });
 
-    it("defines FIXER_STEPS as a constant with StepDefinition type", () => {
-        const fixerStepsMatch = source.match(
-            /(?:const|let)\s+FIXER_STEPS\s*:\s*StepDefinition\[\]/,
-        );
-        expect(fixerStepsMatch).not.toBeNull();
+    it("fixerSteps[0] has name:'fix', profileId:'fixer', isReadOnly:false", () => {
+        const step = workflowConfig.fixerSteps[0];
+        expect(step.name).toBe("fix");
+        expect(step.profileId).toBe("fixer");
+        expect(step.isReadOnly).toBe(false);
+    });
+
+    it("has sidebarPhases as an array with 5 entries", () => {
+        expect(Array.isArray(workflowConfig.sidebarPhases)).toBe(true);
+        expect(workflowConfig.sidebarPhases).toHaveLength(5);
+    });
+
+    it("sidebarPhases ids are: initialization, scouting, planning, implementing, review", () => {
+        const ids = workflowConfig.sidebarPhases.map((p: { id: string }) => p.id);
+        expect(ids).toEqual([
+            "initialization",
+            "scouting",
+            "planning",
+            "implementing",
+            "review",
+        ]);
+    });
+
+    it("has titleFormatter as a function", () => {
+        expect(typeof workflowConfig.titleFormatter).toBe("function");
+    });
+
+    it("titleFormatter passes short strings through unchanged", () => {
+        expect(workflowConfig.titleFormatter("short")).toBe("short");
+    });
+
+    it("titleFormatter truncates long strings to 100 chars", () => {
+        const long = "a".repeat(200);
+        expect(workflowConfig.titleFormatter(long)).toHaveLength(100);
     });
 });
 
-// ─── 5. scout-coordinator usage ─────────────────────────────────────────────
+// ─── B. Runtime: run function ──────────────────────────────────────────────
 
-describe("scout-coordinator usage", () => {
-    it("contains at least 4 references to 'scout-coordinator'", () => {
-        const matches = source.match(/scout-coordinator/g);
-        expect(matches).not.toBeNull();
-        expect(matches!.length).toBeGreaterThanOrEqual(4);
+describe("run function", () => {
+    it("is exported and is a function", () => {
+        expect(typeof run).toBe("function");
     });
 });
 
-// ─── 6. No errorEvent function ──────────────────────────────────────────────
+// ─── C. Runtime: named re-exports exist ─────────────────────────────────────
 
-describe("No errorEvent function", () => {
-    it("contains zero references to errorEvent", () => {
-        const matches = source.match(/errorEvent/g);
-        expect(matches).toBeNull();
+describe("Re-exported phase functions", () => {
+    it("scoutingPhase is a function", () => {
+        expect(typeof scoutingPhase).toBe("function");
     });
-
-    it("does not define an errorEvent function", () => {
-        const lines = source.split("\n");
-        const errorEventDef = lines.find((line) =>
-            /function\s+errorEvent/.test(line),
-        );
-        expect(errorEventDef).toBeUndefined();
+    it("scoutingReviewPhase is a function", () => {
+        expect(typeof scoutingReviewPhase).toBe("function");
     });
-
-    it("does not have a const errorEvent arrow function", () => {
-        const lines = source.split("\n");
-        const errorEventDef = lines.find((line) =>
-            /(?:const|let|var)\s+errorEvent/.test(line),
-        );
-        expect(errorEventDef).toBeUndefined();
+    it("planningPhase is a function", () => {
+        expect(typeof planningPhase).toBe("function");
+    });
+    it("planReviewPhase is a function", () => {
+        expect(typeof planReviewPhase).toBe("function");
+    });
+    it("implementationPhase is a function", () => {
+        expect(typeof implementationPhase).toBe("function");
+    });
+    it("finalReviewPhase is a function", () => {
+        expect(typeof finalReviewPhase).toBe("function");
     });
 });
 
-// ─── 7. No web renderer imports/references ──────────────────────────────────
+describe("Re-exported schemas", () => {
+    it("ScoutingTopicSchema is an object (Zod schema)", () => {
+        expect(ScoutingTopicSchema).toBeDefined();
+        expect(typeof ScoutingTopicSchema.parse).toBe("function");
+    });
+    it("ScoutingGapSchema", () => {
+        expect(typeof ScoutingGapSchema.parse).toBe("function");
+    });
+    it("ScoutingReviewSchema", () => {
+        expect(typeof ScoutingReviewSchema.parse).toBe("function");
+    });
+    it("PlanSchema", () => {
+        expect(typeof PlanSchema.parse).toBe("function");
+    });
+    it("PlanReviewSchema", () => {
+        expect(typeof PlanReviewSchema.parse).toBe("function");
+    });
+    it("ReviewResultSchema", () => {
+        expect(typeof ReviewResultSchema.parse).toBe("function");
+    });
+    it("FinalReviewTopicsSchema", () => {
+        expect(typeof FinalReviewTopicsSchema.parse).toBe("function");
+    });
+    it("TitleSchema", () => {
+        expect(typeof TitleSchema.parse).toBe("function");
+    });
+});
 
-describe("No web renderer imports or references", () => {
-    it("does not import from any web/ path", () => {
-        const webImports = source.split("\n").filter((line) =>
-            line.includes("import") && line.includes("web/"),
+describe("Re-exported step arrays", () => {
+    it("CODE_STEPS is an array with entries", () => {
+        expect(Array.isArray(CODE_STEPS)).toBe(true);
+        expect(CODE_STEPS.length).toBeGreaterThan(0);
+    });
+    it("NON_CODE_STEPS is an array with entries", () => {
+        expect(Array.isArray(NON_CODE_STEPS)).toBe(true);
+        expect(NON_CODE_STEPS.length).toBeGreaterThan(0);
+    });
+});
+
+// ─── D. Static: main.ts text assertions ────────────────────────────────────
+
+describe("main.ts: imports runSpir from '../.lib/spir'", () => {
+    it("imports runSpir from '../.lib/spir'", () => {
+        const match = mainSource.match(
+            /import\s+.*\brunSpir\b.*from\s+['"]\.\.\/\.lib\/spir['"]/,
         );
-        expect(webImports).toHaveLength(0);
+        expect(match).not.toBeNull();
+    });
+});
+
+describe("main.ts: re-exports from '../.lib/spir'", () => {
+    it("has export * from '../.lib/spir'", () => {
+        const match = mainSource.match(
+            /export\s+\*\s+from\s+['"]\.\.\/\.lib\/spir['"]/,
+        );
+        expect(match).not.toBeNull();
+    });
+});
+
+describe("main.ts: no parallelAgents", () => {
+    it("main.ts contains zero references to parallelAgents", () => {
+        expect(mainSource.match(/parallelAgents/g)).toBeNull();
     });
 
-    it("does not reference any web renderer", () => {
-        // Check for common web rendering patterns
-        const webPatterns = [
-            /web\/render/i,
-            /createWebRenderer/i,
-            /WebRenderer/i,
-            /renderToWeb/i,
-            /@app\/render/i,
-        ];
-        for (const pattern of webPatterns) {
-            expect(pattern.test(source)).toBe(false);
+    it(".lib/ contains zero references to parallelAgents", async () => {
+        const libDir = path.resolve(import.meta.dir, "..", "..", ".lib");
+        const entries = await fs.readdir(libDir);
+        for (const entry of entries) {
+            if (!entry.endsWith(".ts")) continue;
+            const content = await fs.readFile(path.join(libDir, entry), "utf-8");
+            expect(content.match(/parallelAgents/g)).toBeNull();
         }
     });
 });
 
-// ─── 8. Comment header ─────────────────────────────────────────────────────
+describe("main.ts: no DevelopWorkflowOptions", () => {
+    it("main.ts contains zero references to DevelopWorkflowOptions", () => {
+        expect(mainSource.match(/DevelopWorkflowOptions/g)).toBeNull();
+    });
 
-describe("Comment header", () => {
+    it("main.ts uses DebugWorkflowOptions", () => {
+        const matches = mainSource.match(/DebugWorkflowOptions/g);
+        expect(matches).not.toBeNull();
+        expect(matches!.length).toBeGreaterThanOrEqual(1);
+    });
+});
+
+describe("main.ts: header comment", () => {
     it("first meaningful comment contains 'Debug Workflow'", () => {
-        // Find the first comment line with actual content
-        const commentLines = source.split("\n").filter((line) =>
+        const commentLines = mainSource.split("\n").filter((line) =>
             line.trim().startsWith("//") && line.trim().length > 10,
         );
         expect(commentLines.length).toBeGreaterThan(0);
@@ -168,10 +252,9 @@ describe("Comment header", () => {
     });
 
     it("does NOT contain 'Development Workflow' in the header", () => {
-        const commentLines = source.split("\n").filter((line) =>
+        const commentLines = mainSource.split("\n").filter((line) =>
             line.trim().startsWith("//"),
         );
-        // The first non-empty comment should say 'Debug Workflow', not 'Development Workflow'
         const firstContentComment = commentLines.find((line) =>
             line.includes("Workflow"),
         );
@@ -181,122 +264,47 @@ describe("Comment header", () => {
     });
 });
 
-// ─── 9. Default maxConcurrentTasks is 3 ────────────────────────────────────
-
-describe("Default maxConcurrentTasks is 3", () => {
-    it("scoutingPhase defaults maxConcurrentTasks to 3", () => {
-        // Check that the parameter default is 3, not 5
-        const scoutingMatch = source.match(
-            /export\s+async\s+function\s+scoutingPhase[\s\S]*?maxConcurrentTasks\s*:\s*number\s*=\s*(\d+)/,
-        );
-        expect(scoutingMatch).not.toBeNull();
-        expect(scoutingMatch![1]).toBe("3");
+describe("main.ts: no errorEvent", () => {
+    it("main.ts contains zero references to errorEvent", () => {
+        expect(mainSource.match(/errorEvent/g)).toBeNull();
     });
 
-    it("implementationPhase defaults maxConcurrentTasks to 3", () => {
-        const implMatch = source.match(
-            /export\s+async\s+function\s+implementationPhase[\s\S]*?maxConcurrentTasks\s*:\s*number\s*=\s*(\d+)/,
+    it("main.ts does not define an errorEvent function", () => {
+        const errorEventDef = mainSource.split("\n").find((line) =>
+            /function\s+errorEvent/.test(line),
         );
-        expect(implMatch).not.toBeNull();
-        expect(implMatch![1]).toBe("3");
-    });
-
-    it("WorkflowTUI maxConcurrentLanes defaults to 3", () => {
-        // Find: maxConcurrentLanes: maxConcurrentTasks ?? 3
-        const tuiMatch = source.match(
-            /maxConcurrentLanes\s*:\s*maxConcurrentTasks\s*\?\?\s*(\d+)/,
-        );
-        expect(tuiMatch).not.toBeNull();
-        expect(tuiMatch![1]).toBe("3");
-    });
-
-    it("does NOT have any maxConcurrentTasks default of 5", () => {
-        // Ensure no leftover defaults of 5 from the develop workflow
-        const defaultFive = source.match(/maxConcurrentTasks\s*(?::\s*number\s*=\s*5|\?\?\s*5)/g);
-        expect(defaultFive).toBeNull();
+        expect(errorEventDef).toBeUndefined();
     });
 });
 
-// ─── 10. Correct exports ────────────────────────────────────────────────────
+describe("main.ts: no web renderer imports or references", () => {
+    it("does not import from any web/ path", () => {
+        const webImports = mainSource.split("\n").filter((line) =>
+            line.includes("import") && line.includes("web/"),
+        );
+        expect(webImports).toHaveLength(0);
+    });
 
-describe("Correct exports", () => {
-    const expectedExports = [
-        "ScoutingTopicSchema",
-        "ScoutingTopics",
-        "ScoutingGapSchema",
-        "ScoutingGap",
-        "ScoutingReviewSchema",
-        "ScoutingReview",
-        "PlanSchema",
-        "Plan",
-        "PlanReviewSchema",
-        "PlanReview",
-        "ReviewResultSchema",
-        "ReviewResult",
-        "FinalReviewTopicsSchema",
-        "FinalReviewTopics",
-        "TitleSchema",
-        "scoutingPhase",
-        "scoutingReviewPhase",
-        "planningPhase",
-        "planReviewPhase",
-        "implementationPhase",
-        "finalReviewPhase",
-        "run",
-        "DebugWorkflowOptions",
-        "RunOptions",
-    ];
-
-    for (const name of expectedExports) {
-        it(`exports ${name}`, () => {
-            // Check for export keyword before the name
-            // For types/interfaces: export type X or export interface X
-            // For functions: export async function X or export function X
-            // For schemas/variables: export const X
-            const patterns = [
-                new RegExp(`export\\s+const\\s+${name}\\b`),
-                new RegExp(`export\\s+type\\s+${name}\\b`),
-                new RegExp(`export\\s+interface\\s+${name}\\b`),
-                new RegExp(`export\\s+async\\s+function\\s+${name}\\b`),
-                new RegExp(`export\\s+function\\s+${name}\\b`),
-            ];
-            const found = patterns.some((p) => p.test(source));
-            expect(found).toBe(true);
-        });
-    }
+    it("does not reference any web renderer", () => {
+        const webPatterns = [
+            /web\/render/i,
+            /createWebRenderer/i,
+            /WebRenderer/i,
+            /renderToWeb/i,
+            /@app\/render/i,
+        ];
+        for (const pattern of webPatterns) {
+            expect(pattern.test(mainSource)).toBe(false);
+        }
+    });
 });
 
-// ─── 11. finalReviewPhase uses LanePool with workDir, maxConcurrentTasks, signal ─
+// ─── E. Static: .lib/scouting.ts text assertions ───────────────────────────
 
-describe("finalReviewPhase uses LanePool with correct parameters", () => {
-    it("finalReviewPhase function accepts workDir, maxConcurrentTasks, and signal parameters", () => {
-        // Verify finalReviewPhase has the expanded parameter list
-        const funcMatch = source.match(
-            /export\s+async\s+function\s+finalReviewPhase[\s\S]*?\)/,
-        );
-        expect(funcMatch).not.toBeNull();
-        const funcSignature = funcMatch![0];
-        expect(funcSignature).toContain("workDir");
-        expect(funcSignature).toContain("maxConcurrentTasks");
-        expect(funcSignature).toContain("signal");
-    });
-
-    it("finalReviewPhase creates a LanePool for fixing", () => {
-        // Find the finalReviewPhase function body
-        const finalReviewStart = source.indexOf("export async function finalReviewPhase");
-        expect(finalReviewStart).toBeGreaterThanOrEqual(0);
-
-        // Get a chunk of the source after the function start
-        const afterFunc = source.slice(finalReviewStart, finalReviewStart + 5000);
-
-        // Should contain new LanePool within the function body
-        expect(afterFunc).toContain("new LanePool");
-    });
-
-    it("finalReviewPhase uses FIXER_STEPS in LanePool getStepsForTask", () => {
-        const finalReviewStart = source.indexOf("export async function finalReviewPhase");
-        const afterFunc = source.slice(finalReviewStart, finalReviewStart + 5000);
-
-        expect(afterFunc).toContain("FIXER_STEPS");
+describe(".lib/scouting.ts: scout-coordinator usage", () => {
+    it("contains at least 4 references to 'scout-coordinator'", () => {
+        const matches = libScoutingSource.match(/scout-coordinator/g);
+        expect(matches).not.toBeNull();
+        expect(matches!.length).toBeGreaterThanOrEqual(4);
     });
 });
