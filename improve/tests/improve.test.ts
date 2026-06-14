@@ -338,7 +338,7 @@ describe("scoutingPhase", () => {
                 cwd: "/cwd",
             }),
         );
-        expect(tracker.scoutingReports).toEqual(reports);
+        expect((tracker.workflowData as { scoutingReports: unknown[] }).scoutingReports).toEqual(reports);
     });
 
     it("returns empty reports when no topics found", async () => {
@@ -517,7 +517,7 @@ describe("planningPhase", () => {
 
         expect(result).toEqual(plan);
         expect(result.tasks).toHaveLength(2);
-        expect(tracker.plan).toEqual(plan);
+        expect((tracker.workflowData as { plan: unknown }).plan).toEqual(plan);
     });
 
     it("throws if planner profile not found", async () => {
@@ -1261,7 +1261,7 @@ describe("run", () => {
         // Create initial saved state at "planning" phase
         const tracker = new WorkflowStatusTracker(workDir);
         tracker.setTaskPrompt("Resumed task");
-        tracker.setScoutingReports([{ summary: "existing report" }]);
+        tracker.setWorkflowData({ scoutingReports: [{ summary: "existing report" }] });
         tracker.setPhase("planning");
         await tracker.save();
 
@@ -1408,8 +1408,8 @@ describe("run", () => {
         const state = JSON.parse(raw);
 
         // After approval, feedback should be cleared
-        expect(state.planReviewFeedback).toBeUndefined();
-        expect(state.planReviewSuggestions).toBeUndefined();
+        expect(state.workflowData?.planReviewFeedback).toBeUndefined();
+        expect(state.workflowData?.planReviewSuggestions).toBeUndefined();
     }, 30000);
 
     it("persists plan review feedback to tracker on rejection", async () => {

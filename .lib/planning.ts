@@ -60,7 +60,7 @@ export async function planningPhase(
     }
     onStatus?.onAgentComplete?.({ agentId: "planner", profile: "planner", phase: "planning" });
 
-    tracker.setPlan(plan);
+    tracker.setWorkflowData({ plan });
 
     await tracker.auditLog.append(
         structuredOutputEvent("planner", plan),

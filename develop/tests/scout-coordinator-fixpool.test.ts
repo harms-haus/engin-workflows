@@ -16,7 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import type { AgentProfile } from "@harms-haus/engin";
-import type { FinalReviewTopics } from "../main.ts";
+import type { FinalReviewTopics } from "../main";
 
 // Capture real module before mocking so we can restore it in afterAll.
 const realModule = Object.assign({}, await import("@harms-haus/engin"));
@@ -57,7 +57,7 @@ import {
     implementationPhase,
     finalReviewPhase,
     run,
-} from "../main.ts";
+} from "../main";
 
 // ─── Source code static checks ──────────────────────────────────────────────
 
@@ -252,10 +252,12 @@ describe("CHANGE 4: recordAgentSpawn for scout-coordinator uses profile 'scout-c
         // Spy on tracker.recordAgentSpawn
         const recordAgentSpawnSpy = mock();
         const origRecordAgentSpawn = tracker.recordAgentSpawn.bind(tracker);
-        tracker.recordAgentSpawn = (args: { agentId: string; profile: string; phase: string }) => {
-            recordAgentSpawnSpy(args);
-            return origRecordAgentSpawn(args);
-        };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        tracker.recordAgentSpawn = ((...args: any[]) => {
+            const info = typeof args[0] === 'string' ? { agentId: args[0], profile: args[1], phase: args[2] } : args[0];
+            recordAgentSpawnSpy(info);
+            return origRecordAgentSpawn(info);
+        }) as typeof tracker.recordAgentSpawn;
 
         const topics = {
             topics: [
@@ -972,10 +974,12 @@ describe("Combined: scout-coordinator lifecycle uses correct profile throughout"
         // Spy on recordAgentSpawn
         const recordAgentSpawnSpy = mock();
         const origRecord = tracker.recordAgentSpawn.bind(tracker);
-        tracker.recordAgentSpawn = (args: { agentId: string; profile: string; phase: string }) => {
-            recordAgentSpawnSpy(args);
-            return origRecord(args);
-        };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        tracker.recordAgentSpawn = ((...args: any[]) => {
+            const info = typeof args[0] === 'string' ? { agentId: args[0], profile: args[1], phase: args[2] } : args[0];
+            recordAgentSpawnSpy(info);
+            return origRecord(info);
+        }) as typeof tracker.recordAgentSpawn;
 
         await scoutingPhase(
             tracker, ["/profiles"], "Build a feature", "/cwd", 3, workDir,

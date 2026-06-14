@@ -38,7 +38,7 @@ mock.module("@harms-haus/engin", () => ({
 
 // ─── Imports (after mocks) ─────────────────────────────────────────────────
 
-import { run } from "../main.ts";
+import { run } from "../main";
 import { WorkflowStatusTracker } from "@harms-haus/engin";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -253,11 +253,11 @@ describe("Workflow Smoke Tests", () => {
             // Create a tracker, set some state, save it
             const tracker = new WorkflowStatusTracker(workDir);
             tracker.setTaskPrompt("Resumed task");
-            tracker.setScoutingReports([{ summary: "existing report" }]);
-            tracker.setPlan({
+            tracker.setWorkflowData({ scoutingReports: [{ summary: "existing report" }] });
+            tracker.setWorkflowData({ plan: {
                 tasks: [{ id: "t1" }],
                 strategy: "test",
-            });
+            } });
             tracker.setPhase("planning");
             await tracker.save();
 
@@ -266,10 +266,10 @@ describe("Workflow Smoke Tests", () => {
 
             expect(restored.taskPrompt).toBe("Resumed task");
             expect(restored.currentPhase).toBe("planning");
-            expect(restored.scoutingReports).toEqual([
+            expect((restored.workflowData as Record<string, unknown>).scoutingReports).toEqual([
                 { summary: "existing report" },
             ]);
-            expect(restored.plan).toEqual({
+            expect((restored.workflowData as Record<string, unknown>).plan).toEqual({
                 tasks: [{ id: "t1" }],
                 strategy: "test",
             });
@@ -395,14 +395,14 @@ describe("Workflow Smoke Tests", () => {
             });
 
             // ── Lifecycle callbacks ─────────────────────────────────
-            expect(onWorkflowStart).toHaveBeenCalledOnce();
+            expect(onWorkflowStart).toHaveBeenCalledTimes(1);
             expect(onWorkflowStart).toHaveBeenCalledWith({
                 taskPrompt: "Build with callbacks",
                 resumed: false,
                 workDir,
             });
 
-            expect(onWorkflowComplete).toHaveBeenCalledOnce();
+            expect(onWorkflowComplete).toHaveBeenCalledTimes(1);
             expect(onWorkflowComplete).toHaveBeenCalledWith(
                 expect.objectContaining({
                     totalDurationMs: expect.any(Number),
@@ -423,7 +423,7 @@ describe("Workflow Smoke Tests", () => {
             const startedPhases = (
                 onPhaseStart as ReturnType<typeof mock>
             ).mock.calls.map(
-                (call: [{ phase: string }]) => call[0].phase,
+                (call: any[]) => (call[0] as { phase: string }).phase,
             );
             expect(startedPhases).toContain("scouting");
             expect(startedPhases).toContain("planning");
@@ -474,8 +474,8 @@ describe("Workflow Smoke Tests", () => {
                 }),
             ).rejects.toThrow("Catastrophic scouting failure");
 
-            expect(onWorkflowStart).toHaveBeenCalledOnce();
-            expect(onWorkflowFailed).toHaveBeenCalledOnce();
+            expect(onWorkflowStart).toHaveBeenCalledTimes(1);
+            expect(onWorkflowFailed).toHaveBeenCalledTimes(1);
             expect(onWorkflowFailed).toHaveBeenCalledWith(
                 expect.objectContaining({
                     error: expect.any(Error),

@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import type { AgentProfile } from "@harms-haus/engin";
-import type { Plan, ScoutingReview, PlanReview, ReviewResult, FinalReviewTopics } from "../main.ts";
+import type { Plan, ScoutingReview, PlanReview, ReviewResult, FinalReviewTopics } from "../main";
 
 // Capture real module before mocking so we can restore it in afterAll.
 const realModule = Object.assign({}, await import("@harms-haus/engin"));
@@ -52,7 +52,7 @@ import {
     ReviewResultSchema,
     FinalReviewTopicsSchema,
     TitleSchema,
-} from "../main.ts";
+} from "../main";
 
 // ─── Test Fixtures ──────────────────────────────────────────────────────────
 
@@ -328,7 +328,7 @@ describe("scoutingPhase", () => {
                 cwd: "/cwd",
             }),
         );
-        expect(tracker.scoutingReports).toEqual(reports);
+        expect((tracker.workflowData as { scoutingReports: unknown[] }).scoutingReports).toEqual(reports);
     });
 
     it("returns empty reports when no topics found", async () => {
@@ -437,7 +437,7 @@ describe("scoutingReviewPhase", () => {
         const reviewResult: ScoutingReview = {
             ready: false,
             research: "Partial findings",
-            gaps: ["Need to investigate test coverage"],
+            gaps: [{ topic: "Need to investigate test coverage", rationale: "Coverage gaps identified", files: ["tests/"] }],
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: reviewResult, attempts: 1 });
 
@@ -507,7 +507,7 @@ describe("planningPhase", () => {
 
         expect(result).toEqual(plan);
         expect(result.tasks).toHaveLength(2);
-        expect(tracker.plan).toEqual(plan);
+        expect((tracker.workflowData as { plan: unknown }).plan).toEqual(plan);
     });
 
     it("throws if planner profile not found", async () => {
@@ -1172,7 +1172,7 @@ describe("run", () => {
         // Create initial saved state at "planning" phase
         const tracker = new WorkflowStatusTracker(workDir);
         tracker.setTaskPrompt("Resumed task");
-        tracker.setScoutingReports([{ summary: "existing report" }]);
+        tracker.setWorkflowData({ scoutingReports: [{ summary: "existing report" }] });
         tracker.setPhase("planning");
         await tracker.save();
 
@@ -1312,8 +1312,8 @@ describe("run", () => {
         const state = JSON.parse(raw);
 
         // After approval, feedback should be cleared
-        expect(state.planReviewFeedback).toBeUndefined();
-        expect(state.planReviewSuggestions).toBeUndefined();
+        expect(state.workflowData?.planReviewFeedback).toBeUndefined();
+        expect(state.workflowData?.planReviewSuggestions).toBeUndefined();
     }, 30000);
 
     it("persists plan review feedback to tracker on rejection", async () => {

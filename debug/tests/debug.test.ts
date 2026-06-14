@@ -403,7 +403,7 @@ describe("scoutingPhase", () => {
         expect(mockPromptForStructured).toHaveBeenCalledTimes(1);
         expect(mockLanePoolCtor).toHaveBeenCalledTimes(1);
         expect(mockLanePoolRun).toHaveBeenCalledTimes(1);
-        expect(tracker.scoutingReports).toEqual(reports);
+        expect((tracker.workflowData as { scoutingReports: unknown[] }).scoutingReports).toEqual(reports);
     });
 
     it("returns empty reports when no topics found", async () => {
@@ -559,7 +559,7 @@ describe("planningPhase", () => {
 
         expect(result).toEqual(plan);
         expect(result.tasks).toHaveLength(2);
-        expect(tracker.plan).toEqual(plan);
+        expect((tracker.workflowData as { plan: unknown }).plan).toEqual(plan);
     });
 
     it("throws if planner profile not found", async () => {
@@ -1233,7 +1233,7 @@ describe("run", () => {
         // Create initial saved state at "planning" phase
         const tracker = new WorkflowStatusTracker(workDir);
         tracker.setTaskPrompt("Resumed task");
-        tracker.setScoutingReports([{ summary: "existing report" }]);
+        tracker.setWorkflowData({ scoutingReports: [{ summary: "existing report" }] });
         tracker.setPhase("planning");
         await tracker.save();
 

@@ -53,6 +53,14 @@ export interface RunState {
     planReviewSuggestions?: string[];
 }
 
+export interface SpirWorkflowData {
+    research?: string;
+    plan?: Plan;
+    scoutingReports?: unknown[];
+    planReviewFeedback?: string;
+    planReviewSuggestions?: string[];
+}
+
 // ─── Helper: complete a phase transition ────────────────────────────────────
 
 export async function completePhase(
@@ -100,6 +108,10 @@ export interface PhaseContext {
     apiKeys?: Record<string, string>;
     onStatus?: StatusCallbacks;
     signal?: AbortSignal;
+}
+
+function getSpirData(tracker: WorkflowStatusTracker): SpirWorkflowData {
+    return tracker.workflowData as SpirWorkflowData;
 }
 
 // ─── Helper: execute a single pipeline phase ───────────────────────────────
@@ -152,7 +164,7 @@ export async function executePhase(
             state.scoutingRounds++;
             state.research = review.research;
             state.scoutingGaps = review.gaps;
-            tracker.setResearch(state.research);
+            tracker.setWorkflowData({ research: state.research });
 
             if (review.ready) {
                 state.scoutingGaps = [];
@@ -176,15 +188,15 @@ export async function executePhase(
         case "planning": {
             // Derive research from saved scouting reports if not yet available
             if (!state.research) {
-                if (tracker.research) {
-                    state.research = tracker.research;
+                if (getSpirData(tracker).research) {
+                    state.research = getSpirData(tracker).research!;
                 } else {
-                    const reports = tracker.scoutingReports;
+                    const reports = getSpirData(tracker).scoutingReports ?? [];
                     const review = await scoutingReviewPhase(
                         tracker, profilesDirs, reports, cwd, apiKeys, onStatus,
                     );
                     state.research = review.research;
-                    tracker.setResearch(state.research);
+                    tracker.setWorkflowData({ research: state.research });
                 }
             }
 
@@ -195,7 +207,7 @@ export async function executePhase(
             );
 
             if (!state.plan) {
-                state.plan = tracker.plan as Plan | undefined;
+                state.plan = getSpirData(tracker).plan;
             }
 
             const planReview = await planReviewPhase(
@@ -206,7 +218,7 @@ export async function executePhase(
             if (planReview.ready) {
                 state.planReviewFeedback = undefined;
                 state.planReviewSuggestions = undefined;
-                tracker.clearPlanReviewFeedback();
+                tracker.setWorkflowData({ planReviewFeedback: undefined, planReviewSuggestions: undefined });
                 await completePhase(phase, tracker, onStatus, phaseStartTime);
                 break;
             }
@@ -214,7 +226,7 @@ export async function executePhase(
             // Not ready — loop back to planning (max 3 rounds)
             state.planReviewFeedback = planReview.feedback;
             state.planReviewSuggestions = planReview.suggestions;
-            tracker.setPlanReviewFeedback(planReview.feedback, planReview.suggestions);
+            tracker.setWorkflowData({ planReviewFeedback: planReview.feedback, planReviewSuggestions: planReview.suggestions });
             if (state.planningRounds < 3) {
                 state.plan = undefined;
                 await completePhase(phase, tracker, onStatus, phaseStartTime, "planning");
@@ -230,7 +242,7 @@ export async function executePhase(
         case "implementing": {
             // Load plan from tracker on resume
             if (!state.plan) {
-                state.plan = tracker.plan as Plan | undefined;
+                state.plan = getSpirData(tracker).plan;
             }
             if (state.plan) {
                 await implementationPhase(
@@ -309,14 +321,14 @@ export async function runSpir(
 
     // ── Shared mutable state that flows between phases ────────────────
     const state: RunState = {
-        research: tracker.research ?? "",
+        research: getSpirData(tracker).research ?? "",
         plan: undefined,
         scoutingReports: [],
         scoutingRounds: 0,
         scoutingGaps: [],
         planningRounds: 0,
-        planReviewFeedback: tracker.planReviewFeedback,
-        planReviewSuggestions: tracker.planReviewSuggestions ? [...tracker.planReviewSuggestions] : undefined,
+        planReviewFeedback: getSpirData(tracker).planReviewFeedback,
+        planReviewSuggestions: getSpirData(tracker).planReviewSuggestions ? [...getSpirData(tracker).planReviewSuggestions!] : undefined,
     };
 
     // ── Execute phases from the starting point ──────────────────────

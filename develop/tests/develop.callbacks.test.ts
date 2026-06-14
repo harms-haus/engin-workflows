@@ -37,7 +37,7 @@ mock.module("@harms-haus/engin", () => ({
 
 // ─── Imports (after mocks) ─────────────────────────────────────────────────
 
-import { run } from "../main.ts";
+import { run } from "../main";
 import { WorkflowStatusTracker } from "@harms-haus/engin";
 
 // ─── Test Fixtures ──────────────────────────────────────────────────────────
@@ -217,7 +217,7 @@ describe("Workflow-level callbacks", () => {
             onStatus: { onWorkflowStart },
         });
 
-        expect(onWorkflowStart).toHaveBeenCalledOnce();
+        expect(onWorkflowStart).toHaveBeenCalledTimes(1);
         expect(onWorkflowStart).toHaveBeenCalledWith({
             taskPrompt: "Build a feature",
             resumed: false,
@@ -258,7 +258,7 @@ describe("Workflow-level callbacks", () => {
             onStatus: { onWorkflowStart },
         });
 
-        expect(onWorkflowStart).toHaveBeenCalledOnce();
+        expect(onWorkflowStart).toHaveBeenCalledTimes(1);
         expect(onWorkflowStart).toHaveBeenCalledWith({
             taskPrompt: "Resumed task",
             resumed: true,
@@ -325,7 +325,7 @@ describe("Workflow-level callbacks", () => {
             onStatus: { onWorkflowComplete },
         });
 
-        expect(onWorkflowComplete).toHaveBeenCalledOnce();
+        expect(onWorkflowComplete).toHaveBeenCalledTimes(1);
         const info = onWorkflowComplete.mock.calls[0][0] as { totalDurationMs: number; agentCount: number };
         expect(typeof info.totalDurationMs).toBe("number");
         expect(info.totalDurationMs).toBeGreaterThanOrEqual(0);
@@ -352,7 +352,7 @@ describe("Workflow-level callbacks", () => {
             }),
         ).rejects.toThrow("LLM unreachable");
 
-        expect(onWorkflowFailed).toHaveBeenCalledOnce();
+        expect(onWorkflowFailed).toHaveBeenCalledTimes(1);
         const info = onWorkflowFailed.mock.calls[0][0] as { error: Error; phase: string };
         expect(info.error).toBeInstanceOf(Error);
         expect(info.error.message).toBe("LLM unreachable");

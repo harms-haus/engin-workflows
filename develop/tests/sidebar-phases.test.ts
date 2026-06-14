@@ -34,7 +34,7 @@ mock.module("@harms-haus/engin", () => ({
 
 // ─── Imports (after mocks) ─────────────────────────────────────────────────
 
-import { run } from "../main.ts";
+import { run } from "../main";
 import { WorkflowStatusTracker } from "@harms-haus/engin";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

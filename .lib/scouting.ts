@@ -137,7 +137,7 @@ export async function scoutingPhase(
     }
 
     // Update tracker with the full accumulated reports
-    tracker.setScoutingReports(reports);
+    tracker.setWorkflowData({ scoutingReports: reports });
 
     return reports;
 }

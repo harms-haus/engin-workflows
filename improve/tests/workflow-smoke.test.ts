@@ -253,11 +253,11 @@ describe("Workflow Smoke Tests", () => {
             // Create a tracker, set some state, save it
             const tracker = new WorkflowStatusTracker(workDir);
             tracker.setTaskPrompt("Resumed task");
-            tracker.setScoutingReports([{ summary: "existing report" }]);
-            tracker.setPlan({
+            tracker.setWorkflowData({ scoutingReports: [{ summary: "existing report" }] });
+            tracker.setWorkflowData({ plan: {
                 tasks: [{ id: "t1" }],
                 strategy: "test",
-            });
+            } });
             tracker.setPhase("planning");
             await tracker.save();
 
@@ -266,10 +266,10 @@ describe("Workflow Smoke Tests", () => {
 
             expect(restored.taskPrompt).toBe("Resumed task");
             expect(restored.currentPhase).toBe("planning");
-            expect(restored.scoutingReports).toEqual([
+            expect((restored.workflowData as Record<string, unknown>).scoutingReports).toEqual([
                 { summary: "existing report" },
             ]);
-            expect(restored.plan).toEqual({
+            expect((restored.workflowData as Record<string, unknown>).plan).toEqual({
                 tasks: [{ id: "t1" }],
                 strategy: "test",
             });
