@@ -85,9 +85,9 @@ export async function completePhase(
  */
 export function getPhaseIndicator(
     phase: Phase,
-    sidebarPhases: { id: string; icon: string }[],
+    phases: { id: string; icon: string }[],
 ): string {
-    const entry = sidebarPhases.find(p => p.id === phase);
+    const entry = phases.find(p => p.id === phase);
     return entry?.icon ?? '⏳';
 }
 
@@ -142,7 +142,7 @@ export async function executePhase(
             ? state.planningRounds
             : 0;
     onStatus?.onPhaseStart?.({ phase, round });
-    onStatus?.onSidebarUpdate?.({ indicator: getPhaseIndicator(phase, config.sidebarPhases) });
+    onStatus?.onSidebarUpdate?.({ indicator: getPhaseIndicator(phase, config.phases) });
 
     switch (phase) {
         // ── Scouting: get topics → lane-pool scouts → review → loop if needed ──
@@ -296,7 +296,7 @@ export async function runSpir(
     if (options.tracker instanceof WorkflowStatusTracker) {
         tracker = options.tracker;
         // A passed tracker is "resumed" only if it has progress from a previous run
-        resumed = tracker.completedPhases.length > 0;
+        resumed = tracker.completedPhaseIds.length > 0;
     } else {
         try {
             tracker = await WorkflowStatusTracker.load(workDir);
@@ -333,23 +333,28 @@ export async function runSpir(
     };
 
     // ── Execute phases from the starting point ──────────────────────
-    let currentIndex = PHASES.indexOf(tracker.currentPhase as Phase);
+    let currentIndex = PHASES.indexOf(tracker.currentPhaseId as Phase);
     if (currentIndex < 0) {
         // Fresh tracker — set the initial phase
         currentIndex = 0;
         tracker.setCurrentPhase(PHASES[0]);
     }
 
+    // ── Register phases via phase_registered events ─────────────────
+    for (const p of config.phases) {
+        onStatus?.onPhaseRegister?.({ id: p.id, label: p.label, icon: p.icon });
+    }
+
     // ── Sidebar: initial phase metadata ─────────────────────────────
     // On resume, use truncated title and skip AI generation
     if (resumed) {
         const shortTitle = taskPrompt.length > 60 ? taskPrompt.slice(0, 57) + '...' : taskPrompt;
-        onStatus?.onSidebarUpdate?.({ title: shortTitle, indicator: getPhaseIndicator(PHASES[currentIndex] as Phase, config.sidebarPhases), phases: config.sidebarPhases });
+        onStatus?.onSidebarUpdate?.({ title: shortTitle, indicator: getPhaseIndicator(PHASES[currentIndex] as Phase, config.phases) });
     } else {
         // Run AI title generation before entering the main phase loop
-        onStatus?.onSidebarUpdate?.({ title: 'Initializing...', indicator: '⚙', phases: config.sidebarPhases });
+        onStatus?.onSidebarUpdate?.({ title: 'Initializing...', indicator: '⚙' });
         const title = await initializationPhase(profilesDirs, taskPrompt, cwd, apiKeys, onStatus, tracker);
-        onStatus?.onSidebarUpdate?.({ title, indicator: getPhaseIndicator(PHASES[currentIndex] as Phase, config.sidebarPhases), phases: config.sidebarPhases });
+        onStatus?.onSidebarUpdate?.({ title, indicator: getPhaseIndicator(PHASES[currentIndex] as Phase, config.phases) });
     }
 
     // ── Shared context for every executePhase call ───────────────────
@@ -379,10 +384,10 @@ export async function runSpir(
         const err = error instanceof Error ? error : new Error(String(error));
         if (err.message === 'Workflow cancelled') {
             await tracker.save();
-            onStatus?.onWorkflowFailed?.({ error: err, phase: tracker.currentPhase });
+            onStatus?.onWorkflowFailed?.({ error: err, phaseId: tracker.currentPhaseId });
             return;
         }
-        onStatus?.onWorkflowFailed?.({ error: err, phase: tracker.currentPhase });
+        onStatus?.onWorkflowFailed?.({ error: err, phaseId: tracker.currentPhaseId });
         throw error;
     }
 

@@ -35,6 +35,7 @@ export async function implementationPhase(
                 files: task.files,
                 dependencies: task.dependencies,
                 isCode: task.is_code,
+                phaseId: 'implementing',
             });
         }
     }
@@ -46,6 +47,7 @@ export async function implementationPhase(
     const pool = new LanePool({
         maxConcurrentLanes: maxConcurrentTasks,
         profilesDirs,
+        phaseId: 'implementing',
         sessionBaseDir: join(workDir, 'sessions'),
         cwd,
         apiKeys,

@@ -13,7 +13,7 @@ export const workflowConfig = {
     fixerSteps: [
         { name: 'fix', profileId: 'fixer', isReadOnly: false },
     ] as StepDefinition[],
-    sidebarPhases: [
+    phases: [
         { id: 'initialization', label: 'Initialization', icon: '⚙' },
         { id: 'scouting', label: 'Scouting', icon: '🔍' },
         { id: 'planning', label: 'Planning', icon: '📋' },

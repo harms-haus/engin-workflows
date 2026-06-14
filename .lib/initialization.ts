@@ -1,7 +1,6 @@
 import type { StatusCallbacks, WorkflowStatusTracker } from "@harms-haus/engin";
-import { createHarness, promptForStructured } from "@harms-haus/engin";
+import { runStepTask } from "@harms-haus/engin";
 import { TitleSchema } from "./schemas";
-import { makeHarnessOptions, spawnAgent } from "./helpers";
 
 // ─── Initialization Phase ───────────────────────────────────────────────────
 
@@ -18,10 +17,6 @@ export async function initializationPhase(
     tracker: WorkflowStatusTracker,
 ): Promise<string> {
     try {
-        const opts = await makeHarnessOptions(profilesDirs, 'scout', cwd, 'title-generator', apiKeys, onStatus);
-        const { session, dispose } = await createHarness(opts);
-        spawnAgent(tracker, onStatus, { agentId: 'title-generator', profile: 'scout', phase: 'initialization' });
-
         const prompt = [
             'You are a title generator. Generate a concise 3-8 word title summarizing the following task.',
             '',
@@ -30,13 +25,20 @@ export async function initializationPhase(
             'Respond with a JSON object containing a "title" field with your concise title.',
         ].join('\n');
 
-        let result: { title: string };
-        try {
-            ({ result } = await promptForStructured(session, prompt, TitleSchema));
-        } finally {
-            dispose?.();
-        }
-        onStatus?.onAgentComplete?.({ agentId: 'title-generator', profile: 'scout', phase: 'initialization' });
+        const result = await runStepTask<{ title: string }>({
+            profilesDirs,
+            phaseId: 'initialization',
+            taskId: 'title-generator',
+            title: 'Title Generator',
+            stepName: 'generate-title',
+            profileId: 'scout',
+            cwd,
+            apiKeys,
+            onStatus,
+            isReadOnly: true,
+            schema: TitleSchema,
+            prompt,
+        });
 
         return result.title;
     } catch (err: unknown) {

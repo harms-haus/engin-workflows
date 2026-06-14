@@ -1,9 +1,9 @@
 import type { StatusCallbacks, StepDefinition, WorkflowStatusTracker } from "@harms-haus/engin";
-import { LanePool, TaskTracker, createHarness, promptForStructured } from "@harms-haus/engin";
+import { LanePool, TaskTracker, runStepTask } from "@harms-haus/engin";
 import { join } from "node:path";
 import { FinalReviewTopicsSchema } from "./schemas";
 import type { FinalReviewTopics } from "./schemas";
-import { makeHarnessOptions, spawnAgent, structuredOutputEvent } from "./helpers";
+import { structuredOutputEvent } from "./helpers";
 
 // ─── Phase 6: Final Review ──────────────────────────────────────────────────
 
@@ -28,23 +28,27 @@ export async function finalReviewPhase(
 
     for (let round = 0; round < maxFixRounds; round++) {
         // 1. Get final review assessment
-        const reviewerOpts = await makeHarnessOptions(profilesDirs, "final-reviewer", cwd, "final-reviewer", apiKeys, onStatus);
-        const { session: reviewerHarness, dispose: reviewerDispose } = await createHarness(reviewerOpts);
-        spawnAgent(tracker, onStatus, { agentId: "final-reviewer", profile: "final-reviewer", phase: "review" });
-
         const reviewPrompt = [
             "You are performing a final quality review of the codebase.",
             "",
             "Examine the files and identify any remaining issues.",
         ].join("\n");
 
-        let assessment: FinalReviewTopics;
-        try {
-            ({ result: assessment } = await promptForStructured(reviewerHarness, reviewPrompt, FinalReviewTopicsSchema));
-        } finally {
-            reviewerDispose?.();
-        }
-        onStatus?.onAgentComplete?.({ agentId: "final-reviewer", profile: "final-reviewer", phase: "review" });
+        const assessment = await runStepTask<FinalReviewTopics>({
+            profilesDirs,
+            phaseId: "review",
+            taskId: `final-reviewer-round-${round}`,
+            title: "Final Review",
+            stepName: "final-review",
+            profileId: "final-reviewer",
+            cwd,
+            apiKeys,
+            onStatus,
+            isReadOnly: true,
+            schema: FinalReviewTopicsSchema,
+            prompt: reviewPrompt,
+            signal,
+        });
 
         await tracker.auditLog.append(
             structuredOutputEvent("final-reviewer", assessment),
@@ -82,6 +86,7 @@ export async function finalReviewPhase(
                 files: [issue.file],
                 dependencies: [],
                 isCode: true,
+                phaseId: 'review',
             });
         }
 
@@ -96,6 +101,7 @@ export async function finalReviewPhase(
             taskTracker: fixerTracker,
             getStepsForTask: () => fixerSteps,
             signal,
+            phaseId: 'review',
         });
 
         await pool.run();

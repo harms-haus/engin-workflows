@@ -171,14 +171,12 @@ beforeEach(() => {
             if (opts.taskTracker && typeof (opts.taskTracker as any).getAllTasks === 'function') {
                 const tt = opts.taskTracker as any;
                 for (const task of [...tt.getAllTasks()]) {
-                    const claimed = tt.claimTasks(1);
+                    const claimed = tt.claimTasks(1, 'mock-agent');
                     if (claimed.length > 0) {
-                        tt.startTask(claimed[0].id, 'mock-lane');
-                        tt.submitForReview(claimed[0].id, { report: `scout report for ${claimed[0].title}` });
                         tt.completeTask(claimed[0].id);
                     }
                 }
-                const doneCount = tt.getAllTasks().filter((t: any) => t.status === 'done').length;
+                const doneCount = tt.getAllTasks().filter((t: any) => t.status === 'complete').length;
                 return { completedTasks: doneCount, failedTasks: 0 };
             }
         }
@@ -1085,11 +1083,11 @@ describe("run", () => {
         const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
 
-        expect(state.currentPhase).toBe("done");
-        expect(state.completedPhases).toContain("scouting");
-        expect(state.completedPhases).toContain("planning");
-        expect(state.completedPhases).toContain("implementing");
-        expect(state.completedPhases).toContain("review");
+        expect(state.currentPhaseId).toBe("done");
+        expect(state.completedPhaseIds).toContain("scouting");
+        expect(state.completedPhaseIds).toContain("planning");
+        expect(state.completedPhaseIds).toContain("implementing");
+        expect(state.completedPhaseIds).toContain("review");
     }, 30000);
 
     it("uses resolveProfilesDirs with 'debug' workflow name", async () => {
@@ -1228,7 +1226,7 @@ describe("run", () => {
 
         const raw = await fs.readFile(path.join(workDir, ".engin-state.json"), "utf-8");
         const state = JSON.parse(raw);
-        expect(state.currentPhase).toBe("done");
+        expect(state.currentPhaseId).toBe("done");
         expect(state.taskPrompt).toBe("Resumed task");
     }, 30000);
 
@@ -1258,7 +1256,7 @@ describe("run", () => {
 
         const raw = await fs.readFile(path.join(workDir, ".engin-state.json"), "utf-8");
         const state = JSON.parse(raw);
-        expect(state.currentPhase).toBe("done");
+        expect(state.currentPhaseId).toBe("done");
     }, 30000);
 
     it("retries planning when plan is rejected", async () => {
@@ -1308,7 +1306,7 @@ describe("run", () => {
 
         const raw = await fs.readFile(path.join(workDir, ".engin-state.json"), "utf-8");
         const state = JSON.parse(raw);
-        expect(state.currentPhase).toBe("done");
+        expect(state.currentPhaseId).toBe("done");
 
         // Verify the planner prompt for round 2 includes feedback
         const plannerPromptRound2 = mockPromptForStructured.mock.calls[5][1] as string;

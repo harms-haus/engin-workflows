@@ -20,12 +20,14 @@ const mockPromptForStructured = mock() as ReturnType<typeof mock> & ((...args: u
 const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
+const mockRunStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
 mock.module("@harms-haus/engin", () => ({
     ...realEngin,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
+    runStepTask: (...args: unknown[]) => mockRunStepTask(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
@@ -91,24 +93,18 @@ function makeAllProfiles(): Map<string, unknown> {
     return map;
 }
 
-/** Default mock prompt handler for a successful run. */
-function defaultPromptHandler(_text: string): unknown {
-    if (_text.includes("codebase scout") || _text.includes("Identify key areas")) {
-        return { result: { topics: [] }, attempts: 1 };
-    }
-    if (_text.includes("reviewing scouting reports")) {
-        return { result: { ready: true, research: "All scouted", gaps: [] }, attempts: 1 };
-    }
-    if (_text.includes("planning agent")) {
-        return { result: { tasks: [], strategy: "none" }, attempts: 1 };
-    }
-    if (_text.includes("reviewing an implementation plan")) {
-        return { result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 };
-    }
-    if (_text.includes("final quality review")) {
-        return { result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 };
-    }
-    return { result: {}, attempts: 1 };
+/**
+ * Smart mock for runStepTask based on taskId.
+ */
+function smartRunStepTask(opts: Record<string, unknown>): unknown {
+    const taskId = opts.taskId as string;
+    if (taskId === "title-generator") return { title: "AI generated title" };
+    if (taskId === "scout-coordinator") return { topics: [] };
+    if (taskId === "scouting-reviewer") return { ready: true, research: "All scouted", gaps: [] };
+    if (taskId === "planner") return { tasks: [], strategy: "none" };
+    if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
+    if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "Good", issues: [] };
+    return {};
 }
 
 // ─── Setup ──────────────────────────────────────────────────────────────────
@@ -118,15 +114,15 @@ beforeEach(() => {
     mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
     mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
-    mockPromptForStructured.mockImplementation(async (_harness: unknown, text: string) => {
-        return defaultPromptHandler(text);
-    });
+    mockRunStepTask.mockImplementation(smartRunStepTask);
+    mockPromptForStructured.mockReset();
+    mockPromptForStructured.mockResolvedValue({ result: {}, attempts: 1 });
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-describe("SIDEBAR_PHASES", () => {
-    it("contains initialization as the first phase entry", async () => {
+describe("onSidebarUpdate — no phases field", () => {
+    it("onSidebarUpdate does NOT carry phases", async () => {
         const workDir = tmpDir();
         const onSidebarUpdate = mock();
 
@@ -137,108 +133,33 @@ describe("SIDEBAR_PHASES", () => {
             onStatus: { onSidebarUpdate },
         });
 
-        // onSidebarUpdate should have been called at least once with the phases array
+        // Phase metadata is now sent via onPhaseRegister, not onSidebarUpdate
+        const hasPhases = onSidebarUpdate.mock.calls.some(
+            (call: unknown[]) => (call[0] as Record<string, unknown>).phases !== undefined
+        );
+        expect(hasPhases).toBe(false);
+    });
+
+    it("onSidebarUpdate carries title and indicator only", async () => {
+        const workDir = tmpDir();
+        const onSidebarUpdate = mock();
+
+        await run("Test task", {
+            profilesDir: "/profiles",
+            cwd: "/project",
+            workDir,
+            onStatus: { onSidebarUpdate },
+        });
+
         expect(onSidebarUpdate).toHaveBeenCalled();
 
-        // Find the call that includes the full phases array
-        const sidebarCalls = onSidebarUpdate.mock.calls
-            .map((call: unknown[]) => call[0] as Record<string, unknown>)
-            .filter((data: Record<string, unknown>) => data.phases !== undefined);
-
-        expect(sidebarCalls.length).toBeGreaterThanOrEqual(1);
-
-        const sidebarData = sidebarCalls[0];
-        const phases = sidebarData.phases as Array<{ id: string; label: string; icon: string }>;
-
-        // Should have 4 entries (scouting, planning, implementing, review)
-        expect(phases).toHaveLength(4);
-
-        // Entries should match phases in order (no initialization phase entry)
-        expect(phases[0].id).toBe("scouting");
-        expect(phases[1].id).toBe("planning");
-        expect(phases[2].id).toBe("implementing");
-        expect(phases[3].id).toBe("review");
-    });
-
-    it("has correct structure for each entry", async () => {
-        const workDir = tmpDir();
-        const onSidebarUpdate = mock();
-
-        await run("Test task", {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-            onStatus: { onSidebarUpdate },
-        });
-
-        const sidebarCalls = onSidebarUpdate.mock.calls
-            .map((call: unknown[]) => call[0] as Record<string, unknown>)
-            .filter((data: Record<string, unknown>) => data.phases !== undefined);
-
-        const phases = sidebarCalls[0].phases as Array<{ id: string; label: string; icon: string }>;
-
-        // Every entry must have id, label, and icon as non-empty strings
-        for (const phase of phases) {
-            expect(typeof phase.id).toBe("string");
-            expect(phase.id.length).toBeGreaterThan(0);
-            expect(typeof phase.label).toBe("string");
-            expect(phase.label.length).toBeGreaterThan(0);
-            expect(typeof phase.icon).toBe("string");
-            expect(phase.icon.length).toBeGreaterThan(0);
-        }
-    });
-
-    it("does not duplicate phase IDs", async () => {
-        const workDir = tmpDir();
-        const onSidebarUpdate = mock();
-
-        await run("Test task", {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-            onStatus: { onSidebarUpdate },
-        });
-
-        const sidebarCalls = onSidebarUpdate.mock.calls
-            .map((call: unknown[]) => call[0] as Record<string, unknown>)
-            .filter((data: Record<string, unknown>) => data.phases !== undefined);
-
-        const phases = sidebarCalls[0].phases as Array<{ id: string }>;
-
-        const ids = phases.map((p) => p.id);
-        const uniqueIds = new Set(ids);
-        expect(uniqueIds.size).toBe(ids.length);
-    });
-
-    it("initialization entry uses gear emoji (U+2699)", async () => {
-        const workDir = tmpDir();
-        const onSidebarUpdate = mock();
-
-        await run("Test task", {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-            onStatus: { onSidebarUpdate },
-        });
-
-        const sidebarCalls = onSidebarUpdate.mock.calls
-            .map((call: unknown[]) => call[0] as Record<string, unknown>)
-            .filter((data: Record<string, unknown>) => data.phases !== undefined);
-
-        const phases = sidebarCalls[0].phases as Array<{ id: string; icon: string }>;
-
-        // SIDEBAR_PHASES no longer includes an initialization entry.
-        // The initialization UI (⚙ indicator, "Initializing..." title) is
-        // emitted via onSidebarUpdate directly, not as a phase entry.
-        // Verify no initialization entry exists in the phases array.
-        const initPhase = phases.find((p) => p.id === "initialization");
-
-        expect(initPhase).toBeUndefined();
-
-        // Verify all phase icons are defined strings
-        for (const phase of phases) {
-            expect(typeof phase.icon).toBe("string");
-            expect(phase.icon.length).toBeGreaterThan(0);
+        for (const call of onSidebarUpdate.mock.calls) {
+            const data = call[0] as Record<string, unknown>;
+            const keys = Object.keys(data);
+            // Only title and indicator are allowed
+            for (const key of keys) {
+                expect(key === "title" || key === "indicator").toBe(true);
+            }
         }
     });
 });

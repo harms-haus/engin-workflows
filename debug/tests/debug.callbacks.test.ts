@@ -29,7 +29,6 @@ mock.module("@harms-haus/engin", () => ({
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
     },
-    resolveProfilesDirs: mock(),
     getGlobalConfigDir: mock(),
     getLocalConfigDir: mock(),
     resolveWorkflowsDirs: mock(),
@@ -39,7 +38,7 @@ mock.module("@harms-haus/engin", () => ({
 
 // ─── Imports (after mocks) ─────────────────────────────────────────────────
 
-import { run } from "../main.ts";
+import { run } from "../main";
 import { WorkflowStatusTracker } from "@harms-haus/engin";
 
 // ─── Test Fixtures ──────────────────────────────────────────────────────────
@@ -202,7 +201,13 @@ function setupRunWithFailedTaskMocks() {
 // ─── Setup ──────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
-    mock.clearAllMocks();
+    mockCreateHarness.mockReset();
+    mockPromptForStructured.mockReset();
+    mockLoadProfiles.mockReset();
+    mockLoadProfilesFromDirs.mockReset();
+    mockResolveProfilesDirs.mockReset();
+    mockLanePoolRun.mockReset();
+    mockLanePoolCtor.mockReset();
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -221,7 +226,7 @@ describe("Workflow-level callbacks", () => {
             onStatus: { onWorkflowStart },
         });
 
-        expect(onWorkflowStart).toHaveBeenCalledOnce();
+        expect(onWorkflowStart).toHaveBeenCalledTimes(1);
         expect(onWorkflowStart).toHaveBeenCalledWith({
             taskPrompt: "Build a feature",
             resumed: false,
@@ -263,7 +268,7 @@ describe("Workflow-level callbacks", () => {
             onStatus: { onWorkflowStart },
         });
 
-        expect(onWorkflowStart).toHaveBeenCalledOnce();
+        expect(onWorkflowStart).toHaveBeenCalledTimes(1);
         expect(onWorkflowStart).toHaveBeenCalledWith({
             taskPrompt: "Resumed task",
             resumed: true,
@@ -330,7 +335,7 @@ describe("Workflow-level callbacks", () => {
             onStatus: { onWorkflowComplete },
         });
 
-        expect(onWorkflowComplete).toHaveBeenCalledOnce();
+        expect(onWorkflowComplete).toHaveBeenCalledTimes(1);
         const info = onWorkflowComplete.mock.calls[0][0] as { totalDurationMs: number; agentCount: number };
         expect(typeof info.totalDurationMs).toBe("number");
         expect(info.totalDurationMs).toBeGreaterThanOrEqual(0);
@@ -357,11 +362,11 @@ describe("Workflow-level callbacks", () => {
             }),
         ).rejects.toThrow("LLM unreachable");
 
-        expect(onWorkflowFailed).toHaveBeenCalledOnce();
-        const info = onWorkflowFailed.mock.calls[0][0] as { error: Error; phase: string };
+        expect(onWorkflowFailed).toHaveBeenCalledTimes(1);
+        const info = onWorkflowFailed.mock.calls[0][0] as { error: Error; phaseId: string };
         expect(info.error).toBeInstanceOf(Error);
         expect(info.error.message).toBe("LLM unreachable");
-        expect(typeof info.phase).toBe("string");
+        expect(typeof info.phaseId).toBe("string");
     });
 
     // 7. onAgentSpawn/Complete for scout
@@ -378,14 +383,12 @@ describe("Workflow-level callbacks", () => {
                 if (opts.taskTracker && typeof (opts.taskTracker as any).getAllTasks === 'function') {
                     const tt = opts.taskTracker as any;
                     for (const task of [...tt.getAllTasks()]) {
-                        const claimed = tt.claimTasks(1);
+                        const claimed = tt.claimTasks(1, 'mock-lane');
                         if (claimed.length > 0) {
-                            tt.startTask(claimed[0].id, 'mock-lane');
-                            tt.submitForReview(claimed[0].id, { report: `scout report for ${claimed[0].title}` });
                             tt.completeTask(claimed[0].id);
                         }
                     }
-                    const doneCount = tt.getAllTasks().filter((t: any) => t.status === 'done').length;
+                    const doneCount = tt.getAllTasks().filter((t: any) => t.status === 'complete').length;
                     return { completedTasks: doneCount, failedTasks: 0 };
                 }
             }
@@ -625,14 +628,14 @@ describe("Workflow-level callbacks", () => {
         });
 
         const spawnCalls = onAgentSpawn.mock.calls.map(
-            (c: unknown[]) => c[0] as { agentId: string; profile: string; phase: string },
+            (c: unknown[]) => c[0] as { agentId: string; profile: string; phaseId: string },
         );
         const titleGenSpawn = spawnCalls.find(
             (c: { agentId: string }) => c.agentId === "title-generator",
         );
         expect(titleGenSpawn).toBeDefined();
         expect(titleGenSpawn!.profile).toBe("scout");
-        expect(titleGenSpawn!.phase).toBe("initialization");
+        expect(titleGenSpawn!.phaseId).toBe("initialization");
     });
 
     it("title-generator onAgentComplete has profile and phase", async () => {
@@ -648,14 +651,14 @@ describe("Workflow-level callbacks", () => {
         });
 
         const completeCalls = onAgentComplete.mock.calls.map(
-            (c: unknown[]) => c[0] as { agentId: string; profile: string; phase: string },
+            (c: unknown[]) => c[0] as { agentId: string; profile: string; phaseId: string },
         );
         const titleGenComplete = completeCalls.find(
             (c: { agentId: string }) => c.agentId === "title-generator",
         );
         expect(titleGenComplete).toBeDefined();
         expect(titleGenComplete!.profile).toBe("scout");
-        expect(titleGenComplete!.phase).toBe("initialization");
+        expect(titleGenComplete!.phaseId).toBe("initialization");
     });
 
     it("title-generator uses scout profile harness via createHarness", async () => {

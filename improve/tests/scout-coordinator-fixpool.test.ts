@@ -1,11 +1,11 @@
 // ─── Tests for scout-coordinator profile, LanePool for fixers, remove parallelAgents ──
 //
-// These tests verify the 9 changes described in the task:
+// These tests verify the changes described in the task:
 //   1. Remove unused parallelAgents import
-//   2. makeHarnessOptions second arg is "scout-coordinator" (not "scout")
-//   3. onAgentSpawn callback uses profile "scout-coordinator"
-//   4. recordAgentSpawn uses profile "scout-coordinator"
-//   5. onAgentComplete uses profile "scout-coordinator"
+//   2. Scout-coordinator runs via runStepTask (not createHarness)
+//   3. Scout-coordinator runs via runStepTask (not createHarness)
+//   4. Scout-coordinator runs via runStepTask (not createHarness)
+//   5. Scout-coordinator runs via runStepTask (not createHarness)
 //   6. FIXER_STEPS constant defined
 //   7. finalReviewPhase signature updated with workDir, maxConcurrentTasks, signal
 //   8. finalReviewPhase uses LanePool (not parallelAgents) for fixers
@@ -28,12 +28,14 @@ const mockPromptForStructured = mock() as ReturnType<typeof mock> & ((...args: u
 const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
+const mockRunStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
 mock.module("@harms-haus/engin", () => ({
     ...realModule,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
+    runStepTask: (...args: unknown[]) => mockRunStepTask(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
@@ -148,28 +150,7 @@ beforeEach(() => {
     mock.clearAllMocks();
     mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
-    mockLanePoolRun.mockImplementation(async function(this: unknown) {
-        // Auto-process tasks from the LanePool's taskTracker so tests
-        // don't need to manually drive the pool.
-        const lastCall = mockLanePoolCtor.mock.calls[mockLanePoolCtor.mock.calls.length - 1];
-        if (lastCall?.[0]) {
-            const opts = lastCall[0] as Record<string, unknown>;
-            if (opts.taskTracker && typeof (opts.taskTracker as any).getAllTasks === 'function') {
-                const tt = opts.taskTracker as any;
-                for (const task of [...tt.getAllTasks()]) {
-                    const claimed = tt.claimTasks(1);
-                    if (claimed.length > 0) {
-                        tt.startTask(claimed[0].id, 'mock-lane');
-                        tt.submitForReview(claimed[0].id, { report: `result for ${claimed[0].title}` });
-                        tt.completeTask(claimed[0].id);
-                    }
-                }
-                const doneCount = tt.getAllTasks().filter((t: any) => t.status === 'done').length;
-                return { completedTasks: doneCount, failedTasks: 0 };
-            }
-        }
-        return { completedTasks: 0, failedTasks: 0 };
-    });
+    mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
 });
 
 // ─── CHANGE 1: parallelAgents import removed ────────────────────────────────
@@ -185,124 +166,56 @@ describe("CHANGE 1: parallelAgents import removed", () => {
     });
 });
 
-// ─── CHANGE 2: makeHarnessOptions second arg is "scout-coordinator" ─────────
+// ─── CHANGE 2: scout-coordinator uses runStepTask ──────────────────────────
 
-describe("CHANGE 2: scoutingPhase uses scout-coordinator profile for makeHarnessOptions", () => {
-    it("creates harness with profileId 'scout-coordinator' (not 'scout')", async () => {
+describe("CHANGE 2: scoutingPhase uses runStepTask for scout-coordinator", () => {
+    it("calls runStepTask with profileId 'scout-coordinator'", async () => {
         const dir = tmpDir();
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const topics = {
+        mockRunStepTask.mockReset();
+        mockRunStepTask.mockResolvedValueOnce({
             topics: [
                 { topic: "module-a", rationale: "Core module", files: ["src/a.ts"] },
             ],
-        };
-
-        mockPromptForStructured.mockResolvedValueOnce({ result: topics, attempts: 1 });
+        });
 
         await scoutingPhase(tracker, ["/profiles"], "Build a feature", "/cwd", 3, workDir);
 
-        // The first createHarness call is for the scout-coordinator
-        const harnessCall = mockCreateHarness.mock.calls[0];
-        expect(harnessCall).toBeDefined();
-        const opts = harnessCall[0] as { profile: { id: string }; agentId: string };
-        // CHANGE 2: profileId should be "scout-coordinator", not "scout"
-        expect(opts.profile.id).toBe("scout-coordinator");
+        // runStepTask should have been called with scout-coordinator
+        expect(mockRunStepTask).toHaveBeenCalledTimes(1);
+        const callOpts = mockRunStepTask.mock.calls[0][0] as Record<string, unknown>;
+        expect(callOpts.taskId).toBe("scout-coordinator");
+        expect(callOpts.profileId).toBe("scout-coordinator");
     });
 });
 
-// ─── CHANGE 3: onAgentSpawn callback uses profile "scout-coordinator" ───────
+// ─── CHANGE 3-5: scout-coordinator runs via runStepTask ─────────────────────
 
-describe("CHANGE 3: onAgentSpawn callback for scout-coordinator uses profile 'scout-coordinator'", () => {
-    it("onAgentSpawn is called with profile 'scout-coordinator' for the scout-coordinator agent", async () => {
+describe("CHANGE 3-5: scout-coordinator lifecycle via runStepTask", () => {
+    it("runStepTask is called with scout-coordinator taskId", async () => {
         const dir = tmpDir();
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const topics = {
+        mockRunStepTask.mockReset();
+        mockRunStepTask.mockResolvedValueOnce({
             topics: [
                 { topic: "module-a", rationale: "Core module", files: ["src/a.ts"] },
             ],
-        };
-
-        mockPromptForStructured.mockResolvedValueOnce({ result: topics, attempts: 1 });
-
-        const onAgentSpawn = mock();
-        await scoutingPhase(tracker, ["/profiles"], "Build a feature", "/cwd", 3, workDir, undefined, { onAgentSpawn });
-
-        // Find the spawn callback for the scout-coordinator agent
-        const spawnCalls = onAgentSpawn.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string; phase: string });
-        const coordinatorSpawn = spawnCalls.find(c => c.agentId === "scout-coordinator");
-
-        expect(coordinatorSpawn).toBeDefined();
-        // CHANGE 3: profile must be "scout-coordinator", not "scout"
-        expect(coordinatorSpawn!.profile).toBe("scout-coordinator");
-    });
-});
-
-// ─── CHANGE 4: recordAgentSpawn uses profile "scout-coordinator" ────────────
-
-describe("CHANGE 4: recordAgentSpawn for scout-coordinator uses profile 'scout-coordinator'", () => {
-    it("tracker.recordAgentSpawn is called with profile 'scout-coordinator' when scouting", async () => {
-        const dir = tmpDir();
-        const workDir = tmpDir();
-        const tracker = new WorkflowStatusTracker(dir);
-
-        // Spy on tracker.recordAgentSpawn
-        const recordAgentSpawnSpy = mock();
-        const origRecordAgentSpawn = tracker.recordAgentSpawn.bind(tracker);
-        tracker.recordAgentSpawn = (args: { agentId: string; profile: string; phase: string }) => {
-            recordAgentSpawnSpy(args);
-            return origRecordAgentSpawn(args);
-        };
-
-        const topics = {
-            topics: [
-                { topic: "module-a", rationale: "Core module", files: ["src/a.ts"] },
-            ],
-        };
-
-        mockPromptForStructured.mockResolvedValueOnce({ result: topics, attempts: 1 });
+        });
 
         await scoutingPhase(tracker, ["/profiles"], "Build a feature", "/cwd", 3, workDir);
 
-        // Find the recordAgentSpawn call for the scout-coordinator agent
-        const recordCalls = recordAgentSpawnSpy.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string; phase: string });
-        const coordinatorRecord = recordCalls.find(c => c.agentId === "scout-coordinator");
-
-        expect(coordinatorRecord).toBeDefined();
-        // CHANGE 4: profile must be "scout-coordinator", not "scout"
-        expect(coordinatorRecord!.profile).toBe("scout-coordinator");
-    });
-});
-
-// ─── CHANGE 5: onAgentComplete callback uses profile "scout-coordinator" ────
-
-describe("CHANGE 5: onAgentComplete callback for scout-coordinator uses profile 'scout-coordinator'", () => {
-    it("onAgentComplete is called with profile 'scout-coordinator' for the scout-coordinator agent", async () => {
-        const dir = tmpDir();
-        const workDir = tmpDir();
-        const tracker = new WorkflowStatusTracker(dir);
-
-        const topics = {
-            topics: [
-                { topic: "module-a", rationale: "Core module", files: ["src/a.ts"] },
-            ],
-        };
-
-        mockPromptForStructured.mockResolvedValueOnce({ result: topics, attempts: 1 });
-
-        const onAgentComplete = mock();
-        await scoutingPhase(tracker, ["/profiles"], "Build a feature", "/cwd", 3, workDir, undefined, { onAgentComplete });
-
-        // Find the complete callback for the scout-coordinator agent
-        const completeCalls = onAgentComplete.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string; phase: string });
-        const coordinatorComplete = completeCalls.find(c => c.agentId === "scout-coordinator");
-
-        expect(coordinatorComplete).toBeDefined();
-        // CHANGE 5: profile must be "scout-coordinator", not "scout"
-        expect(coordinatorComplete!.profile).toBe("scout-coordinator");
+        // Verify runStepTask was called with scout-coordinator
+        const coordinatorCalls = mockRunStepTask.mock.calls.filter(
+            (call: unknown[]) => (call[0] as Record<string, unknown>).taskId === "scout-coordinator"
+        );
+        expect(coordinatorCalls.length).toBe(1);
+        const callOpts = coordinatorCalls[0][0] as Record<string, unknown>;
+        expect(callOpts.profileId).toBe("scout-coordinator");
+        expect(callOpts.phaseId).toBe("scouting");
     });
 });
 
@@ -314,14 +227,14 @@ describe("CHANGE 7: finalReviewPhase signature includes workDir, maxConcurrentTa
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const assessment: FinalReviewTopics = {
+        mockRunStepTask.mockReset();
+        mockRunStepTask.mockResolvedValueOnce({
             topics: [],
             overallAssessment: "Clean",
             issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
+        });
 
-        // Should accept the new signature: (tracker, profilesDirs, cwd, maxConcurrentTasks, workDir, ...)
+        // Should accept the new signature: (tracker, profilesDirs, cwd, workDir, maxConcurrentTasks, ...)
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
         expect(clean).toBe(true);
@@ -333,14 +246,14 @@ describe("CHANGE 7: finalReviewPhase signature includes workDir, maxConcurrentTa
         const tracker = new WorkflowStatusTracker(dir);
         const controller = new AbortController();
 
-        const assessment: FinalReviewTopics = {
+        mockRunStepTask.mockReset();
+        mockRunStepTask.mockResolvedValueOnce({
             topics: [],
             overallAssessment: "Clean",
             issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
+        });
 
-        // Full new signature: (tracker, profilesDirs, cwd, maxConcurrentTasks, workDir, apiKeys, onStatus, signal)
+        // Full new signature: (tracker, profilesDirs, cwd, workDir, maxConcurrentTasks, apiKeys, onStatus, signal)
         const clean = await finalReviewPhase(
             tracker, ["/profiles"], "/cwd", workDir, 3,
             { openai: "key" },
@@ -360,24 +273,23 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
+        mockRunStepTask.mockReset();
         // First review: finds critical issues
-        const firstAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Critical bug in auth", severity: "critical" },
-                { file: "src/b.ts", description: "Critical bug in db", severity: "critical" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
-
-        // Second review: all fixed
-        const secondAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "All fixed",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
+        mockRunStepTask
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Needs fixes",
+                issues: [
+                    { file: "src/a.ts", description: "Critical bug in auth", severity: "critical" },
+                    { file: "src/b.ts", description: "Critical bug in db", severity: "critical" },
+                ],
+            })
+            // Second review: all fixed
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "All fixed",
+                issues: [],
+            });
 
         const clean = await finalReviewPhase(
             tracker, ["/profiles"], "/cwd", workDir, 3,
@@ -387,7 +299,6 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         expect(clean).toBe(true);
 
         // CHANGE 8: LanePool should have been created for the fixer round
-        // (One LanePool for the fixer pool, in addition to any from the reviewer harness)
         expect(mockLanePoolCtor.mock.calls.length).toBeGreaterThanOrEqual(1);
 
         // Find the LanePool that was created for fixers (it will have tasks with 'fixer' profile)
@@ -414,23 +325,22 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const firstAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Bug A", severity: "critical" },
-                { file: "src/b.ts", description: "Bug B", severity: "critical" },
-                { file: "src/c.ts", description: "Bug C", severity: "critical" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
-
-        const secondAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Fixed",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
+        mockRunStepTask.mockReset();
+        mockRunStepTask
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Needs fixes",
+                issues: [
+                    { file: "src/a.ts", description: "Bug A", severity: "critical" },
+                    { file: "src/b.ts", description: "Bug B", severity: "critical" },
+                    { file: "src/c.ts", description: "Bug C", severity: "critical" },
+                ],
+            })
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Fixed",
+                issues: [],
+            });
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -458,21 +368,20 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const firstAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/auth.ts", description: "Missing null check on token", severity: "critical" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
-
-        const secondAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Fixed",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
+        mockRunStepTask.mockReset();
+        mockRunStepTask
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Needs fixes",
+                issues: [
+                    { file: "src/auth.ts", description: "Missing null check on token", severity: "critical" },
+                ],
+            })
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Fixed",
+                issues: [],
+            });
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -501,21 +410,20 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const firstAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Bug", severity: "critical" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
-
-        const secondAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Fixed",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
+        mockRunStepTask.mockReset();
+        mockRunStepTask
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Needs fixes",
+                issues: [
+                    { file: "src/a.ts", description: "Bug", severity: "critical" },
+                ],
+            })
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Fixed",
+                issues: [],
+            });
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 7);
 
@@ -542,21 +450,20 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const firstAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Bug", severity: "critical" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
-
-        const secondAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Fixed",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
+        mockRunStepTask.mockReset();
+        mockRunStepTask
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Needs fixes",
+                issues: [
+                    { file: "src/a.ts", description: "Bug", severity: "critical" },
+                ],
+            })
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Fixed",
+                issues: [],
+            });
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -583,21 +490,20 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const workDir = "/my-work-dir";
         const tracker = new WorkflowStatusTracker(dir);
 
-        const firstAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Bug", severity: "critical" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
-
-        const secondAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Fixed",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
+        mockRunStepTask.mockReset();
+        mockRunStepTask
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Needs fixes",
+                issues: [
+                    { file: "src/a.ts", description: "Bug", severity: "critical" },
+                ],
+            })
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Fixed",
+                issues: [],
+            });
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -625,21 +531,20 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const firstAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Bug", severity: "critical" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
-
-        const secondAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Fixed",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
+        mockRunStepTask.mockReset();
+        mockRunStepTask
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Needs fixes",
+                issues: [
+                    { file: "src/a.ts", description: "Bug", severity: "critical" },
+                ],
+            })
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Fixed",
+                issues: [],
+            });
 
         const onAgentSpawn = mock();
         const onAgentComplete = mock();
@@ -666,21 +571,20 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const tracker = new WorkflowStatusTracker(dir);
         const controller = new AbortController();
 
-        const firstAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Bug", severity: "critical" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
-
-        const secondAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Fixed",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
+        mockRunStepTask.mockReset();
+        mockRunStepTask
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Needs fixes",
+                issues: [
+                    { file: "src/a.ts", description: "Bug", severity: "critical" },
+                ],
+            })
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Fixed",
+                issues: [],
+            });
 
         await finalReviewPhase(
             tracker, ["/profiles"], "/cwd", workDir, 5,
@@ -710,21 +614,20 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const firstAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Bug", severity: "critical" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
-
-        const secondAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Fixed",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
+        mockRunStepTask.mockReset();
+        mockRunStepTask
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Needs fixes",
+                issues: [
+                    { file: "src/a.ts", description: "Bug", severity: "critical" },
+                ],
+            })
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Fixed",
+                issues: [],
+            });
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -751,21 +654,20 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const firstAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Needs fixes",
-            issues: [
-                { file: "src/a.ts", description: "Bug", severity: "critical" },
-            ],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: firstAssessment, attempts: 1 });
-
-        const secondAssessment: FinalReviewTopics = {
-            topics: [],
-            overallAssessment: "Fixed",
-            issues: [],
-        };
-        mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
+        mockRunStepTask.mockReset();
+        mockRunStepTask
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Needs fixes",
+                issues: [
+                    { file: "src/a.ts", description: "Bug", severity: "critical" },
+                ],
+            })
+            .mockResolvedValueOnce({
+                topics: [],
+                overallAssessment: "Fixed",
+                issues: [],
+            });
 
         await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
@@ -796,23 +698,19 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
 describe("CHANGE 9: executePhase passes workDir, maxConcurrentTasks, signal to finalReviewPhase", () => {
     /** Setup mocks for a minimal run that reaches the review phase. */
     function setupMocksForReview() {
-        mockPromptForStructured
-            // initialization: title generation
-            .mockResolvedValueOnce({ result: { title: "AI title" }, attempts: 1 })
-            // scouting: topics (empty so no LanePool for scouts)
-            .mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 })
-            // scouting review: ready
-            .mockResolvedValueOnce({ result: { ready: true, research: "Done", gaps: [] }, attempts: 1 })
-            // planning
-            .mockResolvedValueOnce({ result: { tasks: [], strategy: "none" }, attempts: 1 })
-            // plan review: approved
-            .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
-            // final review: clean (no issues)
-            .mockResolvedValueOnce({ result: {
-                topics: [],
-                overallAssessment: "Good",
-                issues: [],
-            }, attempts: 1 });
+        mockRunStepTask.mockReset();
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (taskId === "title-generator") return { title: "AI title" };
+            if (taskId === "scout-coordinator") return { topics: [] };
+            if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
+            if (taskId === "planner") return { tasks: [], strategy: "none" };
+            if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
+            if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "Good", issues: [] };
+            return {};
+        });
+        mockPromptForStructured.mockReset();
+        mockPromptForStructured.mockResolvedValue({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
     }
 
     it("run() passes workDir and maxConcurrentTasks through to finalReviewPhase via executePhase", async () => {
@@ -827,17 +725,12 @@ describe("CHANGE 9: executePhase passes workDir, maxConcurrentTasks, signal to f
             maxConcurrentTasks: 7,
         });
 
-        // The review phase should have triggered a finalReviewPhase call.
-        // We can verify this worked correctly by checking that the final
-        // review promptForStructured call happened (the 6th call in sequence).
-        expect(mockPromptForStructured.mock.calls.length).toBeGreaterThanOrEqual(6);
-
         // Verify the workflow completed successfully
         const statePath = path.join(workDir, ".engin-state.json");
         const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
-        expect(state.currentPhase).toBe("done");
-        expect(state.completedPhases).toContain("review");
+        expect(state.currentPhaseId).toBe("done");
+        expect(state.completedPhaseIds).toContain("review");
     });
 
     it("run() propagates signal to finalReviewPhase", async () => {
@@ -857,37 +750,38 @@ describe("CHANGE 9: executePhase passes workDir, maxConcurrentTasks, signal to f
         const statePath = path.join(workDir, ".engin-state.json");
         const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
-        expect(state.currentPhase).toBe("done");
+        expect(state.currentPhaseId).toBe("done");
     });
 
     it("run() with critical issues in review uses LanePool (not parallelAgents) for fixers", async () => {
         const workDir = tmpDir();
 
-        mockPromptForStructured
-            // initialization: title generation
-            .mockResolvedValueOnce({ result: { title: "AI title" }, attempts: 1 })
-            // scouting: topics (empty)
-            .mockResolvedValueOnce({ result: { topics: [] }, attempts: 1 })
-            // scouting review: ready
-            .mockResolvedValueOnce({ result: { ready: true, research: "Done", gaps: [] }, attempts: 1 })
-            // planning
-            .mockResolvedValueOnce({ result: { tasks: [], strategy: "none" }, attempts: 1 })
-            // plan review: approved
-            .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
-            // final review round 1: critical issue found
-            .mockResolvedValueOnce({ result: {
-                topics: [],
-                overallAssessment: "Needs fix",
-                issues: [
-                    { file: "src/a.ts", description: "Critical bug", severity: "critical" },
-                ],
-            }, attempts: 1 })
-            // final review round 2: clean
-            .mockResolvedValueOnce({ result: {
-                topics: [],
-                overallAssessment: "Fixed",
-                issues: [],
-            }, attempts: 1 });
+        mockRunStepTask.mockReset();
+        let finalReviewCalls = 0;
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (taskId === "title-generator") return { title: "AI title" };
+            if (taskId === "scout-coordinator") return { topics: [] };
+            if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
+            if (taskId === "planner") return { tasks: [], strategy: "none" };
+            if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
+            if (taskId?.toString().startsWith("final-reviewer-round-")) {
+                finalReviewCalls++;
+                if (finalReviewCalls <= 1) {
+                    return {
+                        topics: [],
+                        overallAssessment: "Needs fix",
+                        issues: [
+                            { file: "src/a.ts", description: "Critical bug", severity: "critical" },
+                        ],
+                    };
+                }
+                return { topics: [], overallAssessment: "Fixed", issues: [] };
+            }
+            return {};
+        });
+        mockPromptForStructured.mockReset();
+        mockPromptForStructured.mockResolvedValue({ result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 });
 
         await run("Build a feature", {
             profilesDir: "/profiles",
@@ -900,7 +794,7 @@ describe("CHANGE 9: executePhase passes workDir, maxConcurrentTasks, signal to f
         const statePath = path.join(workDir, ".engin-state.json");
         const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
-        expect(state.currentPhase).toBe("done");
+        expect(state.currentPhaseId).toBe("done");
 
         // Verify LanePool was used for fixers (look for a LanePool with fixer tasks)
         let fixerPoolFound = false;
@@ -921,56 +815,34 @@ describe("CHANGE 9: executePhase passes workDir, maxConcurrentTasks, signal to f
     }, 30000);
 });
 
-// ─── Combined: All scout-coordinator callbacks use profile "scout-coordinator" ──
+// ─── Combined: scout-coordinator runs via runStepTask ─────────────────────────
 
-describe("Combined: scout-coordinator lifecycle uses correct profile throughout", () => {
-    it("spawn, record, and complete all use profile 'scout-coordinator'", async () => {
+describe("Combined: scout-coordinator lifecycle via runStepTask", () => {
+    it("runStepTask is called with correct profile and phase", async () => {
         const dir = tmpDir();
         const workDir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const topics = {
+        mockRunStepTask.mockReset();
+        mockRunStepTask.mockResolvedValueOnce({
             topics: [
                 { topic: "module-a", rationale: "Core", files: ["src/a.ts"] },
             ],
-        };
-
-        mockPromptForStructured.mockResolvedValueOnce({ result: topics, attempts: 1 });
-
-        const onAgentSpawn = mock();
-        const onAgentComplete = mock();
-
-        // Spy on recordAgentSpawn
-        const recordAgentSpawnSpy = mock();
-        const origRecord = tracker.recordAgentSpawn.bind(tracker);
-        tracker.recordAgentSpawn = (args: { agentId: string; profile: string; phase: string }) => {
-            recordAgentSpawnSpy(args);
-            return origRecord(args);
-        };
+        });
 
         await scoutingPhase(
             tracker, ["/profiles"], "Build a feature", "/cwd", 3, workDir,
-            undefined,
-            { onAgentSpawn, onAgentComplete },
         );
 
-        // Verify onAgentSpawn for scout-coordinator
-        const spawnCalls = onAgentSpawn.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string });
-        const coordinatorSpawn = spawnCalls.find(c => c.agentId === "scout-coordinator");
-        expect(coordinatorSpawn).toBeDefined();
-        expect(coordinatorSpawn!.profile).toBe("scout-coordinator");
-
-        // Verify recordAgentSpawn for scout-coordinator
-        const recordCalls = recordAgentSpawnSpy.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string });
-        const coordinatorRecord = recordCalls.find(c => c.agentId === "scout-coordinator");
-        expect(coordinatorRecord).toBeDefined();
-        expect(coordinatorRecord!.profile).toBe("scout-coordinator");
-
-        // Verify onAgentComplete for scout-coordinator
-        const completeCalls = onAgentComplete.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string });
-        const coordinatorComplete = completeCalls.find(c => c.agentId === "scout-coordinator");
-        expect(coordinatorComplete).toBeDefined();
-        expect(coordinatorComplete!.profile).toBe("scout-coordinator");
+        // Verify runStepTask was called with scout-coordinator
+        const coordinatorCalls = mockRunStepTask.mock.calls.filter(
+            (call: unknown[]) => (call[0] as Record<string, unknown>).taskId === "scout-coordinator"
+        );
+        expect(coordinatorCalls.length).toBe(1);
+        const callOpts = coordinatorCalls[0][0] as Record<string, unknown>;
+        expect(callOpts.profileId).toBe("scout-coordinator");
+        expect(callOpts.phaseId).toBe("scouting");
+        expect(callOpts.isReadOnly).toBe(true);
     });
 });
 

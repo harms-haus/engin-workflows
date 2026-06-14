@@ -94,13 +94,13 @@ describe("workflowConfig", () => {
         expect(step.isReadOnly).toBe(false);
     });
 
-    it("has sidebarPhases as an array with 5 entries", () => {
-        expect(Array.isArray(workflowConfig.sidebarPhases)).toBe(true);
-        expect(workflowConfig.sidebarPhases).toHaveLength(5);
+    it("has phases as an array with 5 entries", () => {
+        expect(Array.isArray(workflowConfig.phases)).toBe(true);
+        expect(workflowConfig.phases).toHaveLength(5);
     });
 
-    it("sidebarPhases ids are: initialization, scouting, planning, implementing, review", () => {
-        const ids = workflowConfig.sidebarPhases.map((p: { id: string }) => p.id);
+    it("phases ids are: initialization, scouting, planning, implementing, review", () => {
+        const ids = workflowConfig.phases.map((p: { id: string }) => p.id);
         expect(ids).toEqual([
             "initialization",
             "scouting",

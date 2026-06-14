@@ -62,7 +62,7 @@ export async function makeHarnessOptions(
 export interface SpawnInfo {
     agentId: string;
     profile: string;
-    phase: string;
+    phaseId: string;
     taskId?: string;
 }
 

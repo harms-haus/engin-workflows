@@ -1,8 +1,8 @@
 import type { StatusCallbacks, WorkflowStatusTracker } from "@harms-haus/engin";
-import { createHarness, promptForStructured } from "@harms-haus/engin";
+import { runStepTask } from "@harms-haus/engin";
 import { PlanSchema, PlanReviewSchema } from "./schemas";
 import type { Plan, PlanReview } from "./schemas";
-import { makeHarnessOptions, spawnAgent, structuredOutputEvent, decisionEvent } from "./helpers";
+import { structuredOutputEvent, decisionEvent } from "./helpers";
 
 // ─── Phase 3: Planning ──────────────────────────────────────────────────────
 
@@ -19,11 +19,8 @@ export async function planningPhase(
     planReviewSuggestions?: string[],
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
+    signal?: AbortSignal,
 ): Promise<Plan> {
-    const opts = await makeHarnessOptions(profilesDirs, "planner", cwd, "planner", apiKeys, onStatus);
-    const { session: harness, dispose: unsub } = await createHarness(opts);
-    spawnAgent(tracker, onStatus, { agentId: "planner", profile: "planner", phase: "planning" });
-
     const promptLines: string[] = [
         "You are a planning agent. Based on the research below, create a detailed implementation plan.",
         "",
@@ -52,13 +49,21 @@ export async function planningPhase(
 
     const prompt = promptLines.join("\n");
 
-    let plan: Plan;
-    try {
-        ({ result: plan } = await promptForStructured(harness, prompt, PlanSchema));
-    } finally {
-        unsub?.();
-    }
-    onStatus?.onAgentComplete?.({ agentId: "planner", profile: "planner", phase: "planning" });
+    const plan = await runStepTask<Plan>({
+        profilesDirs,
+        phaseId: "planning",
+        taskId: "planner",
+        title: "Planner",
+        stepName: "plan",
+        profileId: "planner",
+        cwd,
+        apiKeys,
+        onStatus,
+        isReadOnly: true,
+        schema: PlanSchema,
+        prompt,
+        signal,
+    });
 
     tracker.setWorkflowData({ plan });
 
@@ -83,11 +88,8 @@ export async function planReviewPhase(
     cwd: string,
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
+    signal?: AbortSignal,
 ): Promise<PlanReview> {
-    const opts = await makeHarnessOptions(profilesDirs, "plan-reviewer", cwd, "plan-reviewer", apiKeys, onStatus);
-    const { session: harness, dispose: unsub } = await createHarness(opts);
-    spawnAgent(tracker, onStatus, { agentId: "plan-reviewer", profile: "plan-reviewer", phase: "planning" });
-
     const prompt = [
         "You are reviewing an implementation plan. Evaluate it for completeness, correctness, and feasibility.",
         "",
@@ -102,13 +104,21 @@ export async function planReviewPhase(
         "Approve the plan if it's sound, or provide specific feedback for improvement.",
     ].join("\n");
 
-    let review: PlanReview;
-    try {
-        ({ result: review } = await promptForStructured(harness, prompt, PlanReviewSchema));
-    } finally {
-        unsub?.();
-    }
-    onStatus?.onAgentComplete?.({ agentId: "plan-reviewer", profile: "plan-reviewer", phase: "planning" });
+    const review = await runStepTask<PlanReview>({
+        profilesDirs,
+        phaseId: "planning",
+        taskId: "plan-reviewer",
+        title: "Plan Review",
+        stepName: "review-plan",
+        profileId: "plan-reviewer",
+        cwd,
+        apiKeys,
+        onStatus,
+        isReadOnly: true,
+        schema: PlanReviewSchema,
+        prompt,
+        signal,
+    });
 
     onStatus?.onDecision?.({
         agentId: "plan-reviewer",

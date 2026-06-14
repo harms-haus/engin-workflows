@@ -10,7 +10,7 @@ export interface WorkflowConfig {
     name: string;
     defaultMaxConcurrentTasks: number;
     fixerSteps: StepDefinition[];
-    sidebarPhases: { id: string; label: string; icon: string }[];
+    phases: { id: string; label: string; icon: string }[];
     titleFormatter: (description: string) => string;
 }
 

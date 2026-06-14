@@ -1,9 +1,9 @@
 import type { StatusCallbacks, StepDefinition, WorkflowStatusTracker } from "@harms-haus/engin";
-import { LanePool, TaskTracker, createHarness, promptForStructured } from "@harms-haus/engin";
+import { LanePool, TaskTracker, runStepTask } from "@harms-haus/engin";
 import { join } from "node:path";
 import { ScoutingTopicSchema, ScoutingReviewSchema } from "./schemas";
 import type { ScoutingTopics, ScoutingReview } from "./schemas";
-import { makeHarnessOptions, spawnAgent, structuredOutputEvent, decisionEvent } from "./helpers";
+import { structuredOutputEvent, decisionEvent } from "./helpers";
 
 // ─── Phase 1: Scouting ──────────────────────────────────────────────────────
 
@@ -54,23 +54,27 @@ export async function scoutingPhase(
         topics = phaseOptions.topics;
     } else {
         // First round: use the scout-coordinator to determine topics
-        const scoutOpts = await makeHarnessOptions(profilesDirs, "scout-coordinator", cwd, "scout-coordinator", apiKeys, onStatus);
-        const { session: scoutHarness, dispose: scoutDispose } = await createHarness(scoutOpts);
-        spawnAgent(tracker, onStatus, { agentId: "scout-coordinator", profile: "scout-coordinator", phase: "scouting" });
+        const topicPrompt = [
+            "You are a codebase scout. Analyze the task below and identify key areas of the codebase that need investigation.",
+            "",
+            `Task: ${taskPrompt}`,
+        ].join("\n");
 
-        let coordinatorTopics: ScoutingTopics;
-        try {
-            const topicPrompt = [
-                "You are a codebase scout. Analyze the task below and identify key areas of the codebase that need investigation.",
-                "",
-                `Task: ${taskPrompt}`,
-            ].join("\n");
-
-            ({ result: coordinatorTopics } = await promptForStructured(scoutHarness, topicPrompt, ScoutingTopicSchema));
-        } finally {
-            scoutDispose?.();
-        }
-        onStatus?.onAgentComplete?.({ agentId: "scout-coordinator", profile: "scout-coordinator", phase: "scouting" });
+        const coordinatorTopics = await runStepTask<ScoutingTopics>({
+            profilesDirs,
+            phaseId: "scouting",
+            taskId: "scout-coordinator",
+            title: "Scout Coordinator",
+            stepName: "coordinate",
+            profileId: "scout-coordinator",
+            cwd,
+            apiKeys,
+            onStatus,
+            isReadOnly: true,
+            schema: ScoutingTopicSchema,
+            prompt: topicPrompt,
+            signal,
+        });
 
         topics = coordinatorTopics.topics;
 
@@ -105,6 +109,7 @@ export async function scoutingPhase(
                 files: topic.files,
                 dependencies: [],
                 isCode: false,
+                phaseId: "scouting",
             });
         }
 
@@ -115,6 +120,7 @@ export async function scoutingPhase(
         const pool = new LanePool({
             maxConcurrentLanes: maxConcurrentTasks,
             profilesDirs,
+            phaseId: "scouting",
             sessionBaseDir: join(workDir, 'sessions', `scouting-round-${phaseOptions.round}`),
             cwd,
             apiKeys,
@@ -129,9 +135,9 @@ export async function scoutingPhase(
 
         // Collect results from completed tasks and APPEND to existing reports
         for (const task of scoutingTracker.getAllTasks()) {
-            if (task.status === 'done') {
+            if (task.status === 'complete') {
                 reports.push(task.result);
-                onStatus?.onAgentComplete?.({ agentId: task.id, profile: "scout", phase: "scouting" });
+                onStatus?.onAgentComplete?.({ agentId: task.id, profile: "scout", phaseId: "scouting" });
             }
         }
     }
@@ -155,11 +161,8 @@ export async function scoutingReviewPhase(
     cwd: string,
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
+    signal?: AbortSignal,
 ): Promise<ScoutingReview> {
-    const opts = await makeHarnessOptions(profilesDirs, "scouting-reviewer", cwd, "scouting-reviewer", apiKeys, onStatus);
-    const { session: harness, dispose: unsub } = await createHarness(opts);
-    spawnAgent(tracker, onStatus, { agentId: "scouting-reviewer", profile: "scouting-reviewer", phase: "scouting" });
-
     const prompt = [
         "You are reviewing scouting reports to determine if we have enough information to create an implementation plan.",
         "",
@@ -171,13 +174,21 @@ export async function scoutingReviewPhase(
         "Determine if we're ready to plan. If not, identify ONLY the gaps that remain — each gap should include the topic name, why it still needs investigation, and the key files to examine.",
     ].join("\n");
 
-    let review: ScoutingReview;
-    try {
-        ({ result: review } = await promptForStructured(harness, prompt, ScoutingReviewSchema));
-    } finally {
-        unsub?.();
-    }
-    onStatus?.onAgentComplete?.({ agentId: "scouting-reviewer", profile: "scouting-reviewer", phase: "scouting" });
+    const review = await runStepTask<ScoutingReview>({
+        profilesDirs,
+        phaseId: "scouting",
+        taskId: "scouting-reviewer",
+        title: "Scouting Review",
+        stepName: "review-scouting",
+        profileId: "scouting-reviewer",
+        cwd,
+        apiKeys,
+        onStatus,
+        isReadOnly: true,
+        schema: ScoutingReviewSchema,
+        prompt,
+        signal,
+    });
 
     onStatus?.onDecision?.({
         agentId: "scouting-reviewer",

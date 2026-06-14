@@ -14,7 +14,7 @@ export const workflowConfig = {
         { name: 'fix', profileId: 'fixer', isReadOnly: false },
         { name: 'verify', profileId: 'implement-reviewer', isReadOnly: true, schema: ReviewResultSchema },
     ] as StepDefinition[],
-    sidebarPhases: [
+    phases: [
         { id: 'scouting', label: 'Scouting', icon: '🔍' },
         { id: 'planning', label: 'Planning', icon: '📋' },
         { id: 'implementing', label: 'Implementing', icon: '🔨' },

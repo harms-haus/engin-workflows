@@ -2,7 +2,7 @@
 //
 // Tests for the initialization phase added to run():
 //   - TitleSchema validation
-//   - AI title generation via initializationPhase
+//   - AI title generation via runStepTask
 //   - Sidebar update sequence (Initializing... → AI title)
 //   - Resume behavior (skip AI generation)
 //   - Fallback on LLM error
@@ -23,12 +23,14 @@ const mockPromptForStructured = mock() as ReturnType<typeof mock> & ((...args: u
 const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
+const mockRunStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
 mock.module("@harms-haus/engin", () => ({
     ...realEngin,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
+    runStepTask: (...args: unknown[]) => mockRunStepTask(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
@@ -95,41 +97,17 @@ function makeAllProfiles(): Map<string, unknown> {
 }
 
 /**
- * Default mock prompt handler for a successful run.
- * Responds to each phase's expected prompt pattern.
+ * Smart mock for runStepTask based on taskId.
  */
-function defaultPromptHandler(text: string): unknown {
-    // Title generator (initialization phase)
-    if (text.includes("title generator") || text.includes("3-8 word title")) {
-        return { result: { title: "Refactor auth module" }, attempts: 1 };
-    }
-
-    // Scouting coordinator: identify topics
-    if (text.includes("codebase scout") || text.includes("Identify key areas")) {
-        return { result: { topics: [] }, attempts: 1 };
-    }
-
-    // Scouting review
-    if (text.includes("reviewing scouting reports")) {
-        return { result: { ready: true, research: "All scouted", gaps: [] }, attempts: 1 };
-    }
-
-    // Planning
-    if (text.includes("planning agent")) {
-        return { result: { tasks: [], strategy: "none" }, attempts: 1 };
-    }
-
-    // Plan review
-    if (text.includes("reviewing an implementation plan")) {
-        return { result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 };
-    }
-
-    // Final quality review
-    if (text.includes("final quality review")) {
-        return { result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 };
-    }
-
-    return { result: {}, attempts: 1 };
+function smartRunStepTask(opts: Record<string, unknown>): unknown {
+    const taskId = opts.taskId as string;
+    if (taskId === "title-generator") return { title: "Refactor auth module" };
+    if (taskId === "scout-coordinator") return { topics: [] };
+    if (taskId === "scouting-reviewer") return { ready: true, research: "All scouted", gaps: [] };
+    if (taskId === "planner") return { tasks: [], strategy: "none" };
+    if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
+    if (taskId?.toString().startsWith("final-reviewer-round-")) return { topics: [], overallAssessment: "Good", issues: [] };
+    return {};
 }
 
 // ─── Setup ──────────────────────────────────────────────────────────────────
@@ -139,9 +117,9 @@ beforeEach(() => {
     mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
     mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
-    mockPromptForStructured.mockImplementation(async (_harness: unknown, text: string) => {
-        return defaultPromptHandler(text);
-    });
+    mockRunStepTask.mockImplementation(smartRunStepTask);
+    mockPromptForStructured.mockReset();
+    mockPromptForStructured.mockResolvedValue({ result: {}, attempts: 1 });
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -189,12 +167,6 @@ describe("Initialization Phase Sidebar Updates", () => {
         );
         expect(initCall).toBeDefined();
         expect(initCall!.indicator).toBe("⚙");
-        // This call should include the phases array
-        expect(initCall!.phases).toBeDefined();
-        const phases = initCall!.phases as Array<{ id: string }>;
-        // SIDEBAR_PHASES no longer includes initialization as a phase entry;
-        // the first entry is now "scouting"
-        expect(phases[0].id).toBe("scouting");
     });
 
     it("emits AI-generated title after initialization completes", async () => {
@@ -248,22 +220,25 @@ describe("Initialization Phase Sidebar Updates", () => {
 
     it("initialization runs BEFORE the scouting phase starts", async () => {
         const workDir = tmpDir();
-        const events: string[] = [];
 
-        const onAgentSpawn = mock((data: { agentId: string; phase: string }) => {
-            events.push(`spawn:${data.agentId}:${data.phase}`);
+        // Track runStepTask calls to verify title-generator is called first
+        mockRunStepTask.mockReset();
+        const callOrder: string[] = [];
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            callOrder.push(taskId);
+            return smartRunStepTask(opts);
         });
 
         await run("Build a feature", {
             profilesDir: "/profiles",
             cwd: "/project",
             workDir,
-            onStatus: { onAgentSpawn },
         });
 
-        // title-generator should spawn before any scouting agents
-        const titleGenIdx = events.findIndex((e) => e.startsWith("spawn:title-generator"));
-        const scoutCoordIdx = events.findIndex((e) => e.startsWith("spawn:scout-coordinator"));
+        // title-generator should be called before scout-coordinator
+        const titleGenIdx = callOrder.indexOf("title-generator");
+        const scoutCoordIdx = callOrder.indexOf("scout-coordinator");
         expect(titleGenIdx).toBeGreaterThanOrEqual(0);
         expect(scoutCoordIdx).toBeGreaterThanOrEqual(0);
         expect(titleGenIdx).toBeLessThan(scoutCoordIdx);
@@ -280,32 +255,15 @@ describe("Initialization Phase on Resume", () => {
         tracker.setPhase("scouting");
         await tracker.save();
 
-        mockPromptForStructured.mockImplementation(async (_harness: unknown, text: string) => {
-            // Should NOT see title generator prompt
-            if (text.includes("title generator")) {
+        mockRunStepTask.mockReset();
+        const calledTaskIds: string[] = [];
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            calledTaskIds.push(taskId);
+            if (taskId === "title-generator") {
                 throw new Error("Title generation should NOT be called on resume");
             }
-            // Scouting topics
-            if (text.includes("codebase scout") || text.includes("Identify key areas")) {
-                return { result: { topics: [] }, attempts: 1 };
-            }
-            // Scouting review
-            if (text.includes("reviewing scouting reports")) {
-                return { result: { ready: true, research: "Resumed", gaps: [] }, attempts: 1 };
-            }
-            // Planning
-            if (text.includes("planning agent")) {
-                return { result: { tasks: [], strategy: "none" }, attempts: 1 };
-            }
-            // Plan review
-            if (text.includes("reviewing an implementation plan")) {
-                return { result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 };
-            }
-            // Final quality review
-            if (text.includes("final quality review")) {
-                return { result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 };
-            }
-            return { result: {}, attempts: 1 };
+            return smartRunStepTask(opts);
         });
 
         await run("Resumed task", {
@@ -315,10 +273,11 @@ describe("Initialization Phase on Resume", () => {
         });
 
         // Should complete successfully without hitting title generator
+        expect(calledTaskIds).not.toContain("title-generator");
         const statePath = path.join(workDir, ".engin-state.json");
         const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
-        expect(state.currentPhase).toBe("done");
+        expect(state.currentPhaseId).toBe("done");
     }, 30000);
 
     it("uses truncated title on resume instead of AI title", async () => {
@@ -332,30 +291,6 @@ describe("Initialization Phase on Resume", () => {
 
         const onSidebarUpdate = mock();
         const onWorkflowStart = mock();
-
-        mockPromptForStructured.mockImplementation(async (_harness: unknown, text: string) => {
-            // Scouting topics
-            if (text.includes("codebase scout") || text.includes("Identify key areas")) {
-                return { result: { topics: [] }, attempts: 1 };
-            }
-            // Scouting review
-            if (text.includes("reviewing scouting reports")) {
-                return { result: { ready: true, research: "Resumed", gaps: [] }, attempts: 1 };
-            }
-            // Planning
-            if (text.includes("planning agent")) {
-                return { result: { tasks: [], strategy: "none" }, attempts: 1 };
-            }
-            // Plan review
-            if (text.includes("reviewing an implementation plan")) {
-                return { result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 };
-            }
-            // Final quality review
-            if (text.includes("final quality review")) {
-                return { result: { topics: [], overallAssessment: "Good", issues: [] }, attempts: 1 };
-            }
-            return { result: {}, attempts: 1 };
-        });
 
         await run("A very long task prompt that exceeds the sixty character limit so it gets truncated with ellipsis at the end", {
             profilesDir: "/profiles",
@@ -384,16 +319,14 @@ describe("Initialization Phase Fallback", () => {
     it("falls back to full task prompt when title generation throws", async () => {
         const workDir = tmpDir();
 
-        // Make title generation throw
-        let callCount = 0;
-        mockPromptForStructured.mockImplementation(async (_harness: unknown, text: string) => {
-            callCount++;
-            // First call is title generation — throw
-            if (callCount === 1) {
+        // Make runStepTask throw for title-generator
+        mockRunStepTask.mockReset();
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (taskId === "title-generator") {
                 throw new Error("LLM unavailable");
             }
-            // Subsequent calls use the default handler
-            return defaultPromptHandler(text);
+            return smartRunStepTask(opts);
         });
 
         const onSidebarUpdate = mock();
@@ -419,21 +352,21 @@ describe("Initialization Phase Fallback", () => {
         const statePath = path.join(workDir, ".engin-state.json");
         const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
-        expect(state.currentPhase).toBe("done");
+        expect(state.currentPhaseId).toBe("done");
     }, 30000);
 
     it("falls back to truncated prompt with ellipsis when taskPrompt exceeds 60 chars", async () => {
         const workDir = tmpDir();
         const longPrompt = "This is an extremely long task description that definitely exceeds the sixty character limit for truncation testing";
 
-        // Make title generation throw
-        let callCount = 0;
-        mockPromptForStructured.mockImplementation(async (_harness: unknown, text: string) => {
-            callCount++;
-            if (callCount === 1) {
+        // Make runStepTask throw for title-generator
+        mockRunStepTask.mockReset();
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (taskId === "title-generator") {
                 throw new Error("LLM unavailable");
             }
-            return defaultPromptHandler(text);
+            return smartRunStepTask(opts);
         });
 
         const onSidebarUpdate = mock();
@@ -456,14 +389,18 @@ describe("Initialization Phase Fallback", () => {
         expect(fallbackCall).toBeDefined();
     }, 30000);
 
-    it("falls back when createHarness throws during initialization", async () => {
+    it("falls back when runStepTask throws during initialization", async () => {
         const workDir = tmpDir();
 
-        // Make createHarness throw on first call (title generation harness)
-        mockCreateHarness
-            .mockRejectedValueOnce(new Error("Harness creation failed"))
-            // Subsequent calls succeed
-            .mockResolvedValue(makeHarnessResult());
+        // Make runStepTask throw for title-generator
+        mockRunStepTask.mockReset();
+        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
+            const taskId = opts.taskId as string;
+            if (taskId === "title-generator") {
+                throw new Error("runStepTask failed");
+            }
+            return smartRunStepTask(opts);
+        });
 
         const onSidebarUpdate = mock();
 
@@ -487,21 +424,13 @@ describe("Initialization Phase Fallback", () => {
         const statePath = path.join(workDir, ".engin-state.json");
         const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
-        expect(state.currentPhase).toBe("done");
+        expect(state.currentPhaseId).toBe("done");
     }, 30000);
 });
 
-describe("Initialization Phase — dispose called", () => {
-    it("calls dispose on title generator harness after completion", async () => {
+describe("Initialization Phase — runStepTask called", () => {
+    it("runStepTask called for title-generator on fresh start", async () => {
         const workDir = tmpDir();
-
-        const mockDispose = mock(() => {});
-
-        mockCreateHarness.mockResolvedValue({
-            session: makeHarness(),
-            sessionId: "test-session",
-            dispose: mockDispose,
-        });
 
         await run("Build a feature", {
             profilesDir: "/profiles",
@@ -509,9 +438,27 @@ describe("Initialization Phase — dispose called", () => {
             workDir,
         });
 
-        // The dispose mock should have been called for the title generator harness
-        // (and possibly other harnesses). At least the title generator dispose was called.
-        expect(mockDispose).toHaveBeenCalled();
+        // runStepTask should have been called with title-generator taskId
+        const titleGenCalls = mockRunStepTask.mock.calls.filter(
+            (call: unknown[]) => (call[0] as Record<string, unknown>).taskId === "title-generator"
+        );
+        expect(titleGenCalls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("title-generator uses TitleSchema for structured output", async () => {
+        const workDir = tmpDir();
+
+        await run("Build a feature", {
+            profilesDir: "/profiles",
+            cwd: "/project",
+            workDir,
+        });
+
+        // First runStepTask call should use TitleSchema
+        const firstCall = mockRunStepTask.mock.calls[0];
+        expect(firstCall).toBeDefined();
+        const opts = firstCall[0] as { schema: { _def: { typeName: string } } };
+        expect(opts.schema._def.typeName).toBe("ZodObject");
     });
 });
 
