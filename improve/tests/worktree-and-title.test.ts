@@ -224,7 +224,7 @@ describe("worktree option", () => {
         expect(state.currentPhase).toBe("done");
     });
 
-    it("worktree is NOT persisted to tracker state (not yet supported)", async () => {
+    it("worktree is persisted to tracker state", async () => {
         const workDir = tmpDir();
         const worktree = {
             worktreePath: "/tmp/worktree-xyz",
@@ -243,8 +243,8 @@ describe("worktree option", () => {
         const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
 
-        // The worktree info is not yet persisted in the state file
-        expect(state.worktree).toBeUndefined();
+        // The worktree info should be persisted in the state file
+        expect(state.worktree).toEqual(worktree);
     });
 
     it("worktree is undefined in state when not provided", async () => {
@@ -268,7 +268,7 @@ describe("worktree option", () => {
 // ── 3. Worktree set BEFORE first save ────────────────────────────────────
 
 describe("worktree set before first save", () => {
-    it("worktree is NOT yet persisted (feature not implemented)", async () => {
+    it("worktree is persisted before first save", async () => {
         const workDir = tmpDir();
         const worktree = {
             worktreePath: "/tmp/wt-early",
@@ -287,13 +287,13 @@ describe("worktree set before first save", () => {
         const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
 
-        // worktree is not yet persisted in the state
-        expect(state.worktree).toBeUndefined();
+        // worktree should be persisted in the state
+        expect(state.worktree).toEqual(worktree);
         // taskPrompt should be present
         expect(state.taskPrompt).toBe("Improve a feature");
     });
 
-    it("worktree is NOT persisted through phase transitions (feature not implemented)", async () => {
+    it("worktree persists through phase transitions", async () => {
         const workDir = tmpDir();
         const worktree = {
             worktreePath: "/tmp/wt-persist",
@@ -312,8 +312,8 @@ describe("worktree set before first save", () => {
         const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
 
-        // After all phases complete, worktree is still not persisted
-        expect(state.worktree).toBeUndefined();
+        // After all phases complete, worktree should still be persisted
+        expect(state.worktree).toEqual(worktree);
         expect(state.currentPhase).toBe("done");
     });
 });
@@ -501,7 +501,7 @@ describe("initializationPhase uses createHarness + promptForStructured", () => {
 // ── 5. Combined: worktree + generateWorkflowTitle ────────────────────────
 
 describe("worktree integration (current behavior)", () => {
-    it("worktree is NOT persisted when provided (feature not yet implemented)", async () => {
+    it("worktree is persisted when provided", async () => {
         const workDir = tmpDir();
         const worktree = {
             worktreePath: "/tmp/wt-integration",
@@ -516,12 +516,12 @@ describe("worktree integration (current behavior)", () => {
             worktree,
         });
 
-        // worktree is not yet persisted
+        // worktree should be persisted
         const statePath = path.join(workDir, ".engin-state.json");
         const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
 
-        expect(state.worktree).toBeUndefined();
+        expect(state.worktree).toEqual(worktree);
         expect(state.currentPhase).toBe("done");
     });
 

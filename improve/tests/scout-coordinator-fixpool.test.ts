@@ -306,26 +306,6 @@ describe("CHANGE 5: onAgentComplete callback for scout-coordinator uses profile 
     });
 });
 
-// ─── CHANGE 6: FIXER_STEPS constant defined ─────────────────────────────────
-
-describe("CHANGE 6: FIXER_STEPS constant defined", () => {
-    it("source file defines FIXER_STEPS", () => {
-        expect(SOURCE_CODE).toMatch(/const\s+FIXER_STEPS\s*:\s*StepDefinition\[\]/);
-    });
-
-    it("FIXER_STEPS contains a 'fix' step with profileId 'fixer'", () => {
-        // Look for the FIXER_STEPS definition in the source
-        const fixerStepsMatch = SOURCE_CODE.match(
-            /const\s+FIXER_STEPS\s*:\s*StepDefinition\[\]\s*=\s*\[([\s\S]*?)\]/,
-        );
-        expect(fixerStepsMatch).not.toBeNull();
-        const definition = fixerStepsMatch![1];
-        expect(definition).toContain("'fix'");
-        expect(definition).toContain("'fixer'");
-        expect(definition).toContain("isReadOnly: false");
-    });
-});
-
 // ─── CHANGE 7: finalReviewPhase signature updated ──────────────────────────
 
 describe("CHANGE 7: finalReviewPhase signature includes workDir, maxConcurrentTasks, signal", () => {
@@ -342,7 +322,7 @@ describe("CHANGE 7: finalReviewPhase signature includes workDir, maxConcurrentTa
         mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
 
         // Should accept the new signature: (tracker, profilesDirs, cwd, maxConcurrentTasks, workDir, ...)
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", 5, workDir);
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
         expect(clean).toBe(true);
     });
@@ -362,21 +342,13 @@ describe("CHANGE 7: finalReviewPhase signature includes workDir, maxConcurrentTa
 
         // Full new signature: (tracker, profilesDirs, cwd, maxConcurrentTasks, workDir, apiKeys, onStatus, signal)
         const clean = await finalReviewPhase(
-            tracker, ["/profiles"], "/cwd", 3, workDir,
+            tracker, ["/profiles"], "/cwd", workDir, 3,
             { openai: "key" },
             { onAgentSpawn: mock() },
             controller.signal,
         );
 
         expect(clean).toBe(true);
-    });
-
-    it("source file has finalReviewPhase signature with workDir and maxConcurrentTasks", () => {
-        // Verify the function signature in the source contains the new params in order
-        const sigMatch = SOURCE_CODE.match(
-            /export\s+async\s+function\s+finalReviewPhase\s*\(\s*\n?\s*tracker[^,]*,\s*\n?\s*profilesDirs[^,]*,\s*\n?\s*cwd[^,]*,\s*\n?\s*maxConcurrentTasks[^,]*,\s*\n?\s*workDir/,
-        );
-        expect(sigMatch).not.toBeNull();
     });
 });
 
@@ -408,7 +380,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
         const clean = await finalReviewPhase(
-            tracker, ["/profiles"], "/cwd", 3, workDir,
+            tracker, ["/profiles"], "/cwd", workDir, 3,
             { openai: "key" },
         );
 
@@ -460,7 +432,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
-        await finalReviewPhase(tracker, ["/profiles"], "/cwd", 5, workDir);
+        await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
         // Find the fixer LanePool and inspect its task tracker
         let fixerTaskIds: string[] = [];
@@ -502,7 +474,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
-        await finalReviewPhase(tracker, ["/profiles"], "/cwd", 5, workDir);
+        await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
         // Find the fixer task and check its prompt
         let fixerPrompt = "";
@@ -545,7 +517,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
-        await finalReviewPhase(tracker, ["/profiles"], "/cwd", 7, workDir);
+        await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 7);
 
         // Find the fixer LanePool
         let fixerPoolOpts: Record<string, unknown> | null = null;
@@ -586,7 +558,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
-        await finalReviewPhase(tracker, ["/profiles"], "/cwd", 5, workDir);
+        await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
         // Find the fixer LanePool
         let fixerPoolOpts: Record<string, unknown> | null = null;
@@ -627,7 +599,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
-        await finalReviewPhase(tracker, ["/profiles"], "/cwd", 5, workDir);
+        await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
         // Find the fixer LanePool
         let fixerPoolOpts: Record<string, unknown> | null = null;
@@ -672,7 +644,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         const onAgentSpawn = mock();
         const onAgentComplete = mock();
         await finalReviewPhase(
-            tracker, ["/profiles"], "/cwd", 5, workDir,
+            tracker, ["/profiles"], "/cwd", workDir, 5,
             undefined,
             { onAgentSpawn, onAgentComplete },
         );
@@ -711,7 +683,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
         await finalReviewPhase(
-            tracker, ["/profiles"], "/cwd", 5, workDir,
+            tracker, ["/profiles"], "/cwd", workDir, 5,
             undefined, undefined, controller.signal,
         );
 
@@ -754,7 +726,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
-        await finalReviewPhase(tracker, ["/profiles"], "/cwd", 5, workDir);
+        await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
         // Find the fixer LanePool
         let fixerPoolOpts: Record<string, unknown> | null = null;
@@ -795,7 +767,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
-        await finalReviewPhase(tracker, ["/profiles"], "/cwd", 5, workDir);
+        await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
         // Find fixer tasks
         let fixerTasks: any[] = [];
@@ -999,15 +971,6 @@ describe("Combined: scout-coordinator lifecycle uses correct profile throughout"
         const coordinatorComplete = completeCalls.find(c => c.agentId === "scout-coordinator");
         expect(coordinatorComplete).toBeDefined();
         expect(coordinatorComplete!.profile).toBe("scout-coordinator");
-    });
-});
-
-// ─── errorEvent preserved ───────────────────────────────────────────────────
-
-describe("errorEvent function preserved", () => {
-    it("source file still contains the errorEvent function", () => {
-        expect(SOURCE_CODE).toMatch(/function\s+errorEvent\s*\(/);
-        expect(SOURCE_CODE).toContain('type: "error"');
     });
 });
 

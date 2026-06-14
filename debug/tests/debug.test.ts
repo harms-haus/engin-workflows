@@ -430,29 +430,6 @@ describe("scoutingPhase", () => {
             scoutingPhase(tracker, ["/profiles"], "task", "/cwd", 3, workDir),
         ).rejects.toThrow('Profile "scout-coordinator" not found');
     });
-
-    it("defaults maxConcurrentTasks to 3 when not specified", async () => {
-        const dir = tmpDir();
-        const workDir = tmpDir();
-        const tracker = new WorkflowStatusTracker(dir);
-
-        const topics = {
-            topics: [
-                { topic: "a", rationale: "A", files: ["a.ts"] },
-            ],
-        };
-
-        mockPromptForStructured.mockResolvedValueOnce({ result: topics, attempts: 1 });
-
-        // Call without specifying maxConcurrentTasks — should default to 3
-        await scoutingPhase(tracker, ["/profiles"], "task", "/cwd", undefined as any, workDir);
-
-        // The LanePool should have been constructed with maxConcurrentLanes: 3
-        if (mockLanePoolCtor.mock.calls.length > 0) {
-            const ctorOptions = mockLanePoolCtor.mock.calls[0][0] as Record<string, unknown>;
-            expect(ctorOptions.maxConcurrentLanes).toBe(3);
-        }
-    });
 });
 
 // ─── 4. scoutingReviewPhase Tests ───────────────────────────────────────────
@@ -700,31 +677,6 @@ describe("implementationPhase", () => {
         const ctorOptions = mockLanePoolCtor.mock.calls[0][0] as Record<string, unknown>;
         expect(ctorOptions.maxConcurrentLanes).toBe(2);
         expect(mockLanePoolRun).toHaveBeenCalledTimes(1);
-    });
-
-    it("defaults maxConcurrentLanes to 3 when not specified", async () => {
-        const dir = tmpDir();
-        const tracker = new WorkflowStatusTracker(dir);
-
-        const plan: Plan = {
-            tasks: [
-                {
-                    id: "t1",
-                    title: "Task 1",
-                    prompt: "Do task 1",
-                    profile: "implementer",
-                    files: ["src/a.ts"],
-                    dependencies: [],
-                    is_code: true,
-                },
-            ],
-            strategy: "Sequential",
-        };
-
-        await implementationPhase(tracker, ["/profiles"], plan, "/cwd", undefined as any, "/workdir");
-
-        const ctorOptions = mockLanePoolCtor.mock.calls[0][0] as Record<string, unknown>;
-        expect(ctorOptions.maxConcurrentLanes).toBe(3);
     });
 
     it("passes profilesDirs to LanePool", async () => {

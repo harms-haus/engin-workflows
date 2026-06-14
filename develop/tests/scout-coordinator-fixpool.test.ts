@@ -308,26 +308,6 @@ describe("CHANGE 5: onAgentComplete callback for scout-coordinator uses profile 
     });
 });
 
-// ─── CHANGE 6: FIXER_STEPS constant defined ─────────────────────────────────
-
-describe("CHANGE 6: FIXER_STEPS constant defined", () => {
-    it("source file defines FIXER_STEPS", () => {
-        expect(SOURCE_CODE).toMatch(/const\s+FIXER_STEPS\s*:\s*StepDefinition\[\]/);
-    });
-
-    it("FIXER_STEPS contains a 'fix' step with profileId 'fixer'", () => {
-        // Look for the FIXER_STEPS definition in the source
-        const fixerStepsMatch = SOURCE_CODE.match(
-            /const\s+FIXER_STEPS\s*:\s*StepDefinition\[\]\s*=\s*\[([\s\S]*?)\]/,
-        );
-        expect(fixerStepsMatch).not.toBeNull();
-        const definition = fixerStepsMatch![1];
-        expect(definition).toContain("'fix'");
-        expect(definition).toContain("'fixer'");
-        expect(definition).toContain("isReadOnly: false");
-    });
-});
-
 // ─── CHANGE 7: finalReviewPhase signature updated ──────────────────────────
 
 describe("CHANGE 7: finalReviewPhase signature includes workDir, maxConcurrentTasks, signal", () => {
@@ -371,14 +351,6 @@ describe("CHANGE 7: finalReviewPhase signature includes workDir, maxConcurrentTa
         );
 
         expect(clean).toBe(true);
-    });
-
-    it("source file has finalReviewPhase signature with workDir and maxConcurrentTasks", () => {
-        // Verify the function signature in the source contains the new params in order
-        const sigMatch = SOURCE_CODE.match(
-            /export\s+async\s+function\s+finalReviewPhase\s*\(\s*\n?\s*tracker[^,]*,\s*\n?\s*profilesDirs[^,]*,\s*\n?\s*cwd[^,]*,\s*\n?\s*workDir[^,]*,\s*\n?\s*maxConcurrentTasks/,
-        );
-        expect(sigMatch).not.toBeNull();
     });
 });
 

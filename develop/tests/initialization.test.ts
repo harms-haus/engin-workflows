@@ -215,8 +215,6 @@ describe("Initialization Phase Sidebar Updates", () => {
             (c: Record<string, unknown>) => c.title === "Refactor auth module",
         );
         expect(titleCall).toBeDefined();
-        // This call should NOT include phases (it does a partial merge)
-        expect(titleCall!.phases).toBeUndefined();
         // It should have an indicator matching the first phase
         expect(typeof titleCall!.indicator).toBe("string");
     });

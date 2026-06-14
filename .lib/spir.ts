@@ -314,6 +314,7 @@ export async function runSpir(
     }
 
     tracker.setTaskPrompt(taskPrompt);
+    if (options.worktree) tracker.setWorktree(options.worktree);
     await tracker.save();
 
     // The engine composes store + UI + bridge callbacks into onStatus before calling runSpir; the backbone consumes it directly.

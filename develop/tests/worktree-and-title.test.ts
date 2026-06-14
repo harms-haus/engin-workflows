@@ -1,11 +1,9 @@
-// ─── Worktree & generateWorkflowTitle Tests ────────────────────────────────
+// ─── Worktree Tests ────────────────────────────────────────────────────────
 //
-// Tests for the changes described in the task:
+// Tests for:
 //   1. TitleSchema is re-exported from @harms-haus/engin (backward compat)
 //   2. worktree?: WorktreeInfo is accepted in DevelopWorkflowOptions & RunOptions
 //   3. tracker.setWorktree is called BEFORE tracker.save() in run()
-//   4. initializationPhase delegates to generateWorkflowTitle instead of
-//      manually calling createHarness / promptForStructured
 // ────────────────────────────────────────────────────────────────────────────
 
 import { describe, it, expect, mock, beforeEach, afterAll } from "bun:test";
@@ -23,14 +21,12 @@ const mockPromptForStructured = mock() as ReturnType<typeof mock> & ((...args: u
 const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
-const mockGenerateWorkflowTitle = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
 mock.module("@harms-haus/engin", () => ({
     ...realEngin,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
-    generateWorkflowTitle: (...args: unknown[]) => mockGenerateWorkflowTitle(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
@@ -97,8 +93,9 @@ function makeHarnessResult() {
 }
 
 /**
- * Default mock prompt handler for phases OTHER than initialization.
- * Initialization is handled by generateWorkflowTitle.
+ * Default mock prompt handler for each workflow phase (scouting, planning,
+ * review). Initialization uses its own title-generator prompt via
+ * promptForStructured, handled directly by initializationPhase.
  */
 function defaultPromptHandler(text: string): unknown {
     if (text.includes("codebase scout") || text.includes("Identify key areas")) {
@@ -125,8 +122,6 @@ function setupDefaultMocks() {
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
     mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
 
-    // generateWorkflowTitle is used for initialization
-    mockGenerateWorkflowTitle.mockResolvedValue("AI generated title");
 
     // Other phases use promptForStructured
     mockPromptForStructured.mockImplementation(async (_harness: unknown, text: string) => {
@@ -328,216 +323,6 @@ describe("worktree set before first save", () => {
     });
 });
 
-// ── 4. initializationPhase uses generateWorkflowTitle ────────────────────
-
-describe("initializationPhase uses generateWorkflowTitle", () => {
-    it("calls generateWorkflowTitle on fresh start", async () => {
-        const workDir = tmpDir();
-
-        await run("Build a feature", {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-        });
-
-        // generateWorkflowTitle should have been called exactly once for initialization
-        expect(mockGenerateWorkflowTitle).toHaveBeenCalledTimes(1);
-    });
-
-    it("passes correct options to generateWorkflowTitle", async () => {
-        const workDir = tmpDir();
-
-        await run("Refactor the authentication module", {
-            profilesDir: "/my-profiles",
-            cwd: "/my-project",
-            apiKeys: { openai: "sk-test-key" },
-            workDir,
-        });
-
-        expect(mockGenerateWorkflowTitle).toHaveBeenCalledTimes(1);
-
-        const callArgs = mockGenerateWorkflowTitle.mock.calls[0][0] as Record<string, unknown>;
-        expect(callArgs.profilesDirs).toEqual(["/my-profiles"]);
-        expect(callArgs.taskPrompt).toBe("Refactor the authentication module");
-        expect(callArgs.cwd).toBe("/my-project");
-        expect(callArgs.apiKeys).toEqual({ openai: "sk-test-key" });
-    });
-
-    it("passes onStatus callbacks to generateWorkflowTitle", async () => {
-        const workDir = tmpDir();
-        const onStatus = {
-            onAgentSpawn: mock(),
-            onAgentComplete: mock(),
-        };
-
-        await run("Build a feature", {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-            onStatus,
-        });
-
-        expect(mockGenerateWorkflowTitle).toHaveBeenCalledTimes(1);
-        const callArgs = mockGenerateWorkflowTitle.mock.calls[0][0] as Record<string, unknown>;
-        expect(callArgs.onStatus).toBeDefined();
-    });
-
-    it("does NOT call generateWorkflowTitle on resume", async () => {
-        const workDir = tmpDir();
-
-        // Pre-create a saved state at "scouting" phase
-        const tracker = new WorkflowStatusTracker(workDir);
-        tracker.setTaskPrompt("Resumed task");
-        tracker.setPhase("scouting");
-        await tracker.save();
-
-        await run("Resumed task", {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-        });
-
-        // generateWorkflowTitle should NOT have been called on resume
-        expect(mockGenerateWorkflowTitle).not.toHaveBeenCalled();
-    });
-
-    it("uses AI title from generateWorkflowTitle in sidebar", async () => {
-        const workDir = tmpDir();
-        const onSidebarUpdate = mock();
-
-        mockGenerateWorkflowTitle.mockResolvedValue("Custom AI Title");
-
-        await run("Build a feature", {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-            onStatus: { onSidebarUpdate },
-        });
-
-        const sidebarCalls = onSidebarUpdate.mock.calls.map(
-            (c: unknown[]) => c[0] as Record<string, unknown>,
-        );
-        const titleCall = sidebarCalls.find(
-            (c: Record<string, unknown>) => c.title === "Custom AI Title",
-        );
-        expect(titleCall).toBeDefined();
-    });
-
-    it("falls back to truncated prompt when generateWorkflowTitle returns fallback", async () => {
-        const workDir = tmpDir();
-        const longPrompt = "This is an extremely long task description that definitely exceeds the sixty character limit for truncation testing";
-        const onSidebarUpdate = mock();
-
-        // generateWorkflowTitle returns a truncated fallback (it handles fallback internally)
-        const expectedFallback = longPrompt.slice(0, 57) + "...";
-        mockGenerateWorkflowTitle.mockResolvedValue(expectedFallback);
-
-        await run(longPrompt, {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-            onStatus: { onSidebarUpdate },
-        });
-
-        const sidebarCalls = onSidebarUpdate.mock.calls.map(
-            (c: unknown[]) => c[0] as Record<string, unknown>,
-        );
-        const fallbackCall = sidebarCalls.find(
-            (c: Record<string, unknown>) => c.title === expectedFallback,
-        );
-        expect(fallbackCall).toBeDefined();
-    });
-
-    it("does NOT call createHarness or promptForStructured for initialization", async () => {
-        const workDir = tmpDir();
-
-        await run("Build a feature", {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-        });
-
-        // generateWorkflowTitle should be called for initialization
-        expect(mockGenerateWorkflowTitle).toHaveBeenCalledTimes(1);
-
-        // createHarness and promptForStructured should NOT be called for
-        // the title generation phase — they are only called for other phases
-        // (scouting, planning, reviewing, etc.)
-        //
-        // Since generateWorkflowTitle is mocked, the real createHarness inside
-        // it is never reached. We verify that the workflow doesn't call
-        // createHarness for title generation purposes by checking that all
-        // createHarness calls are for non-title-generator agents.
-        if (mockCreateHarness.mock.calls.length > 0) {
-            for (const call of mockCreateHarness.mock.calls) {
-                const opts = call[0] as { agentId?: string };
-                // No createHarness call should be for title-generator
-                // (generateWorkflowTitle handles that internally)
-                expect(opts.agentId).not.toBe("title-generator");
-            }
-        }
-    });
-
-    it("still emits onAgentSpawn and onAgentComplete for initialization", async () => {
-        const workDir = tmpDir();
-        const onAgentSpawn = mock();
-        const onAgentComplete = mock();
-
-        // After the source change, initializationPhase will call generateWorkflowTitle
-        // but should still emit onAgentSpawn / onAgentComplete for the title-generator.
-        // The implementation wraps generateWorkflowTitle with emit calls.
-        await run("Build a feature", {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-            onStatus: { onAgentSpawn, onAgentComplete },
-        });
-
-        // Verify the spawn and complete callbacks were fired for title-generator.
-        // The spawn/complete are emitted by the wrapper code in initializationPhase,
-        // not by generateWorkflowTitle itself.
-        const spawnCalls = onAgentSpawn.mock.calls.map(
-            (c: unknown[]) => c[0] as { agentId: string },
-        );
-        const titleGenSpawn = spawnCalls.find(
-            (c: { agentId: string }) => c.agentId === "title-generator",
-        );
-        expect(titleGenSpawn).toBeDefined();
-
-        const completeCalls = onAgentComplete.mock.calls.map(
-            (c: unknown[]) => c[0] as { agentId: string },
-        );
-        const titleGenComplete = completeCalls.find(
-            (c: { agentId: string }) => c.agentId === "title-generator",
-        );
-        expect(titleGenComplete).toBeDefined();
-    });
-
-    it("title-generator agent has correct profile and phase metadata", async () => {
-        const workDir = tmpDir();
-        const onAgentSpawn = mock();
-
-        await run("Build a feature", {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-            onStatus: { onAgentSpawn },
-        });
-
-        // After the source change, the wrapper around generateWorkflowTitle
-        // should still emit onAgentSpawn with the correct metadata.
-        const spawnCalls = onAgentSpawn.mock.calls.map(
-            (c: unknown[]) => c[0] as { agentId: string; profile: string; phase: string },
-        );
-        const titleGenSpawn = spawnCalls.find(
-            (c: { agentId: string }) => c.agentId === "title-generator",
-        );
-        expect(titleGenSpawn).toBeDefined();
-        expect(titleGenSpawn!.profile).toBe("scout");
-        expect(titleGenSpawn!.phase).toBe("initialization");
-    });
-});
-
 // ── 5. Combined: worktree + generateWorkflowTitle ────────────────────────
 
 describe("worktree + generateWorkflowTitle integration", () => {
@@ -548,8 +333,6 @@ describe("worktree + generateWorkflowTitle integration", () => {
             branchName: "feature/integration",
             originalCwd: "/project",
         };
-
-        mockGenerateWorkflowTitle.mockResolvedValue("Integration Test Title");
 
         await run("Build a feature", {
             profilesDir: "/profiles",
@@ -565,9 +348,6 @@ describe("worktree + generateWorkflowTitle integration", () => {
 
         expect(state.worktree).toEqual(worktree);
         expect(state.currentPhase).toBe("done");
-
-        // generateWorkflowTitle should have been called
-        expect(mockGenerateWorkflowTitle).toHaveBeenCalledTimes(1);
     });
 
     it("worktree on resume is preserved from original run", async () => {

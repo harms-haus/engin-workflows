@@ -901,7 +901,7 @@ describe("finalReviewPhase", () => {
         mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
 
         const workDir = tmpDir();
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", 5, workDir);
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
         expect(clean).toBe(true);
         expect(mockPromptForStructured).toHaveBeenCalledTimes(1);
@@ -930,7 +930,7 @@ describe("finalReviewPhase", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: secondAssessment, attempts: 1 });
 
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", 3, workDir);
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 3);
 
         expect(clean).toBe(true);
         expect(mockPromptForStructured).toHaveBeenCalledTimes(2); // two review rounds
@@ -965,7 +965,7 @@ describe("finalReviewPhase", () => {
         };
         mockPromptForStructured.mockResolvedValueOnce({ result: assessment, attempts: 1 });
 
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", 5, workDir);
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 5);
 
         expect(clean).toBe(true);
         // No fixer LanePool created since only minor issues
@@ -1001,7 +1001,7 @@ describe("finalReviewPhase", () => {
 
         mockPromptForStructured.mockResolvedValue({ result: assessmentWithCritical, attempts: 1 });
 
-        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", 3, workDir);
+        const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", workDir, 3);
 
         expect(clean).toBe(false);
         // Should have run 3 rounds of review (all rounds exhausted)
