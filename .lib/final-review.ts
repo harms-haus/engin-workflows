@@ -1,5 +1,5 @@
 import type { StatusCallbacks, StepDefinition, WorkflowStatusTracker } from "@harms-haus/engin";
-import { LanePool, TaskTracker, runStepTask } from "@harms-haus/engin";
+import { LanePool, TaskTracker, runStepTask, getDiff } from "@harms-haus/engin";
 import { join } from "node:path";
 import { FinalReviewResultSchema } from "./schemas";
 import type { FinalReviewResult, FinalReviewFinding, FinalReviewSeverity } from "./schemas";
@@ -71,15 +71,49 @@ function actionableFindings(result: FinalReviewResult): FinalReviewFinding[] {
     return result.applicable ? result.findings.filter((f) => isActionableSeverity(f.severity)) : [];
 }
 
+/** Maximum characters of the git diff to inline into a reviewer prompt. */
+const MAX_DIFF_CHARS = 60_000;
+
+/**
+ * Render the working-tree diff (against HEAD) as a prompt section so reviewers
+ * see the exact changes without shelling out themselves. Called fresh before
+ * each pass, so a review-fixes pass sees the post-fix state rather than a
+ * stale snapshot.
+ */
+function formatDiffSection(diff: string): string {
+    if (!diff) {
+        return [
+            "## Changes made during this workflow",
+            "(No git diff was available — the working directory may not be a git repository, or there are no uncommitted changes against HEAD. Review the working tree directly.)",
+        ].join("\n");
+    }
+    const truncated = diff.length > MAX_DIFF_CHARS;
+    const body = truncated ? diff.slice(0, MAX_DIFF_CHARS) : diff;
+    const lines = [
+        "## Changes made during this workflow (git diff against HEAD)",
+        "Review THESE changes through your dimension only — do not review the broader, unchanged codebase.",
+        "```diff",
+        body,
+        "```",
+    ];
+    if (truncated) {
+        lines.push(`(diff truncated to the first ${MAX_DIFF_CHARS} of ${diff.length} characters — use \`git diff HEAD\` to inspect the remainder)`);
+    }
+    return lines.join("\n");
+}
+
 /** Build the prompt for a lane's INITIAL review pass. */
 function buildReviewerPrompt(
     reviewer: FinalReviewerConfig,
     history: FinalReviewResult[],
+    diff: string,
 ): string {
     const lines: string[] = [
         `You are performing the FINAL review of the codebase, focused on a single dimension: ${reviewer.label} (${reviewer.dimension}).`,
         "",
-        "Review ALL changes made during this workflow through the lens of this dimension only, and report your findings.",
+        "Review ALL changes made during this workflow through the lens of this dimension only, and report your findings. The complete diff of the changes is provided below.",
+        "",
+        formatDiffSection(diff),
         "",
         "OUTPUT RULES:",
         "- If this review dimension is NOT applicable to the changeset (for example: a UI/UX review when there are no UI-facing changes, or a security review when there is no security-relevant surface), set applicable=false, explain in notApplicableReason, and return an empty findings array.",
@@ -109,11 +143,14 @@ function buildReviewFixesPrompt(
     reviewer: FinalReviewerConfig,
     history: FinalReviewResult[],
     fixRound: number,
+    diff: string,
 ): string {
     const lines: string[] = [
         `You are performing the REVIEW-FIXES pass for the ${reviewer.label} (${reviewer.dimension}) dimension of the final review.`,
         "",
-        "A fixer has just attempted to resolve the actionable findings you (or a prior pass) reported. Re-assess the CURRENT state of the code through this dimension ONLY, with two goals:",
+        "A fixer has just attempted to resolve the actionable findings you (or a prior pass) reported. The CURRENT diff (including the fix) is provided below. Re-assess it through this dimension ONLY, with two goals:",
+        "",
+        formatDiffSection(diff),
         "",
         "1. VERIFY the fixes: for each previously-reported actionable finding, confirm whether it was actually resolved. A finding that is now fixed must NOT be reported again.",
         "2. CATCH REGRESSIONS: report any NEW issues the fix introduced (e.g. the fix was incomplete, broke something else, or regressed this dimension), plus any previously-missed real issues.",
@@ -174,6 +211,8 @@ interface LaneContext {
     signal?: AbortSignal;
     fixerSteps: StepDefinition[];
     titleFormatter: (description: string) => string;
+    /** Recomputes the working-tree diff (against HEAD); called fresh before each review pass. */
+    collectDiff: () => string;
 }
 
 /**
@@ -262,7 +301,7 @@ async function runFinalReviewLane(
         onStatus: ctx.onStatus,
         isReadOnly: true,
         schema: FinalReviewResultSchema,
-        prompt: buildReviewerPrompt(reviewer, []),
+        prompt: buildReviewerPrompt(reviewer, [], ctx.collectDiff()),
         signal: ctx.signal,
     });
     history.push(result);
@@ -289,7 +328,7 @@ async function runFinalReviewLane(
             onStatus: ctx.onStatus,
             isReadOnly: true,
             schema: FinalReviewResultSchema,
-            prompt: buildReviewFixesPrompt(reviewer, history, fixRound),
+            prompt: buildReviewFixesPrompt(reviewer, history, fixRound, ctx.collectDiff()),
             signal: ctx.signal,
         });
         history.push(verify);
@@ -326,8 +365,17 @@ export async function finalReviewPhase(
     fixerSteps: StepDefinition[] = [{ name: "fix", profileId: "fixer", isReadOnly: false }],
     titleFormatter: (description: string) => string = (d) => d.slice(0, 100),
 ): Promise<boolean> {
+    const collectDiff = (): string => {
+        try {
+            return getDiff(cwd);
+        } catch {
+            return "";
+        }
+    };
+
     const ctx: LaneContext = {
         tracker, profilesDirs, cwd, workDir, maxConcurrentTasks, apiKeys, onStatus, signal, fixerSteps, titleFormatter,
+        collectDiff,
     };
 
     // Run all lanes in parallel; the phase is clean iff every lane is clean.

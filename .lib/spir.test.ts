@@ -81,6 +81,7 @@ mock.module('@harms-haus/engin', () => ({
   }),
   promptForStructured: jest.fn().mockResolvedValue({ result: {}, attempts: 1 }),
   runStepTask: jest.fn().mockResolvedValue(undefined),
+  getDiff: () => '',
 }));
 
 // Dynamic import for runtime values (mock must be applied first)
@@ -524,16 +525,18 @@ describe('executePhase', () => {
 // ─── SpirWorkflowData ───────────────────────────────────────────────────────
 
 describe('SpirWorkflowData', () => {
-  it('accepts research, plan, scoutingReports, and plan review fields', () => {
+  it('accepts research, plan, scoutingReports, scoutingFiles, and plan review fields', () => {
     const data: SpirWorkflowData = {
       research: 'Found everything',
       plan: { tasks: [], strategy: 'test' } as never,
       scoutingReports: [{ topic: 'module-a' }],
+      scoutingFiles: ['src/api.ts', 'src/db.ts'],
       planReviewFeedback: 'Good',
       planReviewSuggestions: ['Add edge cases'],
     };
     expect(data.research).toBe('Found everything');
     expect(data.scoutingReports).toHaveLength(1);
+    expect(data.scoutingFiles).toEqual(['src/api.ts', 'src/db.ts']);
   });
 
   it('all fields are optional', () => {
@@ -861,6 +864,7 @@ describe('module re-exports', () => {
       scoutingReports: [],
       scoutingRounds: 0,
       scoutingGaps: [],
+      scoutingFiles: [],
       planningRounds: 0,
       planReviewFeedback: '',
       planReviewSuggestions: [],

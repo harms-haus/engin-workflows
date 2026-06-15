@@ -28,6 +28,14 @@ export const ScoutingReviewSchema = z.object({
     gaps: z.array(ScoutingGapSchema).describe(
         "Topics that still need investigation. Only include topics genuinely missing from the existing reports — do not repeat topics already covered.",
     ),
+    files: z
+        .array(z.string())
+        .default([])
+        .describe(
+            "The key files a planner must open and read to write a precise implementation plan for THIS task. " +
+                "Aggregate the most important concrete files surfaced across the scouting reports (prefer specific file paths over bare directories), de-duplicate, and order by importance. " +
+                "Include ONLY files a planner would actually need to look at — do not pad the list. Empty array if no particular files are central to the task.",
+        ),
 });
 
 export type ScoutingReview = z.infer<typeof ScoutingReviewSchema>;

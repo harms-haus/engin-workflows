@@ -4,6 +4,9 @@
 // manual createHarness / spawnAgent / promptForStructured sequences.
 
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { StatusCallbacks, WorkflowStatusTracker } from '@harms-haus/engin';
 
 // ─── Mock @harms-haus/engin ────────────────────────────────────────────────
@@ -106,7 +109,7 @@ describe('planningPhase', () => {
     mockRunStepTask.mockResolvedValueOnce(planResult);
 
     const result = await planningPhase(
-      tracker, ['/profiles'], 'Research results...', 'Implement feature X', '/cwd',
+      tracker, ['/profiles'], 'Research results...', [], 'Implement feature X', '/cwd',
     );
 
     expect(result).toBe(planResult);
@@ -131,7 +134,7 @@ describe('planningPhase', () => {
     mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: '' });
 
     await planningPhase(
-      tracker, ['/profiles'], 'Research', 'Task', '/cwd',
+      tracker, ['/profiles'], 'Research', [], 'Task', '/cwd',
       undefined, undefined, apiKeys, onStatus, abortController.signal,
     );
 
@@ -139,6 +142,75 @@ describe('planningPhase', () => {
     expect(callOpts.apiKeys).toBe(apiKeys);
     expect(callOpts.onStatus).toBe(onStatus);
     expect(callOpts.signal).toBe(abortController.signal);
+  });
+
+  // ─── Scouting file-context inlining ───────────────────────────────────────
+
+  describe('scouting file-context inlining', () => {
+    let cwd: string;
+
+    beforeEach(() => {
+      cwd = mkdtempSync(join(tmpdir(), 'planning-files-'));
+      mkdirSync(join(cwd, 'src'), { recursive: true });
+      writeFileSync(join(cwd, 'src/api.ts'), 'export const API = "v1";\n');
+      writeFileSync(join(cwd, 'src/util.ts'), 'export const id = () => 0;\n');
+    });
+    afterEach(() => {
+      rmSync(cwd, { recursive: true, force: true });
+    });
+
+    it('inlines the contents of the scouting files into the planner prompt', async () => {
+      const tracker = makeMockTracker();
+      mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: '' });
+
+      await planningPhase(
+        tracker, ['/profiles'], 'Research', ['src/api.ts', 'src/util.ts'], 'Task', cwd,
+      );
+
+      const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
+      expect(prompt).toContain('Key files from scouting');
+      expect(prompt).toContain('### src/api.ts');
+      expect(prompt).toContain('export const API = "v1";');
+      expect(prompt).toContain('### src/util.ts');
+      expect(prompt).toContain('do NOT spend tool calls re-reading these');
+    });
+
+    it('de-duplicates files before inlining', async () => {
+      const tracker = makeMockTracker();
+      mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: '' });
+
+      await planningPhase(
+        tracker, ['/profiles'], 'Research', ['src/api.ts', 'src/api.ts'], 'Task', cwd,
+      );
+
+      const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
+      // Only one code block for src/api.ts
+      expect((prompt.match(/### src\/api\.ts/g) || []).length).toBe(1);
+    });
+
+    it('omits the files section entirely when no files are provided', async () => {
+      const tracker = makeMockTracker();
+      mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: '' });
+
+      await planningPhase(tracker, ['/profiles'], 'Research', [], 'Task', cwd);
+
+      const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
+      expect(prompt).not.toContain('Key files from scouting');
+    });
+
+    it('still runs (and notes the flagged paths) when a file cannot be read', async () => {
+      const tracker = makeMockTracker();
+      mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: '' });
+
+      await planningPhase(
+        tracker, ['/profiles'], 'Research', ['does/not/exist.ts'], 'Task', cwd,
+      );
+
+      const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
+      expect(prompt).toContain('Key files flagged by scouting');
+      expect(prompt).toContain('- does/not/exist.ts');
+      expect(prompt).toContain('could not be read');
+    });
   });
 
   // ─── Plan review feedback ─────────────────────────────────────────────────
@@ -149,7 +221,7 @@ describe('planningPhase', () => {
       mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: '' });
 
       await planningPhase(
-        tracker, ['/profiles'], 'Research', 'Task', '/cwd',
+        tracker, ['/profiles'], 'Research', [], 'Task', '/cwd',
         'The plan lacks detail',
       );
 
@@ -164,7 +236,7 @@ describe('planningPhase', () => {
       mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: '' });
 
       await planningPhase(
-        tracker, ['/profiles'], 'Research', 'Task', '/cwd',
+        tracker, ['/profiles'], 'Research', [], 'Task', '/cwd',
         'Needs improvement', ['Add error handling', 'Add tests'],
       );
 
@@ -180,7 +252,7 @@ describe('planningPhase', () => {
       mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: '' });
 
       await planningPhase(
-        tracker, ['/profiles'], 'Research', 'Task', '/cwd',
+        tracker, ['/profiles'], 'Research', [], 'Task', '/cwd',
         'Needs improvement', [],
       );
 
@@ -195,7 +267,7 @@ describe('planningPhase', () => {
       mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: '' });
 
       await planningPhase(
-        tracker, ['/profiles'], 'Research', 'Task', '/cwd',
+        tracker, ['/profiles'], 'Research', [], 'Task', '/cwd',
       );
 
       const callOpts = mockRunStepTask.mock.calls[0]![0] as Record<string, unknown>;
@@ -217,7 +289,7 @@ describe('planningPhase', () => {
     };
     mockRunStepTask.mockResolvedValueOnce(plan);
 
-    await planningPhase(tracker, ['/profiles'], 'Research', 'Task', '/cwd');
+    await planningPhase(tracker, ['/profiles'], 'Research', [], 'Task', '/cwd');
 
     expect(tracker.setWorkflowData).toHaveBeenCalledWith({ plan });
   });
@@ -235,7 +307,7 @@ describe('planningPhase', () => {
     };
     mockRunStepTask.mockResolvedValueOnce(plan);
 
-    await planningPhase(tracker, ['/profiles'], 'Research', 'Task', '/cwd');
+    await planningPhase(tracker, ['/profiles'], 'Research', [], 'Task', '/cwd');
 
     expect(tracker.auditLog.append).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -269,7 +341,7 @@ describe('planReviewPhase', () => {
     mockRunStepTask.mockResolvedValueOnce(reviewResult);
 
     const result = await planReviewPhase(
-      tracker, ['/profiles'], plan, 'Research', 'Task', '/cwd',
+      tracker, ['/profiles'], plan, 'Research', [], 'Task', '/cwd',
     );
 
     expect(result).toBe(reviewResult);
@@ -294,7 +366,7 @@ describe('planReviewPhase', () => {
     mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: '', suggestions: [] });
 
     await planReviewPhase(
-      tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', 'Task', '/cwd',
+      tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', [], 'Task', '/cwd',
       apiKeys, onStatus, abortController.signal,
     );
 
@@ -302,6 +374,29 @@ describe('planReviewPhase', () => {
     expect(callOpts.apiKeys).toBe(apiKeys);
     expect(callOpts.onStatus).toBe(onStatus);
     expect(callOpts.signal).toBe(abortController.signal);
+  });
+
+  it('inlines the scouting files into the plan-reviewer prompt', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'planreview-files-'));
+    try {
+      mkdirSync(join(cwd, 'src'), { recursive: true });
+      writeFileSync(join(cwd, 'src/api.ts'), 'export const API = "v1";\n');
+      const tracker = makeMockTracker();
+      mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: 'OK', suggestions: [] });
+
+      await planReviewPhase(
+        tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', ['src/api.ts'], 'Task', cwd,
+      );
+
+      const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
+      expect(prompt).toContain('Key files from scouting');
+      expect(prompt).toContain('### src/api.ts');
+      expect(prompt).toContain('export const API = "v1";');
+      // The plan JSON is still present alongside the inlined files.
+      expect(prompt).toContain('Proposed plan:');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   // ─── onDecision callback ──────────────────────────────────────────────────
@@ -313,7 +408,7 @@ describe('planReviewPhase', () => {
       mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: 'Approved', suggestions: [] });
 
       await planReviewPhase(
-        tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', 'Task', '/cwd',
+        tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', [], 'Task', '/cwd',
         undefined, onStatus,
       );
 
@@ -335,7 +430,7 @@ describe('planReviewPhase', () => {
       });
 
       await planReviewPhase(
-        tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', 'Task', '/cwd',
+        tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', [], 'Task', '/cwd',
         undefined, onStatus,
       );
 
@@ -351,7 +446,7 @@ describe('planReviewPhase', () => {
       mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: 'OK', suggestions: [] });
 
       await expect(
-        planReviewPhase(tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', 'Task', '/cwd'),
+        planReviewPhase(tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', [], 'Task', '/cwd'),
       ).resolves.toBeDefined();
     });
   });
@@ -363,7 +458,7 @@ describe('planReviewPhase', () => {
     mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: 'Plan approved', suggestions: [] });
 
     await planReviewPhase(
-      tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', 'Task', '/cwd',
+      tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', [], 'Task', '/cwd',
     );
 
     expect(tracker.auditLog.append).toHaveBeenCalledWith(

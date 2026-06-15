@@ -97,13 +97,17 @@ export async function scoutingPhase(
                 id: taskId,
                 title: topic.topic,
                 prompt: [
-                    `Investigate the following area of the codebase:`,
+                    "You are scouting ONE focused area of a codebase to support a larger task. Investigate YOUR assigned topic specifically, and relate everything you find back to why it matters for the task below.",
                     "",
+                    "## Overall task (the goal this scouting supports)",
+                    taskPrompt,
+                    "",
+                    "## Your scouting topic (stay focused here — other scouts are covering the rest)",
                     `Topic: ${topic.topic}`,
                     `Rationale: ${topic.rationale}`,
-                    `Key files: ${topic.files.join(", ")}`,
+                    `Key files to start from: ${topic.files.join(", ")}`,
                     "",
-                    "Provide a detailed report of your findings.",
+                    "Provide a detailed report of your findings. For each finding, briefly note how it is relevant to the overall task. Do not duplicate work that falls outside your topic.",
                 ].join("\n"),
                 profile: "scout",
                 files: topic.files,
@@ -153,10 +157,20 @@ export async function scoutingPhase(
 /**
  * Review the scouting reports and determine if we have enough information
  * to proceed to planning.
+ *
+ * The original task prompt is required: without it the reviewer cannot judge
+ * whether the reports are sufficient *for this task*, and tends to invent
+ * random gaps based on whatever it notices in the codebase.
+ *
+ * In addition to { ready, research, gaps }, the reviewer returns `files`: the
+ * concrete key files a planner must read. The caller threads these into the
+ * planning phase so the planner and plan-reviewer receive the file contents
+ * directly instead of having to discover and read them themselves.
  */
 export async function scoutingReviewPhase(
     tracker: WorkflowStatusTracker,
     profilesDirs: string[],
+    taskPrompt: string,
     reports: unknown[],
     cwd: string,
     apiKeys?: Record<string, string>,
@@ -164,14 +178,21 @@ export async function scoutingReviewPhase(
     signal?: AbortSignal,
 ): Promise<ScoutingReview> {
     const prompt = [
-        "You are reviewing scouting reports to determine if we have enough information to create an implementation plan.",
+        "You are reviewing scouting reports to determine if we have enough information to create an implementation plan FOR THE TASK BELOW.",
         "",
-        "IMPORTANT: If the reports are NOT sufficient, your gaps list should ONLY contain the specific topics that are still missing or insufficiently covered. Do NOT re-list topics that are already adequately covered in the existing reports.",
+        "Task:",
+        taskPrompt,
         "",
-        "Scouting reports:",
+        "Scouting reports gathered so far:",
         JSON.stringify(reports, null, 2),
         "",
-        "Determine if we're ready to plan. If not, identify ONLY the gaps that remain — each gap should include the topic name, why it still needs investigation, and the key files to examine.",
+        "Your job:",
+        "- Judge whether the reports above, taken together, give a planner enough understanding of the relevant parts of the codebase to write a complete implementation plan FOR THIS SPECIFIC TASK.",
+        "- If yes: set ready=true, synthesize the reports into a coherent research summary, and set gaps to [].",
+        "- If no: set ready=false and list ONLY the distinct areas that are still missing or insufficiently covered AND relevant to this task. Each gap must include the topic name, why it still needs investigation FOR THIS TASK, and the key files to examine. Do NOT re-list topics that the existing reports already cover adequately.",
+        "- Every gap must be something a planner would actually need in order to plan the implementation of THIS task. Do NOT propose gaps that are merely interesting or tangentially related.",
+        "- ALWAYS populate `files` with the concrete files a planner must open to write a precise plan for this task. Pull these from the reports (and the gaps, if any) — prefer specific file paths over directories, de-duplicate, and keep only files that are genuinely central to the task.",
+        "- If the reports already cover everything needed to plan, you MUST return ready=true. Do not invent additional areas to scout just to be thorough.",
     ].join("\n");
 
     const review = await runStepTask<ScoutingReview>({

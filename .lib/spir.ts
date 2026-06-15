@@ -48,6 +48,8 @@ export interface RunState {
     scoutingReports: unknown[];
     scoutingRounds: number;
     scoutingGaps: ScoutingGap[];
+    /** Key files the scouting review surfaced for the planner; threaded into planningPhase + planReviewPhase. */
+    scoutingFiles?: string[];
     planningRounds: number;
     planReviewFeedback?: string;
     planReviewSuggestions?: string[];
@@ -57,6 +59,7 @@ export interface SpirWorkflowData {
     research?: string;
     plan?: Plan;
     scoutingReports?: unknown[];
+    scoutingFiles?: string[];
     planReviewFeedback?: string;
     planReviewSuggestions?: string[];
 }
@@ -159,12 +162,13 @@ export async function executePhase(
             );
 
             const review = await scoutingReviewPhase(
-                tracker, profilesDirs, state.scoutingReports, cwd, apiKeys, onStatus,
+                tracker, profilesDirs, taskPrompt, state.scoutingReports, cwd, apiKeys, onStatus,
             );
             state.scoutingRounds++;
             state.research = review.research;
             state.scoutingGaps = review.gaps;
-            tracker.setWorkflowData({ research: state.research });
+            state.scoutingFiles = review.files ?? [];
+            tracker.setWorkflowData({ research: state.research, scoutingFiles: state.scoutingFiles });
 
             if (review.ready) {
                 state.scoutingGaps = [];
@@ -193,15 +197,16 @@ export async function executePhase(
                 } else {
                     const reports = getSpirData(tracker).scoutingReports ?? [];
                     const review = await scoutingReviewPhase(
-                        tracker, profilesDirs, reports, cwd, apiKeys, onStatus,
+                        tracker, profilesDirs, taskPrompt, reports, cwd, apiKeys, onStatus,
                     );
                     state.research = review.research;
-                    tracker.setWorkflowData({ research: state.research });
+                    state.scoutingFiles = review.files ?? [];
+                    tracker.setWorkflowData({ research: state.research, scoutingFiles: state.scoutingFiles });
                 }
             }
 
             state.plan = await planningPhase(
-                tracker, profilesDirs, state.research, taskPrompt, cwd,
+                tracker, profilesDirs, state.research, state.scoutingFiles ?? [], taskPrompt, cwd,
                 state.planReviewFeedback, state.planReviewSuggestions,
                 apiKeys, onStatus,
             );
@@ -211,7 +216,7 @@ export async function executePhase(
             }
 
             const planReview = await planReviewPhase(
-                tracker, profilesDirs, state.plan!, state.research, taskPrompt, cwd, apiKeys, onStatus,
+                tracker, profilesDirs, state.plan!, state.research, state.scoutingFiles ?? [], taskPrompt, cwd, apiKeys, onStatus,
             );
             state.planningRounds++;
 
@@ -327,6 +332,7 @@ export async function runSpir(
         scoutingReports: [],
         scoutingRounds: 0,
         scoutingGaps: [],
+        scoutingFiles: getSpirData(tracker).scoutingFiles ? [...getSpirData(tracker).scoutingFiles!] : undefined,
         planningRounds: 0,
         planReviewFeedback: getSpirData(tracker).planReviewFeedback,
         planReviewSuggestions: getSpirData(tracker).planReviewSuggestions ? [...getSpirData(tracker).planReviewSuggestions!] : undefined,

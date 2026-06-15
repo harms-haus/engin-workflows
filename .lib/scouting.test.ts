@@ -329,11 +329,11 @@ describe('scoutingReviewPhase', () => {
   it('calls runStepTask with correct options', async () => {
     const tracker = makeMockTracker();
     const reports = [{ report: 'scout-result' }];
-    const reviewResult: ScoutingReview = { ready: true, research: 'All areas covered', gaps: [] };
+    const reviewResult: ScoutingReview = { ready: true, research: 'All areas covered', files: ['src/api.ts'], gaps: [] };
     mockRunStepTask.mockResolvedValueOnce(reviewResult);
 
     const result = await scoutingReviewPhase(
-      tracker, ['/profiles'], reports, '/cwd',
+      tracker, ['/profiles'], 'Implement feature X', reports, '/cwd',
     );
 
     expect(result).toBe(reviewResult);
@@ -346,7 +346,20 @@ describe('scoutingReviewPhase', () => {
     expect(callOpts.profileId).toBe('scouting-reviewer');
     expect(callOpts.isReadOnly).toBe(true);
     expect(callOpts.prompt).toContain('reviewing scouting reports');
+    // The task prompt MUST be included so the reviewer can judge relevance.
+    expect(callOpts.prompt).toContain('Implement feature X');
     expect(callOpts.prompt).toContain(JSON.stringify(reports, null, 2));
+  });
+
+  it('instructs the reviewer to emit the key files for the planner', async () => {
+    const tracker = makeMockTracker();
+    mockRunStepTask.mockResolvedValueOnce({ ready: true, research: '', gaps: [], files: [] });
+
+    await scoutingReviewPhase(tracker, ['/profiles'], 'Task', [], '/cwd');
+
+    const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
+    expect(prompt).toContain('`files`');
+    expect(prompt).toMatch(/concrete files a planner must/i);
   });
 
   it('passes apiKeys, onStatus, and signal through to runStepTask', async () => {
@@ -357,7 +370,7 @@ describe('scoutingReviewPhase', () => {
     mockRunStepTask.mockResolvedValueOnce({ ready: true, research: '', gaps: [] });
 
     await scoutingReviewPhase(
-      tracker, ['/profiles'], [], '/cwd',
+      tracker, ['/profiles'], 'Task', [], '/cwd',
       apiKeys, onStatus, abortController.signal,
     );
 
@@ -374,7 +387,7 @@ describe('scoutingReviewPhase', () => {
       mockRunStepTask.mockResolvedValueOnce({ ready: true, research: 'All good', gaps: [] });
 
       await scoutingReviewPhase(
-        tracker, ['/profiles'], [], '/cwd',
+        tracker, ['/profiles'], 'Task', [], '/cwd',
         undefined, onStatus,
       );
 
@@ -396,7 +409,7 @@ describe('scoutingReviewPhase', () => {
       });
 
       await scoutingReviewPhase(
-        tracker, ['/profiles'], [], '/cwd',
+        tracker, ['/profiles'], 'Task', [], '/cwd',
         undefined, onStatus,
       );
 
@@ -412,7 +425,7 @@ describe('scoutingReviewPhase', () => {
       mockRunStepTask.mockResolvedValueOnce({ ready: true, research: 'OK', gaps: [] });
 
       await expect(
-        scoutingReviewPhase(tracker, ['/profiles'], [], '/cwd'),
+        scoutingReviewPhase(tracker, ['/profiles'], 'Task', [], '/cwd'),
       ).resolves.toBeDefined();
     });
   });
@@ -426,7 +439,7 @@ describe('scoutingReviewPhase', () => {
         gaps: [{ topic: 'API', rationale: 'Explain', files: ['api.ts'] }],
       });
 
-      await scoutingReviewPhase(tracker, ['/profiles'], [], '/cwd');
+      await scoutingReviewPhase(tracker, ['/profiles'], 'Task', [], '/cwd');
 
       expect(tracker.auditLog.append).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -441,10 +454,10 @@ describe('scoutingReviewPhase', () => {
 
   it('returns the review result from runStepTask', async () => {
     const tracker = makeMockTracker();
-    const reviewResult: ScoutingReview = { ready: true, research: 'Comprehensive', gaps: [] };
+    const reviewResult: ScoutingReview = { ready: true, research: 'Comprehensive', files: [], gaps: [] };
     mockRunStepTask.mockResolvedValueOnce(reviewResult);
 
-    const result = await scoutingReviewPhase(tracker, ['/profiles'], [], '/cwd');
+    const result = await scoutingReviewPhase(tracker, ['/profiles'], 'Task', [], '/cwd');
 
     expect(result).toBe(reviewResult);
   });

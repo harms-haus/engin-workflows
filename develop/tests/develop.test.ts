@@ -388,11 +388,11 @@ describe("scoutingReviewPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const reviewResult: ScoutingReview = { ready: true, research: "All areas investigated thoroughly", gaps: [] };
+        const reviewResult: ScoutingReview = { ready: true, research: "All areas investigated thoroughly", files: [], gaps: [] };
         mockRunStepTask.mockReset();
         mockRunStepTask.mockResolvedValueOnce(reviewResult);
 
-        const result = await scoutingReviewPhase(tracker, ["/profiles"], [{ summary: "report 1" }], "/cwd");
+        const result = await scoutingReviewPhase(tracker, ["/profiles"], "Implement feature X", [{ summary: "report 1" }], "/cwd");
         expect(result).toEqual(reviewResult);
         expect(mockRunStepTask).toHaveBeenCalledTimes(1);
     });
@@ -407,7 +407,7 @@ describe("scoutingReviewPhase", () => {
             gaps: [{ topic: "Need to investigate test coverage", rationale: "Coverage gaps identified", files: ["tests/"] }],
         });
 
-        const result = await scoutingReviewPhase(tracker, ["/profiles"], [], "/cwd");
+        const result = await scoutingReviewPhase(tracker, ["/profiles"], "Implement feature X", [], "/cwd");
         expect(result.ready).toBe(false);
         expect(result.gaps).toHaveLength(1);
     });
@@ -431,7 +431,7 @@ describe("planningPhase", () => {
         mockRunStepTask.mockReset();
         mockRunStepTask.mockResolvedValueOnce(plan);
 
-        const result = await planningPhase(tracker, ["/profiles"], "Research summary", "Build feature X", "/cwd");
+        const result = await planningPhase(tracker, ["/profiles"], "Research summary", [], "Build feature X", "/cwd");
         expect(result).toEqual(plan);
         expect(result.tasks).toHaveLength(2);
         expect((tracker.workflowData as { plan: unknown }).plan).toEqual(plan);
@@ -444,7 +444,7 @@ describe("planningPhase", () => {
         mockRunStepTask.mockReset();
         mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: "Improved plan" });
 
-        await planningPhase(tracker, ["/profiles"], "research", "task", "/cwd", "Plan was too vague", ["Add tasks"]);
+        await planningPhase(tracker, ["/profiles"], "research", [], "task", "/cwd", "Plan was too vague", ["Add tasks"]);
 
         const callOpts = mockRunStepTask.mock.calls[0][0] as Record<string, unknown>;
         const prompt = callOpts.prompt as string;
@@ -465,7 +465,7 @@ describe("planReviewPhase", () => {
         mockRunStepTask.mockReset();
         mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: "Plan is solid and well-structured", suggestions: [] });
 
-        const result = await planReviewPhase(tracker, ["/profiles"], plan, "research", "task prompt", "/cwd");
+        const result = await planReviewPhase(tracker, ["/profiles"], plan, "research", [], "task prompt", "/cwd");
         expect(result.ready).toBe(true);
     });
 
@@ -478,7 +478,7 @@ describe("planReviewPhase", () => {
         mockRunStepTask.mockReset();
         mockRunStepTask.mockResolvedValueOnce({ ready: false, feedback: "Plan has no tasks", suggestions: ["Add concrete implementation tasks"] });
 
-        const result = await planReviewPhase(tracker, ["/profiles"], plan, "research", "task", "/cwd");
+        const result = await planReviewPhase(tracker, ["/profiles"], plan, "research", [], "task", "/cwd");
         expect(result.ready).toBe(false);
         expect(result.suggestions).toHaveLength(1);
     });

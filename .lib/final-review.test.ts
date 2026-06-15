@@ -22,6 +22,7 @@ import type { FinalReviewResult, FinalReviewFinding, FinalReviewSeverity } from 
 
 // ─── Mock @harms-haus/engin ────────────────────────────────────────────────
 const mockRunStepTask = jest.fn<(opts: any) => Promise<unknown>>();
+const mockGetDiff = jest.fn<() => string>().mockReturnValue('MOCK-DIFF-CONTENT');
 const mockPoolRun = jest.fn<() => Promise<{ completedTasks: number; failedTasks: number }>>();
 const mockAddTask = jest.fn<(task: any) => void>();
 const mockGetAllTasks = jest.fn<() => { id: string; status: string; result?: unknown }[]>();
@@ -37,6 +38,7 @@ const MockLanePool = jest.fn().mockImplementation(() => ({
 
 mock.module('@harms-haus/engin', () => ({
   runStepTask: mockRunStepTask,
+  getDiff: mockGetDiff,
   LanePool: MockLanePool,
   TaskTracker: MockTaskTracker,
   createHarness: jest.fn().mockResolvedValue({
@@ -170,6 +172,7 @@ beforeEach(() => {
   mockPoolRun.mockReset();
   mockAddTask.mockReset();
   mockGetAllTasks.mockReset();
+  mockGetDiff.mockClear();
   MockLanePool.mockClear();
   MockTaskTracker.mockClear();
   mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
@@ -227,6 +230,50 @@ describe('finalReviewPhase — runStepTask usage per reviewer', () => {
     for (const c of verifyCalls) {
       expect(c[0].stepName).toBe('final-review-fixes');
       expect(c[0].profileId).toBe('efficiency-reviewer');
+    }
+  });
+
+  it('injects the git diff into EVERY reviewer prompt (initial + verify) and recomputes it per pass', async () => {
+    const tracker = makeMockTracker();
+    // efficiency reports a finding on round-0, then clean on verify → forces a review-fixes pass.
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
+
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    // getDiff must be called once per reviewer pass (initial + each verify), not memoized stale.
+    const reviewerCalls = mockRunStepTask.mock.calls.filter(
+      (c) => isAnyReviewerCall(c[0].taskId),
+    );
+    expect(reviewerCalls.length).toBeGreaterThan(0);
+    expect(mockGetDiff).toHaveBeenCalledTimes(reviewerCalls.length);
+
+    // Every reviewer prompt (initial AND review-fixes) embeds the diff content + section header.
+    for (const c of reviewerCalls) {
+      expect(c[0].prompt).toContain('git diff against HEAD');
+      expect(c[0].prompt).toContain('MOCK-DIFF-CONTENT');
+    }
+  });
+
+  it('does NOT inject the diff into fixer prompts', async () => {
+    const tracker = makeMockTracker();
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
+
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    // Fixer prompts are recorded via mockAddTask (one fixer task per actionable finding).
+    for (const call of mockAddTask.mock.calls) {
+      const task = call[0];
+      expect(task.prompt).not.toContain('git diff against HEAD');
     }
   });
 

@@ -470,6 +470,7 @@ describe("scoutingReviewPhase", () => {
         const result = await scoutingReviewPhase(
             tracker,
             ["/profiles"],
+            "Implement feature X",
             [{ summary: "report 1" }],
             "/cwd",
         );
@@ -492,6 +493,7 @@ describe("scoutingReviewPhase", () => {
         const result = await scoutingReviewPhase(
             tracker,
             ["/profiles"],
+            "Implement feature X",
             [],
             "/cwd",
         );
@@ -508,7 +510,7 @@ describe("scoutingReviewPhase", () => {
         mockRunStepTask.mockRejectedValue(new Error('Profile "scouting-reviewer" not found'));
 
         await expect(
-            scoutingReviewPhase(tracker, ["/profiles"], [], "/cwd"),
+            scoutingReviewPhase(tracker, ["/profiles"], "Implement feature X", [], "/cwd"),
         ).rejects.toThrow('not found');
     });
 });
@@ -551,6 +553,7 @@ describe("planningPhase", () => {
             tracker,
             ["/profiles"],
             "Research summary",
+            [],
             "Build feature X",
             "/cwd",
         );
@@ -568,7 +571,7 @@ describe("planningPhase", () => {
         mockRunStepTask.mockRejectedValue(new Error('Profile "planner" not found'));
 
         await expect(
-            planningPhase(tracker, ["/profiles"], "research", "task", "/cwd"),
+            planningPhase(tracker, ["/profiles"], "research", [], "task", "/cwd"),
         ).rejects.toThrow('not found');
     });
 
@@ -583,6 +586,7 @@ describe("planningPhase", () => {
             tracker,
             ["/profiles"],
             "research",
+            [],
             "task",
             "/cwd",
             "Plan was too vague",
@@ -626,6 +630,7 @@ describe("planReviewPhase", () => {
             ["/profiles"],
             plan,
             "research",
+            [],
             "task prompt",
             "/cwd",
         );
@@ -651,6 +656,7 @@ describe("planReviewPhase", () => {
             ["/profiles"],
             plan,
             "research",
+            [],
             "task",
             "/cwd",
         );
