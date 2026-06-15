@@ -144,6 +144,7 @@ function makeAllProfiles(): Map<string, AgentProfile> {
         "code-quality-reviewer",
         "ui-ux-reviewer",
         "security-reviewer",
+        "documentation-reviewer",
         "test-writer",
         "test-reviewer",
     ];
@@ -162,8 +163,9 @@ function tmpDir(): string {
 
 // ─── Final Review mock helpers ──────────────────────────────────────────────
 //
-// The multi-dimensional final review runs 4 reviewers IN PARALLEL each round.
-// Each reviewer's prompt identifies its dimension, so these helpers key the
+// The final review runs 5 reviewers as INDEPENDENT LANES in parallel. Each
+// lane loops review → fixer → review-fixes over its own dimension. Each
+// reviewer's prompt identifies its dimension, so these helpers key the
 // returned FinalReviewResult off the prompt text — robust to the parallel call
 // ordering. The default impl returns a clean result for every reviewer and is
 // installed in beforeEach so the `run`/callbacks tests (which mock the earlier
@@ -228,7 +230,7 @@ beforeEach(() => {
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
     // Default: any final-review reviewer call returns a clean FinalReviewResult.
     // Per-test mockResolvedValueOnce values (for the sequential phases) take
-    // priority; this impl only handles the 4 parallel reviewer calls once those
+    // priority; this impl only handles the 5 parallel reviewer calls once those
     // are spent.
     mockPromptForStructured.mockImplementation(defaultFinalReviewCleanImpl());
     mockLanePoolRun.mockImplementation(async function(this: unknown) {
@@ -939,14 +941,14 @@ describe("finalReviewPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        // All 4 reviewers return a clean FinalReviewResult.
+        // All 5 reviewers return a clean FinalReviewResult.
         mockPromptForStructured.mockImplementation(finalReviewImpl());
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd");
 
         expect(clean).toBe(true);
-        // 4 reviewers run in parallel each round; one clean round = 4 calls.
-        expect(mockPromptForStructured).toHaveBeenCalledTimes(4);
+        // 5 reviewers run as parallel lanes; one clean pass each = 5 calls.
+        expect(mockPromptForStructured).toHaveBeenCalledTimes(5);
     });
 
     it("returns true when only low-severity (non-actionable) findings found", async () => {
@@ -959,8 +961,9 @@ describe("finalReviewPhase", () => {
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir");
 
         expect(clean).toBe(true);
-        // Only one review round — no fixers spawned since low is not actionable.
-        expect(mockPromptForStructured).toHaveBeenCalledTimes(4);
+        // Low findings are recorded but do NOT spawn fixers; one clean pass per
+        // lane = 5 calls.
+        expect(mockPromptForStructured).toHaveBeenCalledTimes(5);
     });
 
     it("uses LanePool with FIXER_STEPS for critical issues (not parallelAgents)", async () => {
@@ -968,14 +971,15 @@ describe("finalReviewPhase", () => {
         const tracker = new WorkflowStatusTracker(dir);
 
         // Round 0: the efficiency reviewer returns a critical finding; the
-        // other 3 reviewers are clean. Round 1: all clean.
+        // other 4 reviewers are clean. The efficiency lane then runs a fixer
+        // and a review-fixes pass which comes back clean.
         mockPromptForStructured.mockImplementation(finalReviewImpl({ criticalRound0Dim: "efficiency" }));
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir");
 
         expect(clean).toBe(true);
-        // Two review rounds × 4 reviewers = 8 reviewer calls.
-        expect(mockPromptForStructured).toHaveBeenCalledTimes(8);
+        // 5 initial reviews + 1 efficiency review-fixes pass = 6 calls.
+        expect(mockPromptForStructured).toHaveBeenCalledTimes(6);
 
         // LanePool should have been constructed for the fixer round
         // (at least once — for the fixer LanePool)
@@ -1007,8 +1011,9 @@ describe("finalReviewPhase", () => {
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir");
 
         expect(clean).toBe(false);
-        // 3 rounds × 4 reviewers = 12 reviewer calls (all rounds exhausted).
-        expect(mockPromptForStructured).toHaveBeenCalledTimes(12);
+        // Every lane stays dirty: 5 lanes × (1 review + 3 review-fixes passes)
+        // = 5 × 4 = 20 calls.
+        expect(mockPromptForStructured).toHaveBeenCalledTimes(20);
     });
 
     it("finalReviewPhase does not use parallelAgents", async () => {
@@ -1110,7 +1115,7 @@ describe("run", () => {
                     suggestions: [],
                 }, attempts: 1,
             })
-            // finalReview: clean (4 parallel reviewers; default impl returns clean)
+            // finalReview: clean (5 parallel reviewer lanes; default impl returns clean)
             .mockResolvedValueOnce({
                 result: {
                     dimension: "efficiency",
@@ -1258,7 +1263,7 @@ describe("run", () => {
             })
             // plan review
             .mockResolvedValueOnce({ result: { ready: true, feedback: "OK", suggestions: [] }, attempts: 1 })
-            // final review (4 parallel reviewers; default impl returns clean)
+            // final review (5 parallel reviewer lanes; default impl returns clean)
             .mockResolvedValueOnce({
                 result: {
                     dimension: "efficiency",

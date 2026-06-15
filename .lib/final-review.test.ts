@@ -1,11 +1,20 @@
 // ─── Final Review Phase Tests ───────────────────────────────────────────────
 //
-// Tests for final-review.ts: the multi-dimensional review design. Each round
-// runs N specialized reviewers IN PARALLEL (default 4: efficiency, code-quality,
-// ui-ux, security). Findings rated medium/high/critical ("actionable") spawn
-// one fixer task each; low findings and not-applicable reviews do not. After
-// fixers settle, reviewers run again — each receiving its OWN complete prior
-// history so it does not re-report fixed findings.
+// Tests for final-review.ts: the per-lane multi-dimensional review design.
+// Each reviewer runs as an INDEPENDENT LANE in parallel. A lane executes:
+//
+//     review (round-0) ──▶ clean? done
+//                        └▶ [fixer ──▶ review-fixes (round-N)]*
+//                                       (loop while actionable, ≤ MAX_FIX_ROUNDS)
+//
+// The initial review and the review-fixes pass both use the SAME reviewer
+// profile, differing only in stepName ("final-review" vs "final-review-fixes")
+// and prompt. A clean initial review skips the fixer + review-fixes entirely.
+// Findings rated medium/high/critical ("actionable") spawn one fixer task each
+// WITHIN that lane; low findings and not-applicable reviews do not. Each lane
+// keeps its own history so a reviewer never re-reports already-fixed items.
+//
+// Default reviewers (5): efficiency, code-quality, ui-ux, security, documentation.
 // ────────────────────────────────────────────────────────────────────────────
 
 import { describe, expect, it, jest, mock, beforeEach } from 'bun:test';
@@ -65,11 +74,11 @@ const { FinalReviewResultSchema } = await import('./schemas');
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 /** Reviewer dimensions/profiles in the order the default config lists them. */
-const DEFAULT_DIMENSIONS = ['efficiency', 'code-quality', 'ui-ux', 'security'] as const;
-const DEFAULT_PROFILE_IDS = DEFAULT_DIMENSIONS.map(
-  (d) => `${d.replace('ui-ux', 'ui-ux')}-reviewer`.replace('code-quality-reviewer', 'code-quality-reviewer'),
-);
-const EXPECTED_REVIEWER_COUNT = DEFAULT_FINAL_REVIEWERS.length; // 4
+const DEFAULT_DIMENSIONS = ['efficiency', 'code-quality', 'ui-ux', 'security', 'documentation'] as const;
+const DEFAULT_PROFILE_IDS = DEFAULT_DIMENSIONS.map((d) => `${d}-reviewer`);
+const EXPECTED_REVIEWER_COUNT = DEFAULT_FINAL_REVIEWERS.length; // 5
+/** Max fixer attempts per lane (mirrors MAX_FIX_ROUNDS in final-review.ts). */
+const MAX_FIX_ROUNDS = 3;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -129,12 +138,30 @@ function makeResultWithFindings(
   };
 }
 
-/** Set every reviewer (all 4 dimensions) to return clean for every round. */
+/** Derive the reviewer dimension from a profileId ("efficiency-reviewer" → "efficiency"). */
+function dimensionOfProfileId(profileId: string): string {
+  return profileId.replace(/-reviewer$/, '');
+}
+
+/** taskId matcher for ANY reviewer pass (initial review OR review-fixes). */
+const isAnyReviewerCall = (taskId: string) =>
+  /^(efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId);
+
+/** taskId matcher for the INITIAL review pass only (round-0). */
+const isInitialReviewCall = (taskId: string) =>
+  /^(efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-0$/.test(taskId);
+
+/** taskId matcher for a review-fixes pass only (round ≥ 1). */
+const isReviewFixesCall = (taskId: string) =>
+  /^(efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-[1-9]\d*$/.test(taskId);
+
+/**
+ * Set every reviewer to return a clean result for EVERY pass (initial + verify).
+ * Lanes stay clean from the start, so no fixer / review-fixes passes run.
+ */
 function allReviewersClean() {
-  // runStepTask is called 4× per round; returning a clean result keyed by the
-  // requested dimension keeps every reviewer happy regardless of call order.
   mockRunStepTask.mockImplementation(async (opts: any) =>
-    makeCleanResult(opts.profileId.replace('-reviewer', '')),
+    makeCleanResult(dimensionOfProfileId(opts.profileId)),
   );
 }
 
@@ -152,23 +179,54 @@ beforeEach(() => {
 // ─── runStepTask usage ─────────────────────────────────────────────────────
 
 describe('finalReviewPhase — runStepTask usage per reviewer', () => {
-  it('runs one runStepTask per reviewer per round (4 for a single clean round)', async () => {
+  it('runs one INITIAL review per reviewer (5 for an all-clean run)', async () => {
     const tracker = makeMockTracker();
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-    expect(mockRunStepTask).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT);
+    const initialCalls = mockRunStepTask.mock.calls.filter((c) =>
+      isInitialReviewCall(c[0].taskId),
+    );
+    expect(initialCalls).toHaveLength(EXPECTED_REVIEWER_COUNT);
+    // No verify passes ran (all lanes clean on first pass).
+    const verifyCalls = mockRunStepTask.mock.calls.filter((c) =>
+      isReviewFixesCall(c[0].taskId),
+    );
+    expect(verifyCalls).toHaveLength(0);
   });
 
-  it('uses phaseId: "review", stepName: "final-review", isReadOnly: true', async () => {
+  it('uses phaseId: "review", isReadOnly: true, FinalReviewResultSchema for every pass', async () => {
     const tracker = makeMockTracker();
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
     for (const call of mockRunStepTask.mock.calls) {
       const opts = call[0];
       expect(opts.phaseId).toBe('review');
-      expect(opts.stepName).toBe('final-review');
       expect(opts.isReadOnly).toBe(true);
       expect(opts.schema).toBe(FinalReviewResultSchema);
+    }
+  });
+
+  it('uses stepName "final-review" for the initial pass and "final-review-fixes" for verify passes', async () => {
+    const tracker = makeMockTracker();
+    // efficiency reports a finding on round-0, then is clean on every verify pass.
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
+
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    const initialCalls = mockRunStepTask.mock.calls.filter((c) => isInitialReviewCall(c[0].taskId));
+    const verifyCalls = mockRunStepTask.mock.calls.filter((c) => isReviewFixesCall(c[0].taskId));
+    expect(initialCalls).toHaveLength(EXPECTED_REVIEWER_COUNT);
+    for (const c of initialCalls) expect(c[0].stepName).toBe('final-review');
+    // efficiency lane ran exactly one verify pass (round-1, clean).
+    expect(verifyCalls).toHaveLength(1);
+    for (const c of verifyCalls) {
+      expect(c[0].stepName).toBe('final-review-fixes');
+      expect(c[0].profileId).toBe('efficiency-reviewer');
     }
   });
 
@@ -176,17 +234,20 @@ describe('finalReviewPhase — runStepTask usage per reviewer', () => {
     const tracker = makeMockTracker();
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-    const profileIds = mockRunStepTask.mock.calls.map((c) => c[0].profileId).sort();
+    const profileIds = mockRunStepTask.mock.calls
+      .filter((c) => isInitialReviewCall(c[0].taskId))
+      .map((c) => c[0].profileId)
+      .sort();
     expect(profileIds).toEqual([...DEFAULT_PROFILE_IDS].sort());
   });
 
-  it('taskIds follow the pattern "<profileId>-round-<n>"', async () => {
+  it('initial-review taskIds follow the pattern "<profileId>-round-0"', async () => {
     const tracker = makeMockTracker();
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
     for (const call of mockRunStepTask.mock.calls) {
       const opts = call[0];
-      expect(opts.taskId).toMatch(/^(efficiency|code-quality|ui-ux|security)-reviewer-round-0$/);
+      if (!isInitialReviewCall(opts.taskId)) continue;
       expect(opts.taskId).toBe(`${opts.profileId}-round-0`);
     }
   });
@@ -236,7 +297,7 @@ describe('finalReviewPhase — clean assessment', () => {
     expect(mockPoolRun).not.toHaveBeenCalled();
   });
 
-  it('auditLogs each reviewer result (4 events for one round)', async () => {
+  it('auditLogs each reviewer result (5 events for one clean pass)', async () => {
     const append = jest.fn().mockResolvedValue(undefined);
     const tracker = { auditLog: { append } } as never;
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
@@ -251,20 +312,22 @@ describe('finalReviewPhase — clean assessment', () => {
   });
 });
 
-// ─── Actionable findings → fixers ──────────────────────────────────────────
+// ─── Actionable findings → fixers (per lane) ───────────────────────────────
 
-describe('finalReviewPhase — actionable findings spawn fixers', () => {
-  it('creates one fixer task per medium/high/critical finding', async () => {
+describe('finalReviewPhase — actionable findings spawn fixers in that lane', () => {
+  it('creates one fixer task per medium/high/critical finding (single dirty lane)', async () => {
     const tracker = makeMockTracker();
-    // Only the efficiency reviewer returns findings; the other three are clean.
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [
-        makeFinding('medium', { id: 'm1', title: 'medium issue' }),
-        makeFinding('high', { id: 'h1', title: 'high issue' }),
-        makeFinding('critical', { id: 'c1', title: 'critical issue' }),
-      ]),
-    );
-    // round 1: clean (default impl returns clean for all)
+    // Only the efficiency reviewer returns findings; the other four are clean.
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [
+          makeFinding('medium', { id: 'm1', title: 'medium issue' }),
+          makeFinding('high', { id: 'h1', title: 'high issue' }),
+          makeFinding('critical', { id: 'c1', title: 'critical issue' }),
+        ]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
 
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
@@ -272,22 +335,24 @@ describe('finalReviewPhase — actionable findings spawn fixers', () => {
     const titles = mockAddTask.mock.calls.map((c) => c[0].title);
     expect(titles).toEqual(
       expect.arrayContaining([
-        'Fix [medium]: medium issue',
-        'Fix [high]: high issue',
-        'Fix [critical]: critical issue',
+        'Fix [medium] Efficiency: medium issue',
+        'Fix [high] Efficiency: high issue',
+        'Fix [critical] Efficiency: critical issue',
       ]),
     );
   });
 
   it('does NOT spawn a fixer for low-severity findings', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [makeFinding('low', { title: 'nit' })]),
-    );
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('low', { title: 'nit' })]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
 
     const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-    // low is not actionable → no fixers → clean
     expect(mockAddTask).not.toHaveBeenCalled();
     expect(result).toBe(true);
   });
@@ -295,11 +360,16 @@ describe('finalReviewPhase — actionable findings spawn fixers', () => {
   it('ignores findings from reviews marked not-applicable', async () => {
     const tracker = makeMockTracker();
     // security reviewer says not-applicable but (incorrectly) includes a finding
-    mockRunStepTask.mockImplementationOnce(async () => ({
-      ...makeResultWithFindings('security', [makeFinding('critical')]),
-      applicable: false,
-      notApplicableReason: 'No security surface',
-    }));
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'security-reviewer-round-0') {
+        return {
+          ...makeResultWithFindings('security', [makeFinding('critical')]),
+          applicable: false,
+          notApplicableReason: 'No security surface',
+        };
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
 
     const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
@@ -309,16 +379,19 @@ describe('finalReviewPhase — actionable findings spawn fixers', () => {
 
   it('builds the fixer prompt from the finding and embeds fixPrompt', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [
-        makeFinding('critical', {
-          file: 'src/db.ts:10-20',
-          title: 'N+1 query',
-          description: 'Query runs inside a loop.',
-          fixPrompt: 'Batch the query outside the loop.',
-        }),
-      ]),
-    );
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [
+          makeFinding('critical', {
+            file: 'src/db.ts:10-20',
+            title: 'N+1 query',
+            description: 'Query runs inside a loop.',
+            fixPrompt: 'Batch the query outside the loop.',
+          }),
+        ]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
 
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
@@ -341,9 +414,12 @@ describe('finalReviewPhase — actionable findings spawn fixers', () => {
 
   it('applies titleFormatter to the finding title', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [makeFinding('high', { title: 'slow loop' })]),
-    );
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('high', { title: 'slow loop' })]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
 
     await finalReviewPhase(
       tracker,
@@ -360,37 +436,63 @@ describe('finalReviewPhase — actionable findings spawn fixers', () => {
     );
 
     expect(mockAddTask).toHaveBeenCalledWith(
-      expect.objectContaining({ title: 'Fix [high]: TRUNC' }),
+      expect.objectContaining({ title: 'Fix [high] Efficiency: TRUNC' }),
     );
   });
 });
 
-// ─── Fixer LanePool options ────────────────────────────────────────────────
+// ─── Per-lane fixer LanePool ───────────────────────────────────────────────
 
-describe('finalReviewPhase — fixer LanePool', () => {
-  it('creates a LanePool with phaseId "review" and the resolved maxConcurrentLanes', async () => {
+describe('finalReviewPhase — per-lane fixer LanePool', () => {
+  it('creates one LanePool per dirty lane with phaseId "review" and resolved maxConcurrentLanes', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [makeFinding('critical')]),
-    );
+    // Two dirty lanes (efficiency + security), each with one finding, both resolve on verify.
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (
+        opts.taskId === 'efficiency-reviewer-round-0' ||
+        opts.taskId === 'security-reviewer-round-0'
+      ) {
+        return makeResultWithFindings(dimensionOfProfileId(opts.profileId), [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
 
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 3);
 
-    expect(MockLanePool).toHaveBeenCalledTimes(1);
-    expect(MockLanePool.mock.calls[0][0]).toMatchObject({
-      phaseId: 'review',
-      maxConcurrentLanes: 3,
-      sessionBaseDir: '/work/sessions/fix-round-0',
-      cwd: '/cwd',
-      profilesDirs: ['/profiles'],
+    expect(MockLanePool).toHaveBeenCalledTimes(2);
+    for (const ctorCall of MockLanePool.mock.calls) {
+      expect(ctorCall[0]).toMatchObject({
+        phaseId: 'review',
+        maxConcurrentLanes: 3,
+        cwd: '/cwd',
+        profilesDirs: ['/profiles'],
+      });
+    }
+  });
+
+  it('scopes the fixer session dir per dimension + fix round (lanes never collide)', async () => {
+    const tracker = makeMockTracker();
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
     });
+
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(MockLanePool).toHaveBeenCalledTimes(1);
+    expect(MockLanePool.mock.calls[0][0].sessionBaseDir).toBe('/work/sessions/fix-efficiency-0');
   });
 
   it('defaults maxConcurrentLanes to 5 when maxConcurrentTasks is undefined', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [makeFinding('critical')]),
-    );
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
 
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', undefined);
 
@@ -399,9 +501,12 @@ describe('finalReviewPhase — fixer LanePool', () => {
 
   it('passes fixerSteps via getStepsForTask', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [makeFinding('critical')]),
-    );
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
     const customSteps = [{ name: 'my-fix', profileId: 'my-fixer', isReadOnly: false }];
 
     await finalReviewPhase(
@@ -418,9 +523,12 @@ describe('finalReviewPhase — fixer LanePool', () => {
 
   it('does not pass a legacy "phase" field to LanePool', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [makeFinding('critical')]),
-    );
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
 
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
@@ -430,9 +538,12 @@ describe('finalReviewPhase — fixer LanePool', () => {
   it('passes auditLog + a taskTracker to the LanePool and runs it', async () => {
     const append = jest.fn().mockResolvedValue(undefined);
     const tracker = { auditLog: { append } } as never;
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [makeFinding('critical')]),
-    );
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
 
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
@@ -443,84 +554,178 @@ describe('finalReviewPhase — fixer LanePool', () => {
   });
 });
 
-// ─── Loop Behavior ──────────────────────────────────────────────────────────
+// ─── Per-lane loop behavior ────────────────────────────────────────────────
 
-describe('finalReviewPhase — loop behavior', () => {
-  it('stops after one clean round (4 calls, returns true)', async () => {
+describe('finalReviewPhase — per-lane loop behavior', () => {
+  it('a clean lane does NOT trigger any fixer or review-fixes pass', async () => {
     const tracker = makeMockTracker();
-    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
-
-    expect(mockRunStepTask).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT);
-    expect(result).toBe(true);
-  });
-
-  it('re-runs all reviewers after fixers and stops when clean (8 calls)', async () => {
-    const tracker = makeMockTracker();
-    // Round 0: efficiency has a critical finding; others clean
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [makeFinding('critical')]),
-    );
-    // Round 1: all clean (default impl)
-
-    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
-
-    expect(mockRunStepTask).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT * 2);
-    expect(MockLanePool).toHaveBeenCalledTimes(1);
-    expect(result).toBe(true);
-  });
-
-  it('loops up to 3 rounds (12 calls) and returns false when issues persist', async () => {
-    const tracker = makeMockTracker();
-    // Every reviewer every round returns a critical finding.
-    mockRunStepTask.mockImplementation(async (opts: any) =>
-      makeResultWithFindings(opts.profileId.replace('-reviewer', ''), [makeFinding('critical')]),
-    );
-
-    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
-
-    expect(mockRunStepTask).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT * 3);
-    expect(MockLanePool).toHaveBeenCalledTimes(3);
-    expect(result).toBe(false);
-  });
-
-  it('auditLogs every reviewer result across all rounds', async () => {
-    const append = jest.fn().mockResolvedValue(undefined);
-    const tracker = { auditLog: { append } } as never;
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [makeFinding('critical')]),
-    );
+    // Only efficiency is dirty (resolves on verify); the other 4 lanes are clean.
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
 
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-    // 4 (round 0) + 4 (round 1, clean) = 8
-    expect(append).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT * 2);
+    // Clean lanes contribute exactly one initial-review call each.
+    const cleanLaneProfiles = DEFAULT_PROFILE_IDS.filter((p) => p !== 'efficiency-reviewer');
+    for (const profileId of cleanLaneProfiles) {
+      const calls = mockRunStepTask.mock.calls.filter(
+        (c) => typeof c[0].taskId === 'string' && c[0].taskId.startsWith(`${profileId}-round-`),
+      );
+      expect(calls).toHaveLength(1);
+      expect(calls[0][0].taskId).toBe(`${profileId}-round-0`);
+    }
+    // Exactly one LanePool — efficiency's only fix round.
+    expect(MockLanePool).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs review → fixer → review-fixes for one dirty lane then stops (6 calls, 1 pool)', async () => {
+    const tracker = makeMockTracker();
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
+
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(result).toBe(true);
+    // 5 initial reviews + 1 efficiency verify pass = 6 reviewer calls total.
+    const reviewerCalls = mockRunStepTask.mock.calls.filter((c) => isAnyReviewerCall(c[0].taskId));
+    expect(reviewerCalls).toHaveLength(EXPECTED_REVIEWER_COUNT + 1);
+    expect(MockLanePool).toHaveBeenCalledTimes(1);
+  });
+
+  it('loops fixer → review-fixes within a lane until that lane is clean', async () => {
+    const tracker = makeMockTracker();
+    // efficiency stays dirty for round-0 and round-1, then clean on round-2.
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.profileId === 'efficiency-reviewer') {
+        const round = Number(opts.taskId.match(/-round-(\d+)$/)![1]);
+        if (round <= 1) {
+          return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+        }
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
+
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(result).toBe(true);
+    // efficiency lane: review(0) + verify(1, dirty) + verify(2, clean) = 3 calls, 2 fixer pools.
+    const efficiencyCalls = mockRunStepTask.mock.calls.filter(
+      (c) => c[0].profileId === 'efficiency-reviewer',
+    );
+    expect(efficiencyCalls).toHaveLength(3);
+    expect(MockLanePool).toHaveBeenCalledTimes(2);
+  });
+
+  it('gives up on a lane after MAX_FIX_ROUNDS and returns false', async () => {
+    const tracker = makeMockTracker();
+    // efficiency is ALWAYS dirty; others clean.
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.profileId === 'efficiency-reviewer') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
+
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(result).toBe(false);
+    // efficiency lane: review(0) + 3 verify passes (rounds 1,2,3) = 4 calls, 3 fixer pools.
+    const efficiencyCalls = mockRunStepTask.mock.calls.filter(
+      (c) => c[0].profileId === 'efficiency-reviewer',
+    );
+    expect(efficiencyCalls).toHaveLength(1 + MAX_FIX_ROUNDS);
+    expect(MockLanePool).toHaveBeenCalledTimes(MAX_FIX_ROUNDS);
+    // session dirs are per dimension + fix round: fix-efficiency-0, -1, -2
+    const sessionDirs = MockLanePool.mock.calls.map((c) => c[0].sessionBaseDir);
+    expect(sessionDirs).toEqual([
+      '/work/sessions/fix-efficiency-0',
+      '/work/sessions/fix-efficiency-1',
+      '/work/sessions/fix-efficiency-2',
+    ]);
+  });
+
+  it('returns false if ANY lane stays dirty (even if others are clean)', async () => {
+    const tracker = makeMockTracker();
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      // documentation lane never resolves.
+      if (opts.profileId === 'documentation-reviewer') {
+        return makeResultWithFindings('documentation', [makeFinding('high')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
+
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(result).toBe(false);
+    // Only the documentation lane spawned fixers.
+    expect(MockLanePool).toHaveBeenCalledTimes(MAX_FIX_ROUNDS);
+  });
+
+  it('every lane always dirty → 5 lanes × 4 passes = 20 calls, 5 lanes × 3 pools = 15 pools', async () => {
+    const tracker = makeMockTracker();
+    mockRunStepTask.mockImplementation(async (opts: any) =>
+      makeResultWithFindings(dimensionOfProfileId(opts.profileId), [makeFinding('critical')]),
+    );
+
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(result).toBe(false);
+    const reviewerCalls = mockRunStepTask.mock.calls.filter((c) => isAnyReviewerCall(c[0].taskId));
+    expect(reviewerCalls).toHaveLength(EXPECTED_REVIEWER_COUNT * (1 + MAX_FIX_ROUNDS));
+    expect(MockLanePool).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT * MAX_FIX_ROUNDS);
+  });
+
+  it('auditLogs every reviewer result across all passes (initial + verify)', async () => {
+    const append = jest.fn().mockResolvedValue(undefined);
+    const tracker = { auditLog: { append } } as never;
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [makeFinding('critical')]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
+
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    // 5 initial reviews + 1 efficiency verify = 6 audit events.
+    expect(append).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT + 1);
   });
 });
 
 // ─── Reviewer history is passed on re-review ───────────────────────────────
 
-describe('finalReviewPhase — passes full prior-round history to reviewers', () => {
-  it('round-0 prompts contain NO history; round-1 prompts DO', async () => {
+describe('finalReviewPhase — passes full prior-pass history to reviewers', () => {
+  it('initial-review prompts contain NO history; verify prompts DO', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockImplementationOnce(async () =>
-      makeResultWithFindings('efficiency', [makeFinding('critical', { title: 'round0 issue' })]),
-    );
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'efficiency-reviewer-round-0') {
+        return makeResultWithFindings('efficiency', [
+          makeFinding('critical', { title: 'round0 issue' }),
+        ]);
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
 
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-    // Calls 0..3 = round 0; calls 4..7 = round 1
-    const round0Prompts = mockRunStepTask.mock.calls.slice(0, 4).map((c) => c[0].prompt as string);
-    const round1Prompts = mockRunStepTask.mock.calls.slice(4, 8).map((c) => c[0].prompt as string);
+    const initialCalls = mockRunStepTask.mock.calls.filter((c) => isInitialReviewCall(c[0].taskId));
+    const verifyCalls = mockRunStepTask.mock.calls.filter((c) => isReviewFixesCall(c[0].taskId));
 
-    for (const p of round0Prompts) expect(p).not.toContain('PRIOR REVIEW HISTORY');
-    for (const p of round1Prompts) expect(p).toContain('PRIOR REVIEW HISTORY');
-
-    // The efficiency reviewer's round-1 prompt references its round-0 finding.
-    const efficiencyRound1 = mockRunStepTask.mock.calls
-      .map((c) => c[0])
-      .filter((o) => o.profileId === 'efficiency-reviewer' && o.taskId.endsWith('-round-1'))[0];
-    expect(efficiencyRound1.prompt).toContain('round0 issue');
-    expect(efficiencyRound1.prompt).toContain('do NOT re-report resolved findings');
+    for (const c of initialCalls) expect(c[0].prompt).not.toContain('PRIOR REVIEW HISTORY');
+    expect(verifyCalls).toHaveLength(1);
+    const verifyPrompt = verifyCalls[0][0].prompt as string;
+    expect(verifyPrompt).toContain('PRIOR REVIEW HISTORY');
+    // The efficiency reviewer's verify prompt references its round-0 finding.
+    expect(verifyPrompt).toContain('round0 issue');
+    expect(verifyPrompt).toContain('VERIFY the fixes');
   });
 });
 
@@ -533,7 +738,9 @@ describe('finalReviewPhase — custom finalReviewers', () => {
       { profileId: 'a-reviewer', dimension: 'a', label: 'A' },
       { profileId: 'b-reviewer', dimension: 'b', label: 'B' },
     ];
-    mockRunStepTask.mockImplementation(async (opts: any) => makeCleanResult(opts.profileId.replace('-reviewer', '')));
+    mockRunStepTask.mockImplementation(async (opts: any) =>
+      makeCleanResult(opts.profileId.replace(/-reviewer$/, '')),
+    );
 
     await finalReviewPhase(
       tracker, ['/profiles'], '/cwd', '/work', 5,
@@ -576,12 +783,19 @@ describe('isActionableSeverity', () => {
 });
 
 describe('DEFAULT_FINAL_REVIEWERS', () => {
-  it('contains the four expected reviewers', () => {
+  it('contains the five expected reviewers', () => {
     const byDim = Object.fromEntries(DEFAULT_FINAL_REVIEWERS.map((r) => [r.dimension, r]));
-    expect(Object.keys(byDim).sort()).toEqual(['code-quality', 'efficiency', 'security', 'ui-ux']);
+    expect(Object.keys(byDim).sort()).toEqual([
+      'code-quality',
+      'documentation',
+      'efficiency',
+      'security',
+      'ui-ux',
+    ]);
     expect(byDim.efficiency.profileId).toBe('efficiency-reviewer');
     expect(byDim['code-quality'].profileId).toBe('code-quality-reviewer');
     expect(byDim['ui-ux'].profileId).toBe('ui-ux-reviewer');
     expect(byDim.security.profileId).toBe('security-reviewer');
+    expect(byDim.documentation.profileId).toBe('documentation-reviewer');
   });
 });

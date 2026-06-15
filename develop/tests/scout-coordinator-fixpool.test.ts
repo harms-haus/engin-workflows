@@ -163,7 +163,7 @@ beforeEach(() => {
         if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
         if (taskId === "planner") return { tasks: [], strategy: "none" };
         if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-        if (/(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
+        if (/(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
         return {};
     });
     mockLanePoolRun.mockImplementation(async function() {
@@ -346,7 +346,7 @@ describe("CHANGE 7: finalReviewPhase signature", () => {
             if (taskId === "efficiency-reviewer-round-0") {
                 return { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "Needs fixes", findings: [{ id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Why it matters", fixPrompt: "Fix it by ..." }] };
             }
-            if (/(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+            if (/(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
                 return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             }
             return {};
@@ -382,7 +382,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
             if (taskId === "efficiency-reviewer-round-0") {
                 return { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "Needs fixing", findings: [{ id: "f1", severity: "critical", file: "src/a.ts", title: "Critical bug", description: "Why it matters", fixPrompt: "Fix it by ..." }] };
             }
-            if (/(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+            if (/(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
                 return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             }
             return {};
@@ -406,7 +406,7 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
             if (taskId === "efficiency-reviewer-round-0") {
                 return { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "Needs fixing", findings: [{ id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Why it matters", fixPrompt: "Fix it by ..." }] };
             }
-            if (/(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+            if (/(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
                 return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             }
             return {};
@@ -446,7 +446,7 @@ describe("CHANGE 9: executePhase integration", () => {
             if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
             if (taskId === "planner") return { tasks: [], strategy: "none" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-            if (/(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
+            if (/(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         mockPromptForStructured.mockReset();

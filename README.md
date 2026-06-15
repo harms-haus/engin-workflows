@@ -41,7 +41,7 @@ workflows/
 │   └── tsconfig.json
 ├── develop/
 │   ├── main.ts               # thin wrapper
-│   ├── profiles/             # 17 agent-profile .md files
+│   ├── profiles/             # 18 agent-profile .md files
 │   ├── tests/                # structure + behaviour tests
 │   ├── package.json
 │   ├── tsconfig.json
@@ -50,7 +50,7 @@ workflows/
 ├── improve/
 │   ├── main.ts               # thin wrapper
 │   ├── jsdom-setup.ts        # DOM test setup (improve only)
-│   ├── profiles/             # 17 agent-profile .md files
+│   ├── profiles/             # 18 agent-profile .md files
 │   ├── tests/
 │   ├── package.json
 │   ├── tsconfig.json
@@ -58,7 +58,7 @@ workflows/
 │   └── bun.lock
 ├── debug/
 │   ├── main.ts               # thin wrapper
-│   ├── profiles/             # 16 agent-profile .md files (no worker.md)
+│   ├── profiles/             # 17 agent-profile .md files (no worker.md)
 │   ├── tests/
 │   ├── package.json
 │   ├── tsconfig.json
@@ -105,6 +105,7 @@ export const workflowConfig = {
         { profileId: 'code-quality-reviewer', dimension: 'code-quality', label: 'Code Quality' },
         { profileId: 'ui-ux-reviewer',        dimension: 'ui-ux',        label: 'UI/UX' },
         { profileId: 'security-reviewer',     dimension: 'security',     label: 'Security' },
+        { profileId: 'documentation-reviewer', dimension: 'documentation', label: 'Documentation' },
     ] as FinalReviewerConfig[],
     phases: [
         { id: 'initialization', label: 'Initialization', icon: '⚙' },
@@ -134,7 +135,7 @@ export async function run(taskPrompt: string, options: RunOptions): Promise<void
 | `name` | `'develop'` | `'improve'` | `'debug'` |
 | `defaultMaxConcurrentTasks` | `5` | `5` | `3` |
 | `fixerSteps` | `fix` (writable) | `fix` + `verify` (read-only review) | `fix` (writable) |
-| `finalReviewers` | efficiency / code-quality / ui-ux / security (same 4) | same 4 | same 4 |
+| `finalReviewers` | efficiency / code-quality / ui-ux / security / documentation (same 5) | same 5 | same 5 |
 | `phases` | 5 (incl. initialization) | 4 (no initialization) | 5 (incl. initialization) |
 | `titleFormatter` | `d.slice(0, 100)` | `d.slice(0, 100)` | `d.slice(0, 100)` |
 
@@ -168,11 +169,13 @@ definition.
    `ReviewResultSchema`) after it.
 
 5b. **Define `finalReviewers`** *(optional)* — the specialized reviewers run in
-   parallel each round of the final review. Each entry is a `FinalReviewerConfig`
+   the final review phase. Each entry is a `FinalReviewerConfig`
    (`{ profileId, dimension, label }`). All three shipped workflows use the same
-   four: `efficiency-reviewer`, `code-quality-reviewer`, `ui-ux-reviewer`,
-   `security-reviewer`. Omit it to fall back to `.lib`'s `DEFAULT_FINAL_REVIEWERS`
-   (the same four).
+   five: `efficiency-reviewer`, `code-quality-reviewer`, `ui-ux-reviewer`,
+   `security-reviewer`, `documentation-reviewer`. Each runs as an independent
+   "lane" that loops `review → fixer → review-fixes` over its own dimension
+   (see [`finalReviewPhase` in `.lib/README.md`](./.lib/README.md#final-reviewts)). Omit it to fall
+   back to `.lib`'s `DEFAULT_FINAL_REVIEWERS` (the same five).
 
 6. **Customize `phases`** *(optional)* — the phase chips shown in the UI.
    The `id` of each entry is matched against the backbone's `Phase` type
@@ -221,14 +224,14 @@ option). The backbone and step definitions reference profiles by `profileId`:
 | `NON_CODE_STEPS` (`.lib/steps.ts`) | `implementer`, `implement-reviewer` |
 | Scouting phase | `scout-coordinator`, `scout`, `scouting-reviewer` |
 | Planning phase | `planner`, `plan-reviewer` |
-| Final review phase | `efficiency-reviewer`, `code-quality-reviewer`, `ui-ux-reviewer`, `security-reviewer` (run in parallel; `final-reviewer` is the legacy single-reviewer) |
+| Final review phase | `efficiency-reviewer`, `code-quality-reviewer`, `ui-ux-reviewer`, `security-reviewer`, `documentation-reviewer` (each runs as an independent review → fixer → review-fixes lane; `final-reviewer` is the legacy single-reviewer) |
 | Initialization (title) | `scout` |
 
 Concrete differences across the three shipped workflows:
 
-- **`develop/` and `improve/`** ship 17 profiles each (including `worker.md`
-  and the four specialized final-reviewer profiles added with the
-  multi-dimensional review). **`debug/`** ships 16 — no `worker.md`.
+- **`develop/` and `improve/`** ship 18 profiles each (including `worker.md`
+  and the five specialized final-reviewer profiles added with the
+  multi-dimensional review). **`debug/`** ships 17 — no `worker.md`.
   (Note: `worker.md` exists in `develop/` and `improve/` profile dirs but is
   not currently consumed by the backbone code.)
 - **`fixer.md`** uses `thinkingLevel: medium` in `develop`, but

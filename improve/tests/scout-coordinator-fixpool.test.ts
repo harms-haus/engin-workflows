@@ -174,7 +174,7 @@ function reviewerRunStepTaskImpl(
     lastIssueRound = 0,
 ): unknown {
     const taskId = opts.taskId as string;
-    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
         const round = Number(taskId.match(/-round-(\d+)$/)![1]);
         if (taskId.startsWith("efficiency-reviewer-round-") && round <= lastIssueRound) {
             return {
@@ -383,8 +383,9 @@ describe("CHANGE 8: finalReviewPhase uses LanePool for fixers", () => {
             }
         }
 
-        // Tasks should be named fixer-0, fixer-1, fixer-2
-        expect(fixerTaskIds).toEqual(["fixer-0", "fixer-1", "fixer-2"]);
+        // Tasks are scoped per dimension + fix round within a lane:
+        // fixer-efficiency-0-0, fixer-efficiency-0-1, fixer-efficiency-0-2
+        expect(fixerTaskIds).toEqual(["fixer-efficiency-0-0", "fixer-efficiency-0-1", "fixer-efficiency-0-2"]);
     });
 
     it("creates fixer tasks with correct prompts containing file and issue description", async () => {
@@ -674,7 +675,7 @@ describe("CHANGE 9: executePhase passes workDir, maxConcurrentTasks, signal to f
             if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
             if (taskId === "planner") return { tasks: [], strategy: "none" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
         });
         mockPromptForStructured.mockReset();
@@ -732,7 +733,7 @@ describe("CHANGE 9: executePhase passes workDir, maxConcurrentTasks, signal to f
             if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
             if (taskId === "planner") return { tasks: [], strategy: "none" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
                 // Round 0: efficiency-reviewer reports a critical finding; round 1: all clean.
                 return reviewerRunStepTaskImpl(
                     opts,

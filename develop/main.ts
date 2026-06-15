@@ -18,6 +18,7 @@ export const workflowConfig = {
         { profileId: 'code-quality-reviewer', dimension: 'code-quality', label: 'Code Quality' },
         { profileId: 'ui-ux-reviewer', dimension: 'ui-ux', label: 'UI/UX' },
         { profileId: 'security-reviewer', dimension: 'security', label: 'Security' },
+        { profileId: 'documentation-reviewer', dimension: 'documentation', label: 'Documentation' },
     ] as FinalReviewerConfig[],
     phases: [
         { id: 'initialization', label: 'Initialization', icon: '⚙' },

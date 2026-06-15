@@ -124,17 +124,18 @@ describe("workflowConfig", () => {
         expect(workflowConfig.titleFormatter(long)).toHaveLength(100);
     });
 
-    it("finalReviewers is an array of 4 specialized reviewers", () => {
+    it("finalReviewers is an array of 5 specialized reviewers", () => {
         expect(Array.isArray(workflowConfig.finalReviewers)).toBe(true);
-        expect(workflowConfig.finalReviewers).toHaveLength(4);
+        expect(workflowConfig.finalReviewers).toHaveLength(5);
         const byDim = Object.fromEntries(
             workflowConfig.finalReviewers.map((r: { dimension: string; profileId: string }) => [r.dimension, r]),
         );
-        expect(Object.keys(byDim).sort()).toEqual(["code-quality", "efficiency", "security", "ui-ux"]);
+        expect(Object.keys(byDim).sort()).toEqual(["code-quality", "documentation", "efficiency", "security", "ui-ux"]);
         expect(byDim.efficiency.profileId).toBe("efficiency-reviewer");
         expect(byDim["code-quality"].profileId).toBe("code-quality-reviewer");
         expect(byDim["ui-ux"].profileId).toBe("ui-ux-reviewer");
         expect(byDim.security.profileId).toBe("security-reviewer");
+        expect(byDim.documentation.profileId).toBe("documentation-reviewer");
     });
 });
 

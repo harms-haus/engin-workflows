@@ -2,21 +2,36 @@ import type { StatusCallbacks, StepDefinition, WorkflowStatusTracker } from "@ha
 import { LanePool, TaskTracker, runStepTask } from "@harms-haus/engin";
 import { join } from "node:path";
 import { FinalReviewResultSchema } from "./schemas";
-import type { FinalReviewResult, FinalReviewSeverity } from "./schemas";
+import type { FinalReviewResult, FinalReviewFinding, FinalReviewSeverity } from "./schemas";
 import type { FinalReviewerConfig } from "./config";
 import { structuredOutputEvent } from "./helpers";
 
-// ─── Phase 6: Multi-Dimensional Final Review ────────────────────────────────
+// ─── Phase 6: Multi-Dimensional Final Review (per-lane loops) ───────────────
 //
-// The final review runs several specialized reviewers IN PARALLEL every round
-// (by default: efficiency, code-quality, ui-ux, security). Each reviewer
-// returns a FinalReviewResult. Findings rated medium/high/critical ("actionable")
-// are fed to the fixer LanePool; low-severity findings are recorded but do not
-// trigger fixes. After the fixers settle, the reviewers run again. A reviewer
-// always receives its OWN complete prior-round history (not just the latest
-// round) so it can tell which findings were already addressed.
+// The final review runs several specialized reviewers IN PARALLEL as independent
+// "lanes" (by default: efficiency, code-quality, ui-ux, security, documentation).
+// Each lane runs its OWN focused loop over a single dimension:
+//
+//     review ──▶ (no actionable findings? done)
+//               (actionable findings) ──▶ fixer ──▶ review-fixes ──┐
+//                                          ▲                        │
+//                                          └── still actionable? ───┘
+//                                          (loop, up to MAX_FIX_ROUNDS fixer attempts)
+//
+// - The initial `review` and the `review-fixes` pass both use the SAME reviewer
+//   profile for that lane; they differ only in stepName and prompt. The
+//   review-fixes pass is verify-focused ("confirm your prior findings were
+//   resolved; report unresolved ones and any new issues the fix introduced").
+// - If the initial review is clean (no actionable findings), the fixer and
+//   review-fixes passes are skipped entirely.
+// - Each lane maintains its own per-dimension history (all prior review AND
+//   review-fixes results) so the reviewer never re-reports already-fixed items.
+// - Each lane owns its own fixer LanePool (findings from other dimensions never
+//   mix in), and per-lane session directories keep fixer sessions isolated.
+//
+// The phase returns `true` only if EVERY lane finished clean.
 
-/** Maximum review → fix → review rounds before giving up (clean=false). */
+/** Maximum fixer attempts per lane before giving up on that lane (clean=false). */
 const MAX_FIX_ROUNDS = 3;
 
 /**
@@ -39,6 +54,7 @@ export const DEFAULT_FINAL_REVIEWERS: readonly FinalReviewerConfig[] = [
     { profileId: "code-quality-reviewer", dimension: "code-quality", label: "Code Quality" },
     { profileId: "ui-ux-reviewer", dimension: "ui-ux", label: "UI/UX" },
     { profileId: "security-reviewer", dimension: "security", label: "Security" },
+    { profileId: "documentation-reviewer", dimension: "documentation", label: "Documentation" },
 ];
 
 /**
@@ -50,10 +66,14 @@ function filePathOnly(spec: string): string {
     return spec.replace(/:\d+.*$/, "");
 }
 
-/** Build the prompt for a single reviewer, injecting its full prior-round history. */
+/** Return only the actionable (severity ≥ medium) findings from a result. */
+function actionableFindings(result: FinalReviewResult): FinalReviewFinding[] {
+    return result.applicable ? result.findings.filter((f) => isActionableSeverity(f.severity)) : [];
+}
+
+/** Build the prompt for a lane's INITIAL review pass. */
 function buildReviewerPrompt(
     reviewer: FinalReviewerConfig,
-    round: number,
     history: FinalReviewResult[],
 ): string {
     const lines: string[] = [
@@ -73,46 +93,225 @@ function buildReviewerPrompt(
     if (history.length > 0) {
         lines.push(
             "",
-            `── PRIOR REVIEW HISTORY for ${reviewer.label} (ALL previous rounds — do NOT re-report resolved findings) ──`,
+            `── PRIOR REVIEW HISTORY for ${reviewer.label} (ALL previous passes — do NOT re-report resolved findings) ──`,
             "",
-        );
-        history.forEach((prev, i) => {
-            lines.push(`### Round ${i} — ${prev.summary}`);
-            if (!prev.applicable) {
-                lines.push(`Not applicable: ${prev.notApplicableReason || "(no reason given)"}`);
-                return;
-            }
-            if (prev.findings.length === 0) {
-                lines.push("(no findings)");
-                return;
-            }
-            for (const f of prev.findings) {
-                lines.push(`- [${f.severity}] ${f.title} — ${f.file}`);
-                lines.push(`    ${f.description}`);
-            }
-        });
-        lines.push(
+            formatHistory(history),
             "",
-            `This is round ${round}. Re-assess the CURRENT state of the code. A previously-reported finding that has now been fixed must NOT be reported again. You may still report findings that were not adequately addressed, plus any NEW issues you notice.`,
+            "This is a re-review. A previously-reported finding that has now been fixed must NOT be reported again. You may still report findings that were not adequately addressed, plus any NEW issues you notice.",
         );
     }
 
     return lines.join("\n");
 }
 
+/** Build the prompt for a lane's REVIEW-FIXES (verify) pass. */
+function buildReviewFixesPrompt(
+    reviewer: FinalReviewerConfig,
+    history: FinalReviewResult[],
+    fixRound: number,
+): string {
+    const lines: string[] = [
+        `You are performing the REVIEW-FIXES pass for the ${reviewer.label} (${reviewer.dimension}) dimension of the final review.`,
+        "",
+        "A fixer has just attempted to resolve the actionable findings you (or a prior pass) reported. Re-assess the CURRENT state of the code through this dimension ONLY, with two goals:",
+        "",
+        "1. VERIFY the fixes: for each previously-reported actionable finding, confirm whether it was actually resolved. A finding that is now fixed must NOT be reported again.",
+        "2. CATCH REGRESSIONS: report any NEW issues the fix introduced (e.g. the fix was incomplete, broke something else, or regressed this dimension), plus any previously-missed real issues.",
+        "",
+        "OUTPUT RULES:",
+        "- If a finding is fully resolved, do not re-report it.",
+        "- If a finding is only partially addressed or the fix is wrong, report it again (same or new id) with the remaining problem and an updated `fixPrompt`.",
+        "- Rate each finding as before: low / medium / high / critical. Findings rated medium or higher will trigger another fixer attempt.",
+        `- Set the \`dimension\` field of your response to exactly "${reviewer.dimension}".`,
+        "- If every previously-reported finding is resolved and the fix introduced no new issues, return applicable=true with an empty findings array.",
+    ];
+
+    if (history.length > 0) {
+        lines.push(
+            "",
+            `── PRIOR REVIEW HISTORY for ${reviewer.label} (initial review + prior review-fixes passes — do NOT re-report resolved findings) ──`,
+            "",
+            formatHistory(history),
+            "",
+            `This is review-fixes pass ${fixRound + 1}. Focus on confirming the fixes landed correctly and did not introduce regressions.`,
+        );
+    }
+
+    return lines.join("\n");
+}
+
+/** Render a dimension's accumulated history as a human-readable block. */
+function formatHistory(history: FinalReviewResult[]): string {
+    const lines: string[] = [];
+    history.forEach((prev, i) => {
+        const passLabel = i === 0 ? "initial review" : `review-fixes pass ${i}`;
+        lines.push(`### ${passLabel} — ${prev.summary}`);
+        if (!prev.applicable) {
+            lines.push(`Not applicable: ${prev.notApplicableReason || "(no reason given)"}`);
+            return;
+        }
+        if (prev.findings.length === 0) {
+            lines.push("(no findings)");
+            return;
+        }
+        for (const f of prev.findings) {
+            lines.push(`- [${f.severity}] ${f.title} — ${f.file}`);
+            lines.push(`    ${f.description}`);
+        }
+    });
+    return lines.join("\n");
+}
+
+/** Shared, immutable context threaded into every review lane. */
+interface LaneContext {
+    tracker: WorkflowStatusTracker;
+    profilesDirs: string[];
+    cwd: string;
+    workDir: string;
+    maxConcurrentTasks: number | undefined;
+    apiKeys?: Record<string, string>;
+    onStatus?: StatusCallbacks;
+    signal?: AbortSignal;
+    fixerSteps: StepDefinition[];
+    titleFormatter: (description: string) => string;
+}
+
+/**
+ * Run a fixer LanePool over one set of actionable findings for a single lane.
+ * Each finding becomes one fixer task; the pool runs them in parallel (bounded
+ * by `maxConcurrentTasks`). The session dir is scoped per dimension + fix round
+ * so concurrent lanes never collide.
+ */
+async function runFixersForLane(
+    reviewer: FinalReviewerConfig,
+    findings: FinalReviewFinding[],
+    fixRound: number,
+    ctx: LaneContext,
+): Promise<void> {
+    const fixerTracker = new TaskTracker();
+    for (let i = 0; i < findings.length; i++) {
+        const finding = findings[i];
+        fixerTracker.addTask({
+            id: `fixer-${reviewer.dimension}-${fixRound}-${i}`,
+            title: `Fix [${finding.severity}] ${reviewer.label}: ${ctx.titleFormatter(finding.title)}`,
+            prompt: [
+                "You are a fix agent. Resolve the following final-review finding.",
+                "",
+                `Review dimension: ${reviewer.label}`,
+                `Severity: ${finding.severity}`,
+                `File: ${finding.file}`,
+                `Title: ${finding.title}`,
+                "",
+                "Finding:",
+                finding.description,
+                "",
+                "Fix instructions (follow exactly; make targeted, minimal changes):",
+                finding.fixPrompt,
+            ].join("\n"),
+            profile: "fixer",
+            files: [filePathOnly(finding.file)],
+            dependencies: [],
+            isCode: true,
+            phaseId: "review",
+        });
+    }
+
+    const pool = new LanePool({
+        maxConcurrentLanes: ctx.maxConcurrentTasks ?? 5,
+        profilesDirs: ctx.profilesDirs,
+        sessionBaseDir: join(ctx.workDir, "sessions", `fix-${reviewer.dimension}-${fixRound}`),
+        cwd: ctx.cwd,
+        apiKeys: ctx.apiKeys,
+        onStatus: ctx.onStatus,
+        auditLog: ctx.tracker.auditLog,
+        taskTracker: fixerTracker,
+        getStepsForTask: () => ctx.fixerSteps,
+        signal: ctx.signal,
+        phaseId: "review",
+    });
+
+    await pool.run();
+}
+
+/**
+ * Run a single reviewer lane to completion:
+ *
+ *   review ──▶ [fixer ──▶ review-fixes]*  (loop while actionable, ≤ MAX_FIX_ROUNDS fixes)
+ *
+ * Returns `true` if the lane ended clean (no actionable findings on its final
+ * pass), `false` if it exhausted its fixer budget with findings still open.
+ */
+async function runFinalReviewLane(
+    reviewer: FinalReviewerConfig,
+    ctx: LaneContext,
+): Promise<boolean> {
+    // Per-dimension history: the reviewer sees ALL of its own prior passes.
+    const history: FinalReviewResult[] = [];
+
+    // 1. Initial review pass.
+    const reviewTaskId = `${reviewer.profileId}-round-0`;
+    let result = await runStepTask<FinalReviewResult>({
+        profilesDirs: ctx.profilesDirs,
+        phaseId: "review",
+        taskId: reviewTaskId,
+        title: `Final Review: ${reviewer.label}`,
+        stepName: "final-review",
+        profileId: reviewer.profileId,
+        cwd: ctx.cwd,
+        apiKeys: ctx.apiKeys,
+        onStatus: ctx.onStatus,
+        isReadOnly: true,
+        schema: FinalReviewResultSchema,
+        prompt: buildReviewerPrompt(reviewer, []),
+        signal: ctx.signal,
+    });
+    history.push(result);
+    await ctx.tracker.auditLog.append(structuredOutputEvent(reviewer.profileId, result, reviewTaskId));
+
+    // No fixer / review-fixes if the lane is already clean.
+    let pending = actionableFindings(result);
+    if (pending.length === 0) return true;
+
+    // 2. fixer → review-fixes loop (up to MAX_FIX_ROUNDS fixer attempts).
+    for (let fixRound = 0; fixRound < MAX_FIX_ROUNDS; fixRound++) {
+        await runFixersForLane(reviewer, pending, fixRound, ctx);
+
+        const verifyTaskId = `${reviewer.profileId}-round-${fixRound + 1}`;
+        const verify = await runStepTask<FinalReviewResult>({
+            profilesDirs: ctx.profilesDirs,
+            phaseId: "review",
+            taskId: verifyTaskId,
+            title: `Review Fixes: ${reviewer.label}`,
+            stepName: "final-review-fixes",
+            profileId: reviewer.profileId,
+            cwd: ctx.cwd,
+            apiKeys: ctx.apiKeys,
+            onStatus: ctx.onStatus,
+            isReadOnly: true,
+            schema: FinalReviewResultSchema,
+            prompt: buildReviewFixesPrompt(reviewer, history, fixRound),
+            signal: ctx.signal,
+        });
+        history.push(verify);
+        await ctx.tracker.auditLog.append(structuredOutputEvent(reviewer.profileId, verify, verifyTaskId));
+
+        pending = actionableFindings(verify);
+        if (pending.length === 0) return true;
+    }
+
+    // Exhausted fixer budget for this lane with findings still open.
+    return false;
+}
+
 /**
  * Perform the multi-dimensional final review of the entire implementation.
  *
- * Each round:
- *   1. Runs every reviewer in `finalReviewers` in parallel (read-only).
- *   2. Audit-logs each result and appends it to that dimension's history.
- *   3. Collects findings rated medium/high/critical from applicable reviews.
- *   4. If there are none → clean, stop.
- *      Otherwise spawns one fixer task per actionable finding via `LanePool`
- *      and loops (up to `MAX_FIX_ROUNDS`).
+ * Every reviewer in `finalReviewers` runs as an INDEPENDENT LANE in parallel.
+ * Each lane loops `review → fixer → review-fixes` over its own dimension until
+ * clean or until it exhausts `MAX_FIX_ROUNDS` fixer attempts. A lane whose
+ * initial review is clean skips the fixer and review-fixes passes entirely.
  *
- * Returns `true` if the codebase was clean (no actionable findings) on the
- * final round.
+ * Returns `true` only if every lane finished clean.
  */
 export async function finalReviewPhase(
     tracker: WorkflowStatusTracker,
@@ -127,101 +326,14 @@ export async function finalReviewPhase(
     fixerSteps: StepDefinition[] = [{ name: "fix", profileId: "fixer", isReadOnly: false }],
     titleFormatter: (description: string) => string = (d) => d.slice(0, 100),
 ): Promise<boolean> {
-    let clean = false;
+    const ctx: LaneContext = {
+        tracker, profilesDirs, cwd, workDir, maxConcurrentTasks, apiKeys, onStatus, signal, fixerSteps, titleFormatter,
+    };
 
-    // Per-dimension history: a reviewer sees ALL of its own prior-round results.
-    const history: Record<string, FinalReviewResult[]> = {};
+    // Run all lanes in parallel; the phase is clean iff every lane is clean.
+    const results = await Promise.all(
+        finalReviewers.map((reviewer) => runFinalReviewLane(reviewer, ctx)),
+    );
 
-    for (let round = 0; round < MAX_FIX_ROUNDS; round++) {
-        // 1. Run all reviewers in parallel (independent read-only tasks).
-        const entries = await Promise.all(
-            finalReviewers.map(async (reviewer) => {
-                const result = await runStepTask<FinalReviewResult>({
-                    profilesDirs,
-                    phaseId: "review",
-                    taskId: `${reviewer.profileId}-round-${round}`,
-                    title: `Final Review: ${reviewer.label}`,
-                    stepName: "final-review",
-                    profileId: reviewer.profileId,
-                    cwd,
-                    apiKeys,
-                    onStatus,
-                    isReadOnly: true,
-                    schema: FinalReviewResultSchema,
-                    prompt: buildReviewerPrompt(reviewer, round, history[reviewer.dimension] ?? []),
-                    signal,
-                });
-                return { reviewer, result };
-            }),
-        );
-
-        // 2. Record history + audit log (sequentially for deterministic ordering).
-        for (const { reviewer, result } of entries) {
-            (history[reviewer.dimension] ??= []).push(result);
-            await tracker.auditLog.append(
-                structuredOutputEvent(reviewer.profileId, result, `${reviewer.profileId}-round-${round}`),
-            );
-        }
-
-        // 3. Collect actionable findings (severity >= medium) from applicable reviews.
-        const actionable = entries
-            .filter(({ result }) => result.applicable)
-            .flatMap(({ reviewer, result }) =>
-                result.findings
-                    .filter((f) => isActionableSeverity(f.severity))
-                    .map((finding) => ({ reviewer, finding })),
-            );
-
-        if (actionable.length === 0) {
-            clean = true;
-            break;
-        }
-
-        // 4. Spawn one fixer task per actionable finding and run via LanePool.
-        const fixerTracker = new TaskTracker();
-        for (let i = 0; i < actionable.length; i++) {
-            const { reviewer, finding } = actionable[i];
-            fixerTracker.addTask({
-                id: `fixer-${i}`,
-                title: `Fix [${finding.severity}]: ${titleFormatter(finding.title)}`,
-                prompt: [
-                    "You are a fix agent. Resolve the following final-review finding.",
-                    "",
-                    `Review dimension: ${reviewer.label}`,
-                    `Severity: ${finding.severity}`,
-                    `File: ${finding.file}`,
-                    `Title: ${finding.title}`,
-                    "",
-                    "Finding:",
-                    finding.description,
-                    "",
-                    "Fix instructions (follow exactly; make targeted, minimal changes):",
-                    finding.fixPrompt,
-                ].join("\n"),
-                profile: "fixer",
-                files: [filePathOnly(finding.file)],
-                dependencies: [],
-                isCode: true,
-                phaseId: "review",
-            });
-        }
-
-        const pool = new LanePool({
-            maxConcurrentLanes: maxConcurrentTasks ?? 5,
-            profilesDirs,
-            sessionBaseDir: join(workDir, "sessions", `fix-round-${round}`),
-            cwd,
-            apiKeys,
-            onStatus,
-            auditLog: tracker.auditLog,
-            taskTracker: fixerTracker,
-            getStepsForTask: () => fixerSteps,
-            signal,
-            phaseId: "review",
-        });
-
-        await pool.run();
-    }
-
-    return clean;
+    return results.every(Boolean);
 }

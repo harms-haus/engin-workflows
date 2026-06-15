@@ -155,7 +155,7 @@ function smartRunStepTask(opts: Record<string, unknown>): unknown {
     if (taskId === "scouting-reviewer") return { ready: true, research: "All scouted", gaps: [] };
     if (taskId === "planner") return { tasks: [], strategy: "none" };
     if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
         return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
     }
     return {};
@@ -268,14 +268,15 @@ describe("Zod Schemas", () => {
 // ─── workflowConfig ─────────────────────────────────────────────────────────
 
 describe("workflowConfig", () => {
-    it("finalReviewers lists the four specialized reviewers in order", () => {
+    it("finalReviewers lists the five specialized reviewers in order", () => {
         expect(Array.isArray(workflowConfig.finalReviewers)).toBe(true);
-        expect(workflowConfig.finalReviewers).toHaveLength(4);
+        expect(workflowConfig.finalReviewers).toHaveLength(5);
         expect(workflowConfig.finalReviewers!.map((r) => r.profileId)).toEqual([
             "efficiency-reviewer",
             "code-quality-reviewer",
             "ui-ux-reviewer",
             "security-reviewer",
+            "documentation-reviewer",
         ]);
     });
 });
@@ -615,7 +616,7 @@ describe("finalReviewPhase", () => {
         summary: "No issues",
         findings: [],
     });
-    const isReviewerCall = (taskId: string) => /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId);
+    const isReviewerCall = (taskId: string) => /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId);
 
     it("returns true when no issues found", async () => {
         const dir = tmpDir();
@@ -630,9 +631,9 @@ describe("finalReviewPhase", () => {
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
         expect(clean).toBe(true);
-        // 4 reviewers run in parallel every round → 4 runStepTask calls for round 0.
+        // 5 reviewers run as parallel lanes; one clean pass each = 5 calls.
         const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => isReviewerCall((c[0] as Record<string, unknown>).taskId?.toString() ?? ""));
-        expect(finalReviewCalls).toHaveLength(4);
+        expect(finalReviewCalls).toHaveLength(5);
     });
 
     it("spawns fixers for critical issues and returns true when fixed", async () => {
@@ -647,16 +648,16 @@ describe("finalReviewPhase", () => {
             if (taskId === "efficiency-reviewer-round-0") {
                 return { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "Needs fixes", findings: [{ id: "f1", severity: "critical", file: "src/a.ts", title: "Bug", description: "Why it matters", fixPrompt: "Fix it by ..." }] };
             }
-            // All other reviewers (and round 1+) are clean.
+            // All other reviewers (and the efficiency review-fixes pass) are clean.
             if (isReviewerCall(taskId)) return cleanResult(taskId);
             return {};
         });
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
         expect(clean).toBe(true);
-        // Round 0: 4 reviewer calls. Round 1: 4 reviewer calls → 8 total.
+        // 5 initial reviews + 1 efficiency review-fixes pass = 6 calls.
         const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => isReviewerCall((c[0] as Record<string, unknown>).taskId?.toString() ?? ""));
-        expect(finalReviewCalls).toHaveLength(8);
+        expect(finalReviewCalls).toHaveLength(6);
         expect(mockLanePoolCtor).toHaveBeenCalledTimes(1);
     });
 
@@ -698,10 +699,11 @@ describe("finalReviewPhase", () => {
 
         const clean = await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/workdir", 3);
         expect(clean).toBe(false);
-        // 3 rounds × 4 reviewers = 12 reviewer calls.
+        // Every lane stays dirty: 5 lanes × (1 review + 3 review-fixes passes)
+        // = 5 × 4 = 20 calls; 5 lanes × 3 fixer pools = 15 pools.
         const finalReviewCalls = mockRunStepTask.mock.calls.filter((c: unknown[]) => isReviewerCall((c[0] as Record<string, unknown>).taskId?.toString() ?? ""));
-        expect(finalReviewCalls).toHaveLength(12);
-        expect(mockLanePoolCtor).toHaveBeenCalledTimes(3);
+        expect(finalReviewCalls).toHaveLength(20);
+        expect(mockLanePoolCtor).toHaveBeenCalledTimes(15);
     });
 });
 

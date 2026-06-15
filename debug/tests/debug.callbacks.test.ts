@@ -70,6 +70,7 @@ function makeAllProfiles(): Map<string, AgentProfile> {
         "code-quality-reviewer",
         "ui-ux-reviewer",
         "security-reviewer",
+        "documentation-reviewer",
         "test-writer",
         "test-reviewer",
     ];

@@ -65,7 +65,7 @@ function smartRunStepTask(opts: Record<string, unknown>): unknown {
     if (taskId === "plan-reviewer" || prompt.includes("reviewing an implementation plan")) {
         return { ready: true, feedback: "Plan is well-structured and feasible", suggestions: [] };
     }
-    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
         return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
     }
     return {};
@@ -128,7 +128,7 @@ describe("Workflow Smoke Tests", () => {
                 if (taskId === "scouting-reviewer") return { ready: true, research: "Existing research", gaps: [] };
                 if (taskId === "planner") return { tasks: [], strategy: "none" };
                 if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-                if (/(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
+                if (/(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
                 return {};
             });
             mockPromptForStructured.mockReset();

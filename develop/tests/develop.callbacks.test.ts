@@ -118,7 +118,7 @@ function smartRunStepTask(opts: Record<string, unknown>): unknown {
     if (taskId === "plan-reviewer") {
         return { ready: true, feedback: "Plan approved", suggestions: [] };
     }
-    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+    if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
         return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
     }
     return {};
@@ -171,7 +171,7 @@ function setupRunWithTaskMocks() {
             };
         }
         if (taskId === "plan-reviewer") return { ready: true, feedback: "Plan approved", suggestions: [] };
-        if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+        if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
             return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
         }
         return {};
@@ -214,7 +214,7 @@ function setupRunWithFailedTaskMocks() {
             };
         }
         if (taskId === "plan-reviewer") return { ready: true, feedback: "Plan approved", suggestions: [] };
-        if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+        if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
             return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
         }
         return {};
@@ -282,7 +282,7 @@ describe("Workflow-level callbacks", () => {
             if (taskId === "scouting-reviewer") return { ready: true, research: "Resumed research", gaps: [] };
             if (taskId === "planner") return { tasks: [], strategy: "none" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
                 return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             }
             return {};
@@ -417,7 +417,7 @@ describe("Workflow-level callbacks", () => {
             if (taskId === "scouting-reviewer") return { ready: true, research: "Scouted", gaps: [] };
             if (taskId === "planner") return { tasks: [], strategy: "none" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
                 return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             }
             return {};
@@ -622,7 +622,7 @@ describe("Workflow-level callbacks", () => {
             if (taskId === "scouting-reviewer") return { ready: true, research: "Resumed", gaps: [] };
             if (taskId === "planner") return { tasks: [], strategy: "none" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
-            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security)-reviewer-round-\d+$/.test(taskId)) {
+            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) {
                 return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             }
             return {};
