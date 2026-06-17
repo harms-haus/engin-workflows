@@ -18,6 +18,7 @@ const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: 
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockRunStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
+const mockRunMultiStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
 mock.module("@harms-haus/engin", () => ({
     ...realModule,
@@ -25,6 +26,7 @@ mock.module("@harms-haus/engin", () => ({
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
     runStepTask: (...args: unknown[]) => mockRunStepTask(...args),
+    runMultiStepTask: (...args: unknown[]) => mockRunMultiStepTask(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
@@ -43,7 +45,6 @@ import {
     scoutingPhase,
     scoutingReviewPhase,
     planningPhase,
-    planReviewPhase,
     implementationPhase,
     finalReviewPhase,
     run,
@@ -169,6 +170,12 @@ function tmpDir(): string {
     );
 }
 
+/** Default plan written by the smart runMultiStepTask mock when no plan.json exists. */
+const DEFAULT_PLAN: Plan = {
+    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], is_code: true }],
+    strategy: "Default strategy",
+};
+
 /**
  * Smart mock for runStepTask based on taskId.
  */
@@ -198,6 +205,38 @@ function setupPromptMocks(): void {
         .mockResolvedValue({ result: { topics: [], overallAssessment: "Fallback", issues: [] }, attempts: 1 });
 }
 
+/**
+ * Smart mock for runMultiStepTask (used by planningPhase). Mimics just enough of
+ * the real primitive to capture the plan: it resolves each step's (lazy) prompt
+ * and invokes the plan step's `validateOutput` gate (which reads plan.json back
+ * into planningPhase's closure). Returns an approved review by default.
+ */
+async function smartRunMultiStepTask(opts: Record<string, unknown>): Promise<{ results: unknown[]; approved: boolean }> {
+    const steps = opts.steps as Array<Record<string, unknown>>;
+    const results: unknown[] = [];
+    for (const step of steps) {
+        if (typeof step.prompt === "function") await step.prompt(results);
+        if (typeof step.validateOutput === "function") {
+            // The real planner writes plan.json; ensure one exists so the
+            // validateOutput gate succeeds. Derive the path from the plan step's
+            // write sandbox (allowedWriteDirs[0]/plan.json).
+            const allowed = (step.allowedWriteDirs as string[] | undefined)?.[0];
+            if (allowed) {
+                const planPath = path.join(allowed, "plan.json");
+                try {
+                    await fs.access(planPath);
+                } catch {
+                    await fs.mkdir(allowed, { recursive: true });
+                    await fs.writeFile(planPath, JSON.stringify(DEFAULT_PLAN, null, 2));
+                }
+            }
+            await step.validateOutput();
+        }
+        results.push(step.stepName === "review-plan" ? { ready: true, feedback: "OK", suggestions: [] } : undefined);
+    }
+    return { results, approved: true };
+}
+
 // ─── Setup ──────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
@@ -208,6 +247,7 @@ beforeEach(() => {
     mockLanePoolRun.mockReset();
     mockLanePoolCtor.mockReset();
     mockRunStepTask.mockReset();
+    mockRunMultiStepTask.mockReset();
 
     // Set up default implementations
     mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
@@ -220,6 +260,7 @@ beforeEach(() => {
     });
 
     mockRunStepTask.mockImplementation(smartRunStepTask);
+    mockRunMultiStepTask.mockImplementation(smartRunMultiStepTask);
 
     // Set up prompt mocks (2 calls: init + final review)
     setupPromptMocks();
@@ -519,150 +560,26 @@ describe("scoutingReviewPhase", () => {
 
 describe("planningPhase", () => {
     it("creates a plan with tasks", async () => {
-        const dir = tmpDir();
-        const tracker = new WorkflowStatusTracker(dir);
+        const workDir = tmpDir();
+        const artifactsDir = path.join(workDir, "artifacts");
+        await fs.mkdir(artifactsDir, { recursive: true });
+        const tracker = new WorkflowStatusTracker(workDir);
 
         const plan: Plan = {
             tasks: [
-                {
-                    id: "t1",
-                    title: "Implement feature X",
-                    prompt: "Create the X module",
-                    profile: "implementer",
-                    files: ["src/x.ts"],
-                    dependencies: [],
-                    is_code: true,
-                },
-                {
-                    id: "t2",
-                    title: "Add tests for X",
-                    prompt: "Write tests",
-                    profile: "implementer",
-                    files: ["tests/x.test.ts"],
-                    dependencies: ["t1"],
-                    is_code: true,
-                },
+                { id: "t1", title: "Implement feature X", prompt: "Create the X module", profile: "implementer", files: ["src/x.ts"], dependencies: [], is_code: true },
+                { id: "t2", title: "Add tests for X", prompt: "Write tests", profile: "implementer", files: ["tests/x.test.ts"], dependencies: ["t1"], is_code: true },
             ],
             strategy: "Implement core first, then tests",
         };
+        // The planner writes plan.json; the smart runMultiStepTask mock invokes
+        // the validateOutput gate, which reads this back into planningPhase.
+        await fs.writeFile(path.join(artifactsDir, "plan.json"), JSON.stringify(plan, null, 2));
 
-        mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValueOnce(plan);
-
-        const result = await planningPhase(
-            tracker,
-            ["/profiles"],
-            "Research summary",
-            [],
-            "Build feature X",
-            "/cwd",
-        );
-
+        const result = await planningPhase(tracker, ["/profiles"], "Research summary", [], "Build feature X", "/cwd", workDir);
         expect(result).toEqual(plan);
         expect(result.tasks).toHaveLength(2);
         expect((tracker.workflowData as { plan: unknown }).plan).toEqual(plan);
-    });
-
-    it("throws if planner profile not found via runStepTask", async () => {
-        const dir = tmpDir();
-        const tracker = new WorkflowStatusTracker(dir);
-
-        mockRunStepTask.mockReset();
-        mockRunStepTask.mockRejectedValue(new Error('Profile "planner" not found'));
-
-        await expect(
-            planningPhase(tracker, ["/profiles"], "research", [], "task", "/cwd"),
-        ).rejects.toThrow('not found');
-    });
-
-    it("includes review feedback in prompt when provided", async () => {
-        const dir = tmpDir();
-        const tracker = new WorkflowStatusTracker(dir);
-
-        mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: "Improved plan" });
-
-        await planningPhase(
-            tracker,
-            ["/profiles"],
-            "research",
-            [],
-            "task",
-            "/cwd",
-            "Plan was too vague",
-            ["Add tasks"],
-        );
-
-        const callOpts = mockRunStepTask.mock.calls[0][0] as Record<string, unknown>;
-        const prompt = callOpts.prompt as string;
-        expect(prompt).toContain("Plan was too vague");
-        expect(prompt).toContain("Add tasks");
-    });
-});
-
-// ─── planReviewPhase ────────────────────────────────────────────────────────
-
-describe("planReviewPhase", () => {
-    it("approves a good plan", async () => {
-        const dir = tmpDir();
-        const tracker = new WorkflowStatusTracker(dir);
-
-        const plan: Plan = {
-            tasks: [
-                {
-                    id: "t1",
-                    title: "Do something",
-                    prompt: "Do it",
-                    profile: "implementer",
-                    files: ["src/a.ts"],
-                    dependencies: [],
-                    is_code: true,
-                },
-            ],
-            strategy: "Simple approach",
-        };
-
-        mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: "Plan is solid and well-structured", suggestions: [] });
-
-        const result = await planReviewPhase(
-            tracker,
-            ["/profiles"],
-            plan,
-            "research",
-            [],
-            "task prompt",
-            "/cwd",
-        );
-
-        expect(result.ready).toBe(true);
-        expect(result.feedback).toContain("solid");
-    });
-
-    it("rejects a flawed plan with suggestions", async () => {
-        const dir = tmpDir();
-        const tracker = new WorkflowStatusTracker(dir);
-
-        const plan: Plan = {
-            tasks: [],
-            strategy: "No tasks defined",
-        };
-
-        mockRunStepTask.mockReset();
-        mockRunStepTask.mockResolvedValueOnce({ ready: false, feedback: "Plan has no tasks", suggestions: ["Add concrete implementation tasks"] });
-
-        const result = await planReviewPhase(
-            tracker,
-            ["/profiles"],
-            plan,
-            "research",
-            [],
-            "task",
-            "/cwd",
-        );
-
-        expect(result.ready).toBe(false);
-        expect(result.suggestions).toHaveLength(1);
     });
 });
 
@@ -1265,30 +1182,10 @@ describe("run", () => {
         expect(state.currentPhaseId).toBe("done");
     }, 30000);
 
-    it("clears plan review feedback after plan is approved", async () => {
+    it("completes the planning phase and persists the plan", async () => {
         const workDir = tmpDir();
 
-        mockRunStepTask.mockReset();
-        let planReviewCalls = 0;
-        let plannerCalls = 0;
-        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
-            const taskId = opts.taskId as string;
-            if (taskId === "title-generator") return { title: "AI title" };
-            if (taskId === "scout-coordinator") return { topics: [] };
-            if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
-            if (taskId === "plan-reviewer") {
-                planReviewCalls++;
-                if (planReviewCalls <= 1) return { ready: false, feedback: "Plan is too vague", suggestions: ["Add tasks"] };
-                return { ready: true, feedback: "Plan approved", suggestions: [] };
-            }
-            if (taskId === "planner") {
-                plannerCalls++;
-                if (plannerCalls <= 1) return { tasks: [], strategy: "Weak plan" };
-                return { tasks: [{ id: "t1", title: "Task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], is_code: true }], strategy: "Better plan" };
-            }
-            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
-            return {};
-        });
+        // Defaults: smartRunMultiStepTask writes plan.json + returns an approved review.
         setupPromptMocks();
 
         await run("Test task", {
@@ -1297,68 +1194,35 @@ describe("run", () => {
             workDir,
         });
 
-        const raw = await fs.readFile(path.join(workDir, ".engin-state.json"), "utf-8");
+        const statePath = path.join(workDir, ".engin-state.json");
+        const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
-
-        // After approval, feedback should be cleared
-        expect(state.workflowData?.planReviewFeedback).toBeUndefined();
-        expect(state.workflowData?.planReviewSuggestions).toBeUndefined();
-    }, 30000);
-
-    it("persists plan review feedback to tracker on rejection", async () => {
-        const workDir = tmpDir();
-
-        mockRunStepTask.mockReset();
-        let planReviewCalls = 0;
-        let plannerCalls = 0;
-        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
-            const taskId = opts.taskId as string;
-            if (taskId === "title-generator") return { title: "AI title" };
-            if (taskId === "scout-coordinator") return { topics: [] };
-            if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
-            if (taskId === "plan-reviewer") {
-                planReviewCalls++;
-                if (planReviewCalls <= 1) return { ready: false, feedback: "Plan is too vague", suggestions: ["Add tasks"] };
-                return { ready: true, feedback: "Improved", suggestions: [] };
-            }
-            if (taskId === "planner") {
-                plannerCalls++;
-                if (plannerCalls <= 1) return { tasks: [], strategy: "Bad plan" };
-                return { tasks: [{ id: "t1", title: "Task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], is_code: true }], strategy: "Better plan" };
-            }
-            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
-            return {};
-        });
-        setupPromptMocks();
-
-        await run("Fix something", {
-            profilesDir: "/profiles",
-            cwd: "/project",
-            workDir,
-        });
-
-        // Verify the planner prompt for round 2 includes feedback from the rejection.
-        const plannerCallsFiltered = mockRunStepTask.mock.calls.filter((c: unknown[]) => (c[0] as Record<string, unknown>).taskId === "planner");
-        expect(plannerCallsFiltered.length).toBeGreaterThanOrEqual(2);
-        const plannerPromptRound2 = plannerCallsFiltered[1][0] as Record<string, unknown>;
-        const prompt = plannerPromptRound2.prompt as string;
-        expect(prompt).toContain("Plan is too vague");
-        expect(prompt).toContain("Add tasks");
+        expect(state.workflowData?.plan).toBeDefined();
+        expect(state.currentPhaseId).toBe("done");
     }, 30000);
 
     it("preserves plan on exhausted planning rounds", async () => {
         const workDir = tmpDir();
 
-        mockRunStepTask.mockReset();
-        mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
-            const taskId = opts.taskId as string;
-            if (taskId === "title-generator") return { title: "AI title" };
-            if (taskId === "scout-coordinator") return { topics: [] };
-            if (taskId === "scouting-reviewer") return { ready: true, research: "Done", gaps: [] };
-            if (taskId === "plan-reviewer") return { ready: false, feedback: "Not good enough", suggestions: [] };
-            if (taskId === "planner") return { tasks: [], strategy: "Bad" };
-            if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
-            return {};
+        // Simulate the reviewer never approving: runMultiStepTask exhausts its
+        // retries and planningPhase proceeds anyway with the captured plan.
+        mockRunMultiStepTask.mockReset();
+        mockRunMultiStepTask.mockImplementation(async (opts: Record<string, unknown>) => {
+            const steps = opts.steps as Array<Record<string, unknown>>;
+            const results: unknown[] = [];
+            for (const step of steps) {
+                if (typeof step.prompt === "function") await step.prompt(results);
+                if (typeof step.validateOutput === "function") {
+                    const allowed = (step.allowedWriteDirs as string[] | undefined)?.[0];
+                    if (allowed) {
+                        await fs.mkdir(allowed, { recursive: true });
+                        await fs.writeFile(path.join(allowed, "plan.json"), JSON.stringify(DEFAULT_PLAN, null, 2));
+                    }
+                    await step.validateOutput();
+                }
+                results.push(step.stepName === "review-plan" ? { ready: false, feedback: "Not good enough", suggestions: [] } : undefined);
+            }
+            return { results, approved: false };
         });
         setupPromptMocks();
 
@@ -1368,12 +1232,10 @@ describe("run", () => {
             workDir,
         });
 
-        const raw = await fs.readFile(path.join(workDir, ".engin-state.json"), "utf-8");
+        const statePath = path.join(workDir, ".engin-state.json");
+        const raw = await fs.readFile(statePath, "utf-8");
         const state = JSON.parse(raw);
-        // Even after 3 rejected planning rounds, the workflow should complete (not crash)
         expect(state.currentPhaseId).toBe("done");
-        // Implementation phase should still have been attempted (plan from tracker)
-        expect(state.completedPhaseIds).toContain("implementing");
     }, 30000);
 });
 

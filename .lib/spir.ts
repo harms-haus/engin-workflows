@@ -10,7 +10,7 @@ import { WorkflowStatusTracker, resolveProfilesDirs } from "@harms-haus/engin";
 import type { WorkflowConfig, SpirRunOptions } from "./config";
 import type { Plan, ScoutingGap } from "./schemas";
 import { scoutingPhase, scoutingReviewPhase } from "./scouting";
-import { planningPhase, planReviewPhase } from "./planning";
+import { planningPhase } from "./planning";
 import { implementationPhase } from "./implementation";
 import { finalReviewPhase } from "./final-review";
 import { initializationPhase } from "./initialization";
@@ -49,11 +49,8 @@ export interface RunState {
     scoutingReports: unknown[];
     scoutingRounds: number;
     scoutingGaps: ScoutingGap[];
-    /** Key files the scouting review surfaced for the planner; threaded into planningPhase + planReviewPhase. */
+    /** Key files the scouting review surfaced for the planner; threaded into the planning phase. */
     scoutingFiles?: string[];
-    planningRounds: number;
-    planReviewFeedback?: string;
-    planReviewSuggestions?: string[];
 }
 
 export interface SpirWorkflowData {
@@ -61,8 +58,6 @@ export interface SpirWorkflowData {
     plan?: Plan;
     scoutingReports?: unknown[];
     scoutingFiles?: string[];
-    planReviewFeedback?: string;
-    planReviewSuggestions?: string[];
 }
 
 // ─── Helper: complete a phase transition ────────────────────────────────────
@@ -141,11 +136,7 @@ export async function executePhase(
         maxConcurrentTasks, config, apiKeys, onStatus, signal, rendererRegistry,
     } = ctx;
     const phaseStartTime = Date.now();
-    const round = (phase === "scouting")
-        ? state.scoutingRounds
-        : (phase === "planning")
-            ? state.planningRounds
-            : 0;
+    const round = phase === "scouting" ? state.scoutingRounds : 0;
     onStatus?.onPhaseStart?.({ phase, round });
     onStatus?.onSidebarUpdate?.({ indicator: getPhaseIndicator(phase, config.phases) });
 
@@ -207,9 +198,11 @@ export async function executePhase(
                 }
             }
 
+            // planningPhase runs plan → review-plan as a single two-step task
+            // that owns its own replan-on-rejection loop internally, so this
+            // case just runs it once and advances.
             state.plan = await planningPhase(
                 tracker, profilesDirs, state.research, state.scoutingFiles ?? [], taskPrompt, cwd, workDir,
-                state.planReviewFeedback, state.planReviewSuggestions,
                 apiKeys, onStatus, signal,
                 rendererRegistry,
             );
@@ -218,31 +211,6 @@ export async function executePhase(
                 state.plan = getSpirData(tracker).plan;
             }
 
-            const planReview = await planReviewPhase(
-                tracker, profilesDirs, workDir, state.research, state.scoutingFiles ?? [], taskPrompt, cwd, apiKeys, onStatus, signal,
-                rendererRegistry,
-            );
-            state.planningRounds++;
-
-            if (planReview.ready) {
-                state.planReviewFeedback = undefined;
-                state.planReviewSuggestions = undefined;
-                tracker.setWorkflowData({ planReviewFeedback: undefined, planReviewSuggestions: undefined });
-                await completePhase(phase, tracker, onStatus, phaseStartTime);
-                break;
-            }
-
-            // Not ready — loop back to planning (max 3 rounds)
-            state.planReviewFeedback = planReview.feedback;
-            state.planReviewSuggestions = planReview.suggestions;
-            tracker.setWorkflowData({ planReviewFeedback: planReview.feedback, planReviewSuggestions: planReview.suggestions });
-            if (state.planningRounds < 3) {
-                state.plan = undefined;
-                await completePhase(phase, tracker, onStatus, phaseStartTime, "planning");
-                return "planning";
-            }
-
-            // Exhausted rounds — proceed anyway with current plan
             await completePhase(phase, tracker, onStatus, phaseStartTime);
             break;
         }
@@ -338,9 +306,6 @@ export async function runSpir(
         scoutingRounds: 0,
         scoutingGaps: [],
         scoutingFiles: getSpirData(tracker).scoutingFiles ? [...getSpirData(tracker).scoutingFiles!] : undefined,
-        planningRounds: 0,
-        planReviewFeedback: getSpirData(tracker).planReviewFeedback,
-        planReviewSuggestions: getSpirData(tracker).planReviewSuggestions ? [...getSpirData(tracker).planReviewSuggestions!] : undefined,
     };
 
     // ── Execute phases from the starting point ──────────────────────

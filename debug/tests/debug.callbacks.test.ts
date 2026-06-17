@@ -17,6 +17,7 @@ const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: 
 const mockResolveProfilesDirs = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
+const mockRunMultiStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
 mock.module("@harms-haus/engin", () => ({
     ...realModule,
@@ -25,6 +26,7 @@ mock.module("@harms-haus/engin", () => ({
     loadProfiles: (...args: unknown[]) => mockLoadProfiles(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
     resolveProfilesDirs: (...args: unknown[]) => mockResolveProfilesDirs(...args),
+    runMultiStepTask: (...args: unknown[]) => mockRunMultiStepTask(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
@@ -38,7 +40,7 @@ mock.module("@harms-haus/engin", () => ({
 
 // ─── Imports (after mocks) ─────────────────────────────────────────────────
 
-import { run } from "../main";
+import { run, type Plan } from "../main";
 import { WorkflowStatusTracker } from "@harms-haus/engin";
 
 // ─── Test Fixtures ──────────────────────────────────────────────────────────
@@ -226,6 +228,35 @@ function setupRunWithFailedTaskMocks() {
         .mockResolvedValueOnce({ result: { dimension: "efficiency", applicable: true, notApplicableReason: "", summary: "No issues", findings: [] }, attempts: 1 });
 }
 
+/** Default plan written by the smart runMultiStepTask mock when no plan.json exists. */
+const DEFAULT_PLAN: Plan = {
+    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], is_code: true }],
+    strategy: "Default strategy",
+};
+
+async function smartRunMultiStepTask(opts: Record<string, unknown>): Promise<{ results: unknown[]; approved: boolean }> {
+    const steps = opts.steps as Array<Record<string, unknown>>;
+    const results: unknown[] = [];
+    for (const step of steps) {
+        if (typeof step.prompt === "function") await step.prompt(results);
+        if (typeof step.validateOutput === "function") {
+            const allowed = (step.allowedWriteDirs as string[] | undefined)?.[0];
+            if (allowed) {
+                const planPath = path.join(allowed, "plan.json");
+                try {
+                    await fs.access(planPath);
+                } catch {
+                    await fs.mkdir(allowed, { recursive: true });
+                    await fs.writeFile(planPath, JSON.stringify(DEFAULT_PLAN, null, 2));
+                }
+            }
+            await step.validateOutput();
+        }
+        results.push(step.stepName === "review-plan" ? { ready: true, feedback: "OK", suggestions: [] } : undefined);
+    }
+    return { results, approved: true };
+}
+
 // ─── Setup ──────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
@@ -236,11 +267,13 @@ beforeEach(() => {
     mockResolveProfilesDirs.mockReset();
     mockLanePoolRun.mockReset();
     mockLanePoolCtor.mockReset();
+    mockRunMultiStepTask.mockReset();
     // Default: any final-review reviewer call returns a clean FinalReviewResult.
     // Per-test mockResolvedValueOnce values (for the sequential phases) take
     // priority; this impl only handles the 4 parallel reviewer calls once those
     // are spent.
     mockPromptForStructured.mockImplementation(defaultFinalReviewCleanImpl());
+    mockRunMultiStepTask.mockImplementation(smartRunMultiStepTask);
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -491,18 +524,12 @@ describe("Workflow-level callbacks", () => {
             onStatus: { onAgentSpawn, onAgentComplete },
         });
 
-        const spawnCalls = onAgentSpawn.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string });
-        const completeCalls = onAgentComplete.mock.calls.map((c: unknown[]) => c[0] as { agentId: string; profile: string });
-
-        const plannerSpawns = spawnCalls.filter((c) => c.agentId.includes("planner"));
-        const plannerCompletes = completeCalls.filter((c) => c.agentId.includes("planner"));
-
-        expect(plannerSpawns.length).toBeGreaterThanOrEqual(1);
-        expect(plannerCompletes.length).toBeGreaterThanOrEqual(1);
-
-        for (const spawn of plannerSpawns) {
-            expect(spawn.profile).toBe("planner");
-        }
+        // The planner now runs inside the mocked runMultiStepTask (one task,
+        // two steps: plan → review-plan), so verify it was invoked with a plan
+        // step rather than checking an onAgentSpawn with agentId "planner".
+        expect(mockRunMultiStepTask).toHaveBeenCalledTimes(1);
+        const multiOpts = mockRunMultiStepTask.mock.calls[0][0] as Record<string, unknown>;
+        expect((multiOpts.steps as Array<{ stepName: string }>)[0].stepName).toBe("plan");
     });
 
     // 9. onDecision called for reviews

@@ -17,6 +17,7 @@ const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: 
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockRunStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
+const mockRunMultiStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
 mock.module("@harms-haus/engin", () => ({
     ...realModule,
@@ -25,6 +26,7 @@ mock.module("@harms-haus/engin", () => ({
     loadProfiles: (...args: unknown[]) => mockLoadProfiles(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
     runStepTask: (...args: unknown[]) => mockRunStepTask(...args),
+    runMultiStepTask: (...args: unknown[]) => mockRunMultiStepTask(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
@@ -39,7 +41,7 @@ mock.module("@harms-haus/engin", () => ({
 
 // ─── Imports (after mocks) ─────────────────────────────────────────────────
 
-import { run } from "../main";
+import { run, type Plan } from "../main";
 import { WorkflowStatusTracker } from "@harms-haus/engin";
 
 // ─── Test Fixtures ──────────────────────────────────────────────────────────
@@ -96,6 +98,12 @@ function tmpDir(): string {
         `develop-callbacks-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
     );
 }
+
+/** Default plan written by the smart runMultiStepTask mock when no plan.json exists. */
+const DEFAULT_PLAN: Plan = {
+    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], is_code: true }],
+    strategy: "Default strategy",
+};
 
 /**
  * Smart mock for runStepTask.
@@ -230,12 +238,46 @@ function setupRunWithFailedTaskMocks() {
         .mockResolvedValue({ result: { topics: [], overallAssessment: "Fallback", issues: [] }, attempts: 1 });
 }
 
+/**
+ * Smart mock for runMultiStepTask (used by planningPhase). Mimics just enough of
+ * the real primitive to capture the plan: it resolves each step's (lazy) prompt
+ * and invokes the plan step's `validateOutput` gate (which reads plan.json back
+ * into planningPhase's closure). Returns an approved review by default.
+ */
+async function smartRunMultiStepTask(opts: Record<string, unknown>): Promise<{ results: unknown[]; approved: boolean }> {
+    const steps = opts.steps as Array<Record<string, unknown>>;
+    const results: unknown[] = [];
+    for (const step of steps) {
+        if (typeof step.prompt === "function") await step.prompt(results);
+        if (typeof step.validateOutput === "function") {
+            // The real planner writes plan.json; ensure one exists so the
+            // validateOutput gate succeeds. Derive the path from the plan step's
+            // write sandbox (allowedWriteDirs[0]/plan.json).
+            const allowed = (step.allowedWriteDirs as string[] | undefined)?.[0];
+            if (allowed) {
+                const planPath = path.join(allowed, "plan.json");
+                try {
+                    await fs.access(planPath);
+                } catch {
+                    await fs.mkdir(allowed, { recursive: true });
+                    await fs.writeFile(planPath, JSON.stringify(DEFAULT_PLAN, null, 2));
+                }
+            }
+            await step.validateOutput();
+        }
+        results.push(step.stepName === "review-plan" ? { ready: true, feedback: "OK", suggestions: [] } : undefined);
+    }
+    return { results, approved: true };
+}
+
 // ─── Setup ──────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
     // Manually reset mock call counters only (not implementations/return values)
     // We don't use mock.clearAllMocks() because it can interfere with mockResolvedValueOnce queues
     // Each test sets up its own mocks via setupHappyPathMocks or equivalent.
+    mockRunMultiStepTask.mockReset();
+    mockRunMultiStepTask.mockImplementation(smartRunMultiStepTask);
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -462,10 +504,12 @@ describe("Workflow-level callbacks", () => {
             onStatus: { onAgentSpawn, onAgentComplete },
         });
 
-        const plannerCalls = mockRunStepTask.mock.calls.filter(
-            (call: unknown[]) => (call[0] as Record<string, unknown>).taskId === "planner"
-        );
-        expect(plannerCalls.length).toBeGreaterThanOrEqual(1);
+        // The planner now runs inside the mocked runMultiStepTask (one task,
+        // two steps: plan → review-plan), so assert it was invoked rather than
+        // checking a runStepTask call with taskId === "planner".
+        expect(mockRunMultiStepTask).toHaveBeenCalledTimes(1);
+        const multiOpts = mockRunMultiStepTask.mock.calls[0][0] as Record<string, unknown>;
+        expect((multiOpts.steps as Array<{ stepName: string }>)[0].stepName).toBe("plan");
     });
 
     // 9. onDecision called for reviews

@@ -17,6 +17,7 @@ const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: 
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockRunStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
+const mockRunMultiStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
 mock.module("@harms-haus/engin", () => ({
     ...realModule,
@@ -25,6 +26,7 @@ mock.module("@harms-haus/engin", () => ({
     loadProfiles: (...args: unknown[]) => mockLoadProfiles(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
     runStepTask: (...args: unknown[]) => mockRunStepTask(...args),
+    runMultiStepTask: (...args: unknown[]) => mockRunMultiStepTask(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
@@ -120,6 +122,29 @@ function smartRunStepTask(opts: Record<string, unknown>): unknown {
     }
     if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
     return {};
+}
+
+/**
+ * Smart mock for runMultiStepTask (used by planningPhase). Writes a minimal
+ * plan.json into the plan step's write sandbox and returns an approved review
+ * so the real planningPhase closure captures the plan and proceeds.
+ */
+async function smartRunMultiStepTask(opts: Record<string, unknown>): Promise<{ results: unknown[]; approved: boolean }> {
+    const steps = opts.steps as Array<Record<string, unknown>>;
+    const results: unknown[] = [];
+    for (const step of steps) {
+        if (typeof step.prompt === "function") await step.prompt(results);
+        if (typeof step.validateOutput === "function") {
+            const allowed = (step.allowedWriteDirs as string[] | undefined)?.[0];
+            if (allowed) {
+                await fs.mkdir(allowed, { recursive: true });
+                await fs.writeFile(path.join(allowed, "plan.json"), JSON.stringify({ tasks: [], strategy: "none" }, null, 2));
+            }
+            await step.validateOutput();
+        }
+        results.push(step.stepName === "review-plan" ? { ready: true, feedback: "OK", suggestions: [] } : undefined);
+    }
+    return { results, approved: true };
 }
 
 /** Set up default mocks for a minimal successful run (no tasks). */
@@ -218,6 +243,9 @@ function setupRunWithFailedTaskMocks() {
 
 beforeEach(() => {
     mock.clearAllMocks();
+    // planningPhase now drives plan + review through runMultiStepTask; give it a
+    // working default so the real orchestrator (run()) completes planning.
+    mockRunMultiStepTask.mockImplementation(smartRunMultiStepTask);
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -438,11 +466,9 @@ describe("Workflow-level callbacks", () => {
 
         // runStepTask fires onAgentSpawn and onAgentComplete internally,
         // but since we mock runStepTask, those callbacks won't fire through the mock.
-        // Verify that runStepTask was called with the right args.
-        const plannerCalls = mockRunStepTask.mock.calls.filter(
-            (call: unknown[]) => (call[0] as Record<string, unknown>).taskId === "planner"
-        );
-        expect(plannerCalls.length).toBeGreaterThanOrEqual(1);
+        // Planning now runs the planner via runMultiStepTask (not runStepTask),
+        // so verify that primitive was invoked during the planning phase.
+        expect(mockRunMultiStepTask.mock.calls.length).toBeGreaterThanOrEqual(1);
     });
 
     // 9. onDecision called for reviews

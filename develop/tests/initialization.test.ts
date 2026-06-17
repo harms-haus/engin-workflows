@@ -14,6 +14,7 @@ const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: 
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockRunStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
+const mockRunMultiStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
 mock.module("@harms-haus/engin", () => ({
     ...realEngin,
@@ -21,6 +22,7 @@ mock.module("@harms-haus/engin", () => ({
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
     runStepTask: (...args: unknown[]) => mockRunStepTask(...args),
+    runMultiStepTask: (...args: unknown[]) => mockRunMultiStepTask(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
@@ -56,11 +58,36 @@ function makeHarnessResult() {
     return { session: makeHarness(), sessionId: "test-session", dispose: mock() };
 }
 
+/** Default plan written by the smart runMultiStepTask mock when no plan.json exists. */
+const DEFAULT_PLAN = {
+    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], is_code: true }],
+    strategy: "Default strategy",
+};
+
+async function smartRunMultiStepTask(opts: Record<string, unknown>): Promise<{ results: unknown[]; approved: boolean }> {
+    const steps = opts.steps as Array<Record<string, unknown>>;
+    const results: unknown[] = [];
+    for (const step of steps) {
+        if (typeof step.prompt === "function") await step.prompt(results);
+        if (typeof step.validateOutput === "function") {
+            const allowed = (step.allowedWriteDirs as string[] | undefined)?.[0];
+            if (allowed) {
+                const planPath = path.join(allowed, "plan.json");
+                try { await fs.access(planPath); } catch { await fs.mkdir(allowed, { recursive: true }); await fs.writeFile(planPath, JSON.stringify(DEFAULT_PLAN, null, 2)); }
+            }
+            await step.validateOutput();
+        }
+        results.push(step.stepName === "review-plan" ? { ready: true, feedback: "OK", suggestions: [] } : undefined);
+    }
+    return { results, approved: true };
+}
+
 /** Setup standard mocks for initialization tests. */
 function setupStandardMocks() {
     mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
     mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
+    mockRunMultiStepTask.mockImplementation(smartRunMultiStepTask);
     mockRunStepTask.mockImplementation((opts: Record<string, unknown>) => {
         const taskId = opts.taskId as string;
         if (taskId === "title-generator") return { title: "Refactor auth module" };

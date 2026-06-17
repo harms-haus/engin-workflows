@@ -35,7 +35,6 @@ import {
     scoutingPhase,
     scoutingReviewPhase,
     planningPhase,
-    planReviewPhase,
     implementationPhase,
     finalReviewPhase,
     ScoutingTopicSchema,
@@ -153,9 +152,6 @@ describe("Re-exported phase functions", () => {
     });
     it("planningPhase is a function", () => {
         expect(typeof planningPhase).toBe("function");
-    });
-    it("planReviewPhase is a function", () => {
-        expect(typeof planReviewPhase).toBe("function");
     });
     it("implementationPhase is a function", () => {
         expect(typeof implementationPhase).toBe("function");

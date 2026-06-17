@@ -16,7 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import type { AgentProfile } from "@harms-haus/engin";
-import type { FinalReviewTopics } from "../main.ts";
+import type { FinalReviewTopics, Plan } from "../main.ts";
 
 // Capture real module before mocking so we can restore it in afterAll.
 const realModule = Object.assign({}, await import("@harms-haus/engin"));
@@ -29,6 +29,7 @@ const mockLoadProfilesFromDirs = mock() as ReturnType<typeof mock> & ((...args: 
 const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockRunStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
+const mockRunMultiStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
 mock.module("@harms-haus/engin", () => ({
     ...realModule,
@@ -36,6 +37,7 @@ mock.module("@harms-haus/engin", () => ({
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
     loadProfilesFromDirs: (...args: unknown[]) => mockLoadProfilesFromDirs(...args),
     runStepTask: (...args: unknown[]) => mockRunStepTask(...args),
+    runMultiStepTask: (...args: unknown[]) => mockRunMultiStepTask(...args),
     LanePool: function(this: { run: unknown }, ...args: unknown[]) {
         mockLanePoolCtor(...args);
         this.run = mockLanePoolRun;
@@ -55,7 +57,6 @@ import {
     scoutingPhase,
     scoutingReviewPhase,
     planningPhase,
-    planReviewPhase,
     implementationPhase,
     finalReviewPhase,
     run,
@@ -190,6 +191,36 @@ function reviewerRunStepTaskImpl(
     return {};
 }
 
+/** Default plan written by the smart runMultiStepTask mock when no plan.json exists. */
+const DEFAULT_PLAN: Plan = {
+    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], is_code: true }],
+    strategy: "Default strategy",
+};
+
+/**
+ * Smart mock for runMultiStepTask (used by planningPhase). Mimics just enough of
+ * the real primitive to capture the plan: it resolves each step's (lazy) prompt
+ * and invokes the plan step's `validateOutput` gate (which reads plan.json back
+ * into planningPhase's closure). Returns an approved review by default.
+ */
+async function smartRunMultiStepTask(opts: Record<string, unknown>): Promise<{ results: unknown[]; approved: boolean }> {
+    const steps = opts.steps as Array<Record<string, unknown>>;
+    const results: unknown[] = [];
+    for (const step of steps) {
+        if (typeof step.prompt === "function") await step.prompt(results);
+        if (typeof step.validateOutput === "function") {
+            const allowed = (step.allowedWriteDirs as string[] | undefined)?.[0];
+            if (allowed) {
+                const planPath = path.join(allowed, "plan.json");
+                try { await fs.access(planPath); } catch { await fs.mkdir(allowed, { recursive: true }); await fs.writeFile(planPath, JSON.stringify(DEFAULT_PLAN, null, 2)); }
+            }
+            await step.validateOutput();
+        }
+        results.push(step.stepName === "review-plan" ? { ready: true, feedback: "OK", suggestions: [] } : undefined);
+    }
+    return { results, approved: true };
+}
+
 // ─── Setup ──────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
@@ -197,6 +228,7 @@ beforeEach(() => {
     mockLoadProfilesFromDirs.mockResolvedValue(makeAllProfiles());
     mockCreateHarness.mockResolvedValue(makeHarnessResult());
     mockLanePoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
+    mockRunMultiStepTask.mockImplementation(smartRunMultiStepTask);
 });
 
 // ─── CHANGE 1: parallelAgents import removed ────────────────────────────────

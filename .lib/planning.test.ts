@@ -1,11 +1,16 @@
 // ─── Planning Phase Tests ────────────────────────────────────────────────────
 //
-// Tests for planning.ts. After the file-output refactor, the planner WRITES
-// plan.json (rather than returning structured text), so planningPhase reads the
-// artifact back via a `validateOutput` gate passed to runStepTask. The mock
-// runStepTask honours that gate by invoking it (happy path), and tests pre-write
-// the plan.json the planner would have produced.
-
+// Planning is now ONE task with TWO steps (plan → review-plan), run via the
+// engine's runMultiStepTask. The plan step writes plan.json (validated by a
+// `validateOutput` gate); the review step reads it back (its prompt is a lazy
+// function so the file exists by the time it runs) and gates approval via
+// `isApproved`. The replan-on-rejection loop lives inside runMultiStepTask and
+// is covered by the engine's phase-tasks tests; here we assert that planningPhase
+// wires the two steps correctly.
+//
+// The mock runMultiStepTask mimics just enough of the real behaviour to let us
+// assert prompt contents and the plan read-back: it resolves each step's (lazy)
+// prompt, invokes `validateOutput`, and returns a controllable review result.
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -35,36 +40,63 @@ class MockLanePool {
   async run() {}
 }
 
-const mockRunStepTask = mock<(opts: Record<string, unknown>) => Promise<unknown>>();
-// Mimic the real runStepTask: when a validateOutput gate is supplied, invoke it
-// once (happy path) so planningPhase can read back the plan file the test set up.
-mockRunStepTask.mockImplementation(async (opts) => {
-  if (typeof opts.validateOutput === 'function') {
-    await opts.validateOutput();
+interface CapturedStep {
+  stepName: string;
+  profileId: string;
+  promptText: string;
+  isReadOnly?: boolean;
+  allowedWriteDirs?: string[];
+  schema?: unknown;
+  isApproved?: (r: unknown) => boolean;
+  getFeedback?: (r: unknown) => string;
+  validateOutput?: () => Promise<{ error?: string } | undefined>;
+}
+
+const mockRunMultiStepTask = mock<(opts: Record<string, unknown>) => Promise<{ results: unknown[]; approved: boolean }>>();
+
+// What the mock returns for the review step result + final `approved` flag.
+let nextReviewResult: { ready: boolean; feedback: string; suggestions: string[] } = {
+  ready: true,
+  feedback: 'Approved',
+  suggestions: [],
+};
+let nextApproved = true;
+let lastCapturedSteps: CapturedStep[] = [];
+
+mockRunMultiStepTask.mockImplementation(async (opts) => {
+  const steps = opts.steps as CapturedStep[];
+  lastCapturedSteps = [];
+  const results: unknown[] = [];
+  for (const step of steps) {
+    const promptText = typeof step.prompt === 'function' ? await step.prompt(results) : (step.prompt as string);
+    lastCapturedSteps.push({
+      stepName: step.stepName,
+      profileId: step.profileId,
+      promptText,
+      isReadOnly: step.isReadOnly,
+      allowedWriteDirs: step.allowedWriteDirs,
+      schema: step.schema,
+      isApproved: step.isApproved,
+      getFeedback: step.getFeedback,
+      validateOutput: step.validateOutput,
+    });
+    if (typeof step.validateOutput === 'function') await step.validateOutput();
+    if (step.stepName === 'review-plan') results.push(nextReviewResult);
+    else results.push(undefined);
   }
-  // Generic blob for the plan-reviewer (which still returns structured output).
-  return {
-    topics: [],
-    tasks: [],
-    strategy: '',
-    ready: true,
-    research: 'Mock research',
-    gaps: [],
-    feedback: 'Mock feedback',
-    suggestions: [],
-  };
+  return { results, approved: nextApproved };
 });
 
 mock.module('@harms-haus/engin', () => ({
   ...createEnginMock(),
   LanePool: MockLanePool,
   TaskTracker: MockTaskTracker,
-  runStepTask: mockRunStepTask,
+  runMultiStepTask: mockRunMultiStepTask,
 }));
 
 // Dynamic import after mock is set up
-const { planningPhase, planReviewPhase, getPlanPath, getArtifactsDir } = await import('./planning');
-import type { Plan, PlanReview } from './schemas';
+const { planningPhase, getPlanPath, getArtifactsDir } = await import('./planning');
+import type { Plan } from './schemas';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -105,37 +137,75 @@ function makeWorkDir(plan?: Plan): string {
   const workDir = mkdtempSync(join(tmpdir(), 'planning-wd-'));
   if (plan) {
     mkdirSync(getArtifactsDir(workDir), { recursive: true });
-    // Pretty-printed, the way a planner would actually write it.
     writeFileSync(getPlanPath(workDir), JSON.stringify(plan, null, 2));
   }
   return workDir;
 }
 
-// ─── Tests: planningPhase ───────────────────────────────────────────────────
+// ─── Tests ─────────────────────────────────────────────────────────────────
 
 describe('planningPhase', () => {
   beforeEach(() => {
-    mockRunStepTask.mockClear();
+    mockRunMultiStepTask.mockClear();
+    lastCapturedSteps = [];
+    nextReviewResult = { ready: true, feedback: 'Approved', suggestions: [] };
+    nextApproved = true;
   });
 
-  // ─── runStepTask options ──────────────────────────────────────────────────
+  const planStep = () => lastCapturedSteps.find((s) => s.stepName === 'plan')!;
+  const reviewStep = () => lastCapturedSteps.find((s) => s.stepName === 'review-plan')!;
 
-  it('runs the planner as a NON-read-only task with a write sandbox and no schema', async () => {
+  // ── runMultiStepTask wiring ─────────────────────────────────────────────
+
+  it('runs plan + review as ONE two-step task', async () => {
     const workDir = makeWorkDir(SAMPLE_PLAN);
     try {
-      await planningPhase(
-        makeMockTracker(), ['/profiles'], 'Research results...', [], 'Implement feature X', '/cwd', workDir,
-      );
+      await planningPhase(makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
 
-      const opts = mockRunStepTask.mock.calls[0]![0] as Record<string, unknown>;
-      expect(opts.taskId).toBe('planner');
+      expect(mockRunMultiStepTask).toHaveBeenCalledTimes(1);
+      const opts = mockRunMultiStepTask.mock.calls[0]![0] as Record<string, unknown>;
+      expect(opts.taskId).toBe('planning');
       expect(opts.phaseId).toBe('planning');
-      expect(opts.stepName).toBe('plan');
-      expect(opts.profileId).toBe('planner');
-      expect(opts.isReadOnly).toBe(false);
-      expect(opts.schema).toBeUndefined();
-      expect(opts.allowedWriteDirs).toEqual([getArtifactsDir(workDir)]);
-      expect(typeof opts.validateOutput).toBe('function');
+      expect(opts.title).toBe('Plan & Review');
+      expect(Array.isArray(opts.steps)).toBe(true);
+      expect((opts.steps as CapturedStep[]).map((s) => s.stepName)).toEqual(['plan', 'review-plan']);
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it('configures the plan step (write sandbox, no schema, validateOutput gate)', async () => {
+    const workDir = makeWorkDir(SAMPLE_PLAN);
+    try {
+      await planningPhase(makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
+
+      const s = planStep();
+      expect(s.profileId).toBe('planner');
+      expect(s.isReadOnly).toBe(false);
+      expect(s.allowedWriteDirs).toEqual([getArtifactsDir(workDir)]);
+      expect(s.schema).toBeUndefined();
+      expect(typeof s.validateOutput).toBe('function');
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it('configures the review step (read-only, schema, ready-gate, feedback extractor)', async () => {
+    const workDir = makeWorkDir(SAMPLE_PLAN);
+    try {
+      await planningPhase(makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
+
+      const s = reviewStep();
+      expect(s.profileId).toBe('plan-reviewer');
+      expect(s.isReadOnly).toBe(true);
+      expect(s.schema).toBeDefined();
+      expect(s.isApproved!({ ready: true })).toBe(true);
+      expect(s.isApproved!({ ready: false })).toBe(false);
+      // getFeedback folds suggestions into the feedback line.
+      const fb = s.getFeedback!({ ready: false, feedback: 'vague', suggestions: ['add x', 'add y'] });
+      expect(fb).toContain('vague');
+      expect(fb).toContain('- add x');
+      expect(fb).toContain('- add y');
     } finally {
       rmSync(workDir, { recursive: true, force: true });
     }
@@ -151,10 +221,10 @@ describe('planningPhase', () => {
 
       await planningPhase(
         makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir,
-        undefined, undefined, apiKeys, onStatus, abortController.signal, fakeRegistry as never,
+        apiKeys, onStatus, abortController.signal, fakeRegistry as never,
       );
 
-      const opts = mockRunStepTask.mock.calls[0]![0] as Record<string, unknown>;
+      const opts = mockRunMultiStepTask.mock.calls[0]![0] as Record<string, unknown>;
       expect(opts.apiKeys).toBe(apiKeys);
       expect(opts.onStatus).toBe(onStatus);
       expect(opts.signal).toBe(abortController.signal);
@@ -164,41 +234,26 @@ describe('planningPhase', () => {
     }
   });
 
-  // ─── Prompt contents ──────────────────────────────────────────────────────
+  // ── Plan step prompt ────────────────────────────────────────────────────
 
   it('tells the planner to write the plan to the artifacts file path', async () => {
     const workDir = makeWorkDir(SAMPLE_PLAN);
     try {
-      await planningPhase(
-        makeMockTracker(), ['/profiles'], 'Research results...', [], 'Implement feature X', '/cwd', workDir,
-      );
+      await planningPhase(makeMockTracker(), ['/profiles'], 'Research results...', [], 'Implement feature X', '/cwd', workDir);
 
-      const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
+      const prompt = planStep().promptText;
       expect(prompt).toContain('planning agent');
       expect(prompt).toContain('Implement feature X');
       expect(prompt).toContain('Research results...');
       expect(prompt).toContain(getPlanPath(workDir));
-      expect(prompt).toContain('artifacts');
-      expect(prompt).toContain('write');
       expect(prompt).toContain('sandboxed');
-    } finally {
-      rmSync(workDir, { recursive: true, force: true });
-    }
-  });
-
-  it('does NOT instruct the planner to respond with JSON text', async () => {
-    const workDir = makeWorkDir(SAMPLE_PLAN);
-    try {
-      await planningPhase(makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
-
-      const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
       expect(prompt).toContain('Do NOT output the plan as text');
     } finally {
       rmSync(workDir, { recursive: true, force: true });
     }
   });
 
-  // ─── Scouting file-context inlining ───────────────────────────────────────
+  // ── Scouting file-context inlining (plan step) ─────────────────────────
 
   describe('scouting file-context inlining', () => {
     let cwd: string;
@@ -207,7 +262,6 @@ describe('planningPhase', () => {
       cwd = mkdtempSync(join(tmpdir(), 'planning-files-'));
       mkdirSync(join(cwd, 'src'), { recursive: true });
       writeFileSync(join(cwd, 'src/api.ts'), 'export const API = "v1";\n');
-      writeFileSync(join(cwd, 'src/util.ts'), 'export const id = () => 0;\n');
     });
     afterEach(() => {
       rmSync(cwd, { recursive: true, force: true });
@@ -216,16 +270,12 @@ describe('planningPhase', () => {
     it('inlines the contents of the scouting files into the planner prompt', async () => {
       const workDir = makeWorkDir(SAMPLE_PLAN);
       try {
-        await planningPhase(
-          makeMockTracker(), ['/profiles'], 'Research', ['src/api.ts', 'src/util.ts'], 'Task', cwd, workDir,
-        );
+        await planningPhase(makeMockTracker(), ['/profiles'], 'Research', ['src/api.ts'], 'Task', cwd, workDir);
 
-        const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
+        const prompt = planStep().promptText;
         expect(prompt).toContain('Key files from scouting');
         expect(prompt).toContain('### src/api.ts');
         expect(prompt).toContain('export const API = "v1";');
-        expect(prompt).toContain('### src/util.ts');
-        expect(prompt).toContain('do NOT spend tool calls re-reading these');
       } finally {
         rmSync(workDir, { recursive: true, force: true });
       }
@@ -236,71 +286,38 @@ describe('planningPhase', () => {
       try {
         await planningPhase(makeMockTracker(), ['/profiles'], 'Research', [], 'Task', cwd, workDir);
 
-        const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
-        expect(prompt).not.toContain('Key files from scouting');
+        expect(planStep().promptText).not.toContain('Key files from scouting');
       } finally {
         rmSync(workDir, { recursive: true, force: true });
       }
     });
   });
 
-  // ─── Plan review feedback ─────────────────────────────────────────────────
+  // ── Review step prompt (lazy: reads plan.json at run time) ──────────────
 
-  describe('with plan review feedback', () => {
-    it('includes feedback in the prompt when provided', async () => {
-      const workDir = makeWorkDir(SAMPLE_PLAN);
-      try {
-        await planningPhase(
-          makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir, 'The plan lacks detail',
-        );
+  it('reads plan.json and inlines its contents into the reviewer prompt', async () => {
+    const workDir = makeWorkDir(SAMPLE_PLAN);
+    try {
+      await planningPhase(makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
 
-        const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
-        expect(prompt).toContain('Previous plan was rejected');
-        expect(prompt).toContain('The plan lacks detail');
-      } finally {
-        rmSync(workDir, { recursive: true, force: true });
-      }
-    });
-
-    it('includes suggestions in the prompt when provided with feedback', async () => {
-      const workDir = makeWorkDir(SAMPLE_PLAN);
-      try {
-        await planningPhase(
-          makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir,
-          'Needs improvement', ['Add error handling', 'Add tests'],
-        );
-
-        const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
-        expect(prompt).toContain('Specific suggestions:');
-        expect(prompt).toContain('- Add error handling');
-        expect(prompt).toContain('- Add tests');
-      } finally {
-        rmSync(workDir, { recursive: true, force: true });
-      }
-    });
-
-    it('omits feedback section when no feedback provided', async () => {
-      const workDir = makeWorkDir(SAMPLE_PLAN);
-      try {
-        await planningPhase(makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
-
-        const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
-        expect(prompt).not.toContain('Previous plan was rejected');
-      } finally {
-        rmSync(workDir, { recursive: true, force: true });
-      }
-    });
+      const prompt = reviewStep().promptText;
+      expect(prompt).toContain('reviewing an implementation plan');
+      expect(prompt).toContain('Research');
+      expect(prompt).toContain('Proposed plan (written by the planner)');
+      // The raw JSON of the plan file is inlined.
+      expect(prompt).toContain('"id": "task-1"');
+      expect(prompt).toContain('"strategy": "Step by step"');
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
   });
 
-  // ─── Read-back & workflow data ────────────────────────────────────────────
+  // ── Read-back & workflow data ───────────────────────────────────────────
 
   it('reads the written plan.json back and returns it as the validated Plan', async () => {
     const workDir = makeWorkDir(SAMPLE_PLAN);
     try {
-      const result = await planningPhase(
-        makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir,
-      );
-
+      const result = await planningPhase(makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
       expect(result).toEqual(SAMPLE_PLAN);
     } finally {
       rmSync(workDir, { recursive: true, force: true });
@@ -312,7 +329,6 @@ describe('planningPhase', () => {
     try {
       const tracker = makeMockTracker();
       await planningPhase(tracker, ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
-
       expect(tracker.setWorkflowData).toHaveBeenCalledWith({ plan: SAMPLE_PLAN });
     } finally {
       rmSync(workDir, { recursive: true, force: true });
@@ -326,194 +342,55 @@ describe('planningPhase', () => {
       await planningPhase(tracker, ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
 
       expect(tracker.auditLog.append).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'structured_output',
-          agentId: 'planner',
-          output: SAMPLE_PLAN,
-        }),
+        expect.objectContaining({ type: 'structured_output', agentId: 'planner', output: SAMPLE_PLAN }),
       );
     } finally {
       rmSync(workDir, { recursive: true, force: true });
     }
   });
 
-  // NOTE: the in-session validation retry loop (validateOutput failing →
-  // re-prompt up to 3×) lives in runStepTask and is covered by the engine's
-  // phase-tasks tests, not here — the mocked runStepTask simulates success.
-});
+  // ── Decision / audit (final review outcome) ────────────────────────────
 
-// ─── Tests: planReviewPhase ─────────────────────────────────────────────────
-
-describe('planReviewPhase', () => {
-  beforeEach(() => {
-    mockRunStepTask.mockClear();
-  });
-
-  it('calls runStepTask with correct options', async () => {
-    const workDir = makeWorkDir({ tasks: [], strategy: 'Plan' });
-    try {
-      const reviewResult: PlanReview = { ready: true, feedback: 'Looks good', suggestions: [] };
-      mockRunStepTask.mockResolvedValueOnce(reviewResult);
-
-      const result = await planReviewPhase(
-        makeMockTracker(), ['/profiles'], workDir, 'Research', [], 'Task', '/cwd',
-      );
-
-      expect(result).toBe(reviewResult);
-      const opts = mockRunStepTask.mock.calls[0]![0] as Record<string, unknown>;
-      expect(opts.taskId).toBe('plan-reviewer');
-      expect(opts.phaseId).toBe('planning');
-      expect(opts.stepName).toBe('review-plan');
-      expect(opts.profileId).toBe('plan-reviewer');
-      expect(opts.isReadOnly).toBe(true);
-      expect(opts.schema).toBeDefined(); // reviewer still uses structured output
-    } finally {
-      rmSync(workDir, { recursive: true, force: true });
-    }
-  });
-
-  it('reads plan.json from the workDir and inlines its contents into the reviewer prompt', async () => {
+  it('fires onDecision + audit with plan_approved when the review approves', async () => {
     const workDir = makeWorkDir(SAMPLE_PLAN);
     try {
-      mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: 'OK', suggestions: [] });
-
-      await planReviewPhase(
-        makeMockTracker(), ['/profiles'], workDir, 'Research', [], 'Task', '/cwd',
-      );
-
-      const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
-      expect(prompt).toContain('reviewing an implementation plan');
-      expect(prompt).toContain('Research');
-      // The plan file contents (raw JSON) are inlined, not a JS-stringified object.
-      expect(prompt).toContain('Proposed plan (written by the planner)');
-      expect(prompt).toContain('"id": "task-1"');
-      expect(prompt).toContain('"strategy": "Step by step"');
-    } finally {
-      rmSync(workDir, { recursive: true, force: true });
-    }
-  });
-
-  it('throws when the plan file is missing', async () => {
-    const workDir = makeWorkDir(); // no plan.json
-    try {
-      await expect(
-        planReviewPhase(makeMockTracker(), ['/profiles'], workDir, 'Research', [], 'Task', '/cwd'),
-      ).rejects.toThrow(/no plan file found/);
-      // And it must not have spawned the reviewer at all.
-      expect(mockRunStepTask).not.toHaveBeenCalled();
-    } finally {
-      rmSync(workDir, { recursive: true, force: true });
-    }
-  });
-
-  it('passes apiKeys, onStatus, signal, and rendererRegistry through', async () => {
-    const workDir = makeWorkDir({ tasks: [], strategy: '' });
-    try {
-      const apiKeys = { openai: 'sk-test' };
+      nextReviewResult = { ready: true, feedback: 'Looks good', suggestions: [] };
+      nextApproved = true;
       const onStatus = makeStatusCallbacksSpy();
-      const abortController = new AbortController();
-      const fakeRegistry = { renderers: new Map(), register: mock(() => {}), get: mock(() => {}), render: mock(() => {}) };
-      mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: '', suggestions: [] });
+      const tracker = makeMockTracker();
 
-      await planReviewPhase(
-        makeMockTracker(), ['/profiles'], workDir, 'Research', [], 'Task', '/cwd',
-        apiKeys, onStatus, abortController.signal, fakeRegistry as never,
+      await planningPhase(tracker, ['/profiles'], 'Research', [], 'Task', '/cwd', workDir, undefined, onStatus);
+
+      expect(onStatus.onDecision).toHaveBeenCalledWith({
+        agentId: 'plan-reviewer',
+        decision: 'plan_approved',
+        reasoning: 'Looks good',
+      });
+      expect(tracker.auditLog.append).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'decision', agentId: 'plan-reviewer', decision: 'plan_approved', reasoning: 'Looks good' }),
       );
-
-      const opts = mockRunStepTask.mock.calls[0]![0] as Record<string, unknown>;
-      expect(opts.apiKeys).toBe(apiKeys);
-      expect(opts.onStatus).toBe(onStatus);
-      expect(opts.signal).toBe(abortController.signal);
-      expect(opts.rendererRegistry).toBe(fakeRegistry);
     } finally {
       rmSync(workDir, { recursive: true, force: true });
     }
   });
 
-  it('inlines the scouting files into the reviewer prompt', async () => {
-    const cwd = mkdtempSync(join(tmpdir(), 'planreview-files-'));
+  it('fires onDecision + audit with plan_rejected when the review exhausts retries', async () => {
     const workDir = makeWorkDir(SAMPLE_PLAN);
     try {
-      mkdirSync(join(cwd, 'src'), { recursive: true });
-      writeFileSync(join(cwd, 'src/api.ts'), 'export const API = "v1";\n');
-      mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: 'OK', suggestions: [] });
-
-      await planReviewPhase(
-        makeMockTracker(), ['/profiles'], workDir, 'Research', ['src/api.ts'], 'Task', cwd,
-      );
-
-      const prompt = mockRunStepTask.mock.calls[0]![0]!.prompt as string;
-      expect(prompt).toContain('Key files from scouting');
-      expect(prompt).toContain('### src/api.ts');
-      expect(prompt).toContain('export const API = "v1";');
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
-      rmSync(workDir, { recursive: true, force: true });
-    }
-  });
-
-  // ─── onDecision callback ──────────────────────────────────────────────────
-
-  describe('onDecision callback', () => {
-    it('fires onDecision with plan_approved when ready is true', async () => {
-      const workDir = makeWorkDir({ tasks: [], strategy: '' });
-      try {
-        const onStatus = makeStatusCallbacksSpy();
-        mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: 'Approved', suggestions: [] });
-
-        await planReviewPhase(
-          makeMockTracker(), ['/profiles'], workDir, 'Research', [], 'Task', '/cwd', undefined, onStatus,
-        );
-
-        expect(onStatus.onDecision).toHaveBeenCalledWith({
-          agentId: 'plan-reviewer',
-          decision: 'plan_approved',
-          reasoning: 'Approved',
-        });
-      } finally {
-        rmSync(workDir, { recursive: true, force: true });
-      }
-    });
-
-    it('fires onDecision with plan_rejected when ready is false', async () => {
-      const workDir = makeWorkDir({ tasks: [], strategy: '' });
-      try {
-        const onStatus = makeStatusCallbacksSpy();
-        mockRunStepTask.mockResolvedValueOnce({ ready: false, feedback: 'Missing details', suggestions: ['Add more detail'] });
-
-        await planReviewPhase(
-          makeMockTracker(), ['/profiles'], workDir, 'Research', [], 'Task', '/cwd', undefined, onStatus,
-        );
-
-        expect(onStatus.onDecision).toHaveBeenCalledWith({
-          agentId: 'plan-reviewer',
-          decision: 'plan_rejected',
-          reasoning: 'Missing details',
-        });
-      } finally {
-        rmSync(workDir, { recursive: true, force: true });
-      }
-    });
-  });
-
-  // ─── Audit log ────────────────────────────────────────────────────────────
-
-  it('appends a decision event to the audit log', async () => {
-    const workDir = makeWorkDir({ tasks: [], strategy: '' });
-    try {
+      nextReviewResult = { ready: false, feedback: 'Missing details', suggestions: ['add more'] };
+      nextApproved = false; // runMultiStepTask exhausted
+      const onStatus = makeStatusCallbacksSpy();
       const tracker = makeMockTracker();
-      mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: 'Plan approved', suggestions: [] });
 
-      await planReviewPhase(tracker, ['/profiles'], workDir, 'Research', [], 'Task', '/cwd');
+      // Even on exhaustion, planningPhase proceeds with the captured plan.
+      const result = await planningPhase(tracker, ['/profiles'], 'Research', [], 'Task', '/cwd', workDir, undefined, onStatus);
 
-      expect(tracker.auditLog.append).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'decision',
-          agentId: 'plan-reviewer',
-          decision: 'plan_approved',
-          reasoning: 'Plan approved',
-        }),
-      );
+      expect(result).toEqual(SAMPLE_PLAN);
+      expect(onStatus.onDecision).toHaveBeenCalledWith({
+        agentId: 'plan-reviewer',
+        decision: 'plan_rejected',
+        reasoning: 'Missing details',
+      });
     } finally {
       rmSync(workDir, { recursive: true, force: true });
     }

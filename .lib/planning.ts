@@ -1,5 +1,5 @@
 import type { RendererRegistry, StatusCallbacks, WorkflowStatusTracker } from "@harms-haus/engin";
-import { ensureDir, parseJsonWithRepair, runStepTask, schemaToString } from "@harms-haus/engin";
+import { ensureDir, parseJsonWithRepair, runMultiStepTask, schemaToString } from "@harms-haus/engin";
 import { open, readFile } from "node:fs/promises";
 import { extname, isAbsolute, join } from "node:path";
 import { PlanSchema, PlanReviewSchema } from "./schemas";
@@ -181,8 +181,6 @@ export async function planningPhase(
     taskPrompt: string,
     cwd: string,
     workDir: string,
-    planReviewFeedback?: string,
-    planReviewSuggestions?: string[],
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
     signal?: AbortSignal,
@@ -226,44 +224,30 @@ export async function planningPhase(
         "```",
     );
 
-    if (planReviewFeedback) {
-        promptLines.push(
-            "",
-            "Previous plan was rejected. Address the following feedback:",
-            planReviewFeedback,
-        );
-        if (planReviewSuggestions && planReviewSuggestions.length > 0) {
-            promptLines.push(
-                "",
-                "Specific suggestions:",
-                ...planReviewSuggestions.map(s => `- ${s}`),
-            );
-        }
-    }
-
     const prompt = promptLines.join("\n");
 
-    // The planner writes a FILE (not structured text), so there is no `schema`.
-    // Instead, `validateOutput` reads plan.json back, validates it against
-    // PlanSchema, and on failure feeds the error back to the planner within the
-    // SAME session so it can rewrite the file — up to 3 attempts (handled in
-    // runStepTask). The validated plan is captured via closure.
+    // Plan + plan-review run as TWO STEPS of ONE task (matching the
+    // implementation phase's per-step-agent model). The review step gates the
+    // plan step: when the reviewer rejects, runMultiStepTask backs up to the
+    // plan step, appends the reviewer's feedback to the planner prompt, and
+    // retries — up to maxStepRetries times. This single call therefore owns the
+    // entire plan → review → replan loop (no orchestrator-level round counter).
+    //
+    // Step 1 (plan): the planner WRITES plan.json (no structured output). The
+    // `validateOutput` gate reads it back, validates it against PlanSchema, and
+    // on failure re-prompts the planner within the same session. The validated
+    // plan is captured via closure.
+    //
+    // Step 2 (review-plan): the reviewer's prompt is a function evaluated at
+    // run time, so it reads the plan artifact AFTER the planner has written it.
+    // It approves / rejects via the PlanReview schema.
     let plan: Plan | undefined;
-    await runStepTask({
-        profilesDirs,
-        phaseId: "planning",
-        taskId: "planner",
-        title: "Planner",
+    const planStep = {
         stepName: "plan",
         profileId: "planner",
-        cwd,
-        apiKeys,
-        onStatus,
+        prompt,
         isReadOnly: false,
         allowedWriteDirs: [artifactsDir],
-        prompt,
-        signal,
-        rendererRegistry,
         validateOutput: async () => {
             const res = await readAndValidatePlan(planPath);
             if ("plan" in res) {
@@ -272,58 +256,84 @@ export async function planningPhase(
             }
             return { error: res.error };
         },
+    };
+
+    const reviewStep = {
+        stepName: "review-plan",
+        profileId: "plan-reviewer",
+        prompt: async () =>
+            buildPlanReviewPrompt({ taskPrompt, research, filesSection, planPath }),
+        isReadOnly: true,
+        schema: PlanReviewSchema,
+        isApproved: (r: unknown) => (r as PlanReview).ready === true,
+        getFeedback: (r: unknown) => {
+            const rv = r as PlanReview;
+            const parts = [rv.feedback];
+            if (rv.suggestions && rv.suggestions.length > 0) {
+                parts.push("Specific suggestions:", ...rv.suggestions.map((s) => `- ${s}`));
+            }
+            return parts.join("\n");
+        },
+    };
+
+    const { results, approved } = await runMultiStepTask({
+        profilesDirs,
+        phaseId: "planning",
+        taskId: "planning",
+        title: "Plan & Review",
+        steps: [planStep, reviewStep],
+        cwd,
+        apiKeys,
+        onStatus,
+        signal,
+        rendererRegistry,
+        maxStepRetries: 3,
     });
 
-    // runStepTask throws if validation never passes, so `plan` is guaranteed set.
-    const validatedPlan: Plan = plan!;
+    // The plan step's validateOutput gate guarantees `plan` is set once the
+    // task reaches the review step. On exhaustion (review never approved) we
+    // proceed anyway with the latest captured plan — mirroring the prior
+    // "exhausted rounds → proceed anyway" behaviour.
+    const validatedPlan: Plan =
+        plan ?? (() => { throw new Error("Planning completed without a validated plan"); })();
 
     tracker.setWorkflowData({ plan: validatedPlan });
+    await tracker.auditLog.append(structuredOutputEvent("planner", validatedPlan));
 
-    await tracker.auditLog.append(
-        structuredOutputEvent("planner", validatedPlan),
-    );
+    // Surface the final review outcome for the TUI + audit. (Per-rejection
+    // "step rejected" decisions are already fired by runMultiStepTask.)
+    const finalReview = results[1] as PlanReview | undefined;
+    const decision = approved ? "plan_approved" : "plan_rejected";
+    const reasoning = finalReview?.feedback ?? "";
+    onStatus?.onDecision?.({ agentId: "plan-reviewer", decision, reasoning });
+    await tracker.auditLog.append(decisionEvent("plan-reviewer", decision, reasoning));
 
     return validatedPlan;
 }
 
-// ─── Phase 4: Plan Review ───────────────────────────────────────────────────
+// ─── Plan Review prompt builder ─────────────────────────────────────────────
 
 /**
- * Review the plan and determine if it's ready for implementation.
+ * Build the plan-reviewer prompt. Reads the plan artifact the planner wrote
+ * (`planPath`) at CALL time and inlines it verbatim, so the reviewer sees the
+ * exact file currently on disk. This is why the review step's prompt is a
+ * function evaluated lazily by `runMultiStepTask` rather than built up front:
+ * the plan file does not exist until the planner step has run.
  *
- * The reviewer reads the plan from the artifact the planner wrote
- * (`getPlanPath(workDir)`) and its contents are inlined into the prompt, so the
- * reviewer sees the exact file the planner produced — no separate handoff of
- * the parsed `Plan`. It stays fully read-only (no write tools) and responds
- * with structured output.
- *
- * `files` is the same scouting key-files list the planner saw; their contents
- * are inlined so the plan-reviewer can judge the plan against the actual code
- * rather than the planner's summary of it.
+ * Throws when no plan file exists yet (the plan step should have written it).
  */
-export async function planReviewPhase(
-    tracker: WorkflowStatusTracker,
-    profilesDirs: string[],
-    workDir: string,
-    research: string,
-    files: string[],
-    taskPrompt: string,
-    cwd: string,
-    apiKeys?: Record<string, string>,
-    onStatus?: StatusCallbacks,
-    signal?: AbortSignal,
-    rendererRegistry?: RendererRegistry,
-): Promise<PlanReview> {
-    const filesSection = await formatScoutingFilesSection(files, cwd);
-
-    // Read the plan artifact the planner wrote and inline it verbatim.
-    const planPath = getPlanPath(workDir);
+async function buildPlanReviewPrompt(opts: {
+    taskPrompt: string;
+    research: string;
+    filesSection: string;
+    planPath: string;
+}): Promise<string> {
     let planText: string;
     try {
-        planText = await readFile(planPath, "utf-8");
+        planText = await readFile(opts.planPath, "utf-8");
     } catch {
         throw new Error(
-            `Cannot review the plan: no plan file found at ${planPath}. ` +
+            `Cannot review the plan: no plan file found at ${opts.planPath}. ` +
                 `The planning phase must have written it first.`,
         );
     }
@@ -331,14 +341,14 @@ export async function planReviewPhase(
     const prompt = [
         "You are reviewing an implementation plan. Evaluate it for completeness, correctness, and feasibility.",
         "",
-        `Task: ${taskPrompt}`,
+        `Task: ${opts.taskPrompt}`,
         "",
         "Research context:",
-        research,
+        opts.research,
     ];
 
-    if (filesSection) {
-        prompt.push("", filesSection);
+    if (opts.filesSection) {
+        prompt.push("", opts.filesSection);
     }
 
     prompt.push(
@@ -351,36 +361,5 @@ export async function planReviewPhase(
         "Approve the plan if it's sound, or provide specific feedback for improvement.",
     );
 
-    const review = await runStepTask<PlanReview>({
-        profilesDirs,
-        phaseId: "planning",
-        taskId: "plan-reviewer",
-        title: "Plan Review",
-        stepName: "review-plan",
-        profileId: "plan-reviewer",
-        cwd,
-        apiKeys,
-        onStatus,
-        isReadOnly: true,
-        schema: PlanReviewSchema,
-        prompt: prompt.join("\n"),
-        signal,
-        rendererRegistry,
-    });
-
-    onStatus?.onDecision?.({
-        agentId: "plan-reviewer",
-        decision: review.ready ? "plan_approved" : "plan_rejected",
-        reasoning: review.feedback,
-    });
-
-    await tracker.auditLog.append(
-        decisionEvent(
-            "plan-reviewer",
-            review.ready ? "plan_approved" : "plan_rejected",
-            review.feedback,
-        ),
-    );
-
-    return review;
+    return prompt.join("\n");
 }

@@ -75,7 +75,6 @@ mock.module('@harms-haus/engin', () => ({
 // ─── Mock sibling phase modules (for executePhase dispatch tests) ─────────
 const mockImplementationPhase = jest.fn().mockResolvedValue(undefined);
 const mockPlanningPhase = jest.fn().mockResolvedValue({ tasks: [], strategy: '' });
-const mockPlanReviewPhase = jest.fn().mockResolvedValue({ ready: true, feedback: '', suggestions: [] });
 const mockScoutingPhase = jest.fn().mockResolvedValue([]);
 const mockScoutingReviewPhase = jest.fn().mockResolvedValue({ research: '', gaps: [], ready: true, files: [] });
 const mockFinalReviewPhase = jest.fn().mockResolvedValue(undefined);
@@ -87,7 +86,6 @@ mock.module('./implementation', () => ({
 
 mock.module('./planning', () => ({
   planningPhase: mockPlanningPhase,
-  planReviewPhase: mockPlanReviewPhase,
 }));
 
 mock.module('./scouting', () => ({
@@ -194,29 +192,12 @@ describe('RunState interface', () => {
       scoutingReports: [],
       scoutingRounds: 0,
       scoutingGaps: [],
-      planningRounds: 0,
     };
     expect(state.research).toBe('');
     expect(state.plan).toBeUndefined();
     expect(state.scoutingReports).toEqual([]);
     expect(state.scoutingRounds).toBe(0);
     expect(state.scoutingGaps).toEqual([]);
-    expect(state.planningRounds).toBe(0);
-  });
-
-  it('accepts optional planReviewFeedback and planReviewSuggestions', () => {
-    const state: RunState = {
-      research: 'test',
-      plan: undefined,
-      scoutingReports: [],
-      scoutingRounds: 0,
-      scoutingGaps: [],
-      planningRounds: 0,
-      planReviewFeedback: 'Needs work',
-      planReviewSuggestions: ['Add more detail'],
-    };
-    expect(state.planReviewFeedback).toBe('Needs work');
-    expect(state.planReviewSuggestions).toEqual(['Add more detail']);
   });
 });
 
@@ -434,7 +415,6 @@ describe('executePhase', () => {
       scoutingReports: [],
       scoutingRounds: 0,
       scoutingGaps: [],
-      planningRounds: 0,
     }, ctx);
 
     expect(onPhaseStart).toHaveBeenCalledWith({
@@ -484,7 +464,6 @@ describe('executePhase', () => {
         scoutingReports: [],
         scoutingRounds: 0,
         scoutingGaps: [],
-        planningRounds: 0,
       }, ctx),
     ).resolves.toBeUndefined();
   });
@@ -525,7 +504,6 @@ describe('executePhase', () => {
       scoutingReports: [],
       scoutingRounds: 2,
       scoutingGaps: [],
-      planningRounds: 1,
     }, ctx);
 
     // For "done", round is 0 (only scouting/planning use their respective round counters)
@@ -539,14 +517,12 @@ describe('executePhase', () => {
 // ─── SpirWorkflowData ───────────────────────────────────────────────────────
 
 describe('SpirWorkflowData', () => {
-  it('accepts research, plan, scoutingReports, scoutingFiles, and plan review fields', () => {
+  it('accepts research, plan, scoutingReports, and scoutingFiles', () => {
     const data: SpirWorkflowData = {
       research: 'Found everything',
       plan: { tasks: [], strategy: 'test' } as never,
       scoutingReports: [{ topic: 'module-a' }],
       scoutingFiles: ['src/api.ts', 'src/db.ts'],
-      planReviewFeedback: 'Good',
-      planReviewSuggestions: ['Add edge cases'],
     };
     expect(data.research).toBe('Found everything');
     expect(data.scoutingReports).toHaveLength(1);
@@ -838,9 +814,6 @@ describe('module re-exports', () => {
       scoutingRounds: 0,
       scoutingGaps: [],
       scoutingFiles: [],
-      planningRounds: 0,
-      planReviewFeedback: '',
-      planReviewSuggestions: [],
     };
     expect(_check.research).toBe('');
   });
@@ -916,8 +889,7 @@ describe('WorkflowConfig — phases field', () => {
 //
 // The rendererRegistry must flow from SpirRunOptions through runSpir into
 // PhaseContext, and from PhaseContext through executePhase into every phase
-// function that receives it (implementationPhase, planningPhase,
-// planReviewPhase).
+// function that receives it (implementationPhase, planningPhase).
 
 describe('PhaseContext — rendererRegistry field', () => {
   it('PhaseContext accepts rendererRegistry (compile-time + runtime)', () => {
@@ -952,7 +924,6 @@ describe('executePhase — rendererRegistry passthrough', () => {
   beforeEach(() => {
     mockImplementationPhase.mockClear();
     mockPlanningPhase.mockClear();
-    mockPlanReviewPhase.mockClear();
     mockScoutingPhase.mockClear();
     mockScoutingReviewPhase.mockClear();
     mockFinalReviewPhase.mockClear();
@@ -994,7 +965,6 @@ describe('executePhase — rendererRegistry passthrough', () => {
       scoutingReports: [],
       scoutingRounds: 0,
       scoutingGaps: [],
-      planningRounds: 0,
     };
 
     await spir.executePhase('implementing' as Phase, state, ctx);
@@ -1025,20 +995,15 @@ describe('executePhase — rendererRegistry passthrough', () => {
       scoutingRounds: 0,
       scoutingGaps: [],
       scoutingFiles: [],
-      planningRounds: 0,
     };
 
     await spir.executePhase('planning' as Phase, state, ctx);
 
-    // planningPhase should have been called with rendererRegistry as trailing arg
+    // planningPhase owns plan + review now, so it should have been called
+    // once with rendererRegistry as the trailing arg.
     expect(mockPlanningPhase).toHaveBeenCalledTimes(1);
     const args = mockPlanningPhase.mock.calls[0];
     expect(args).toContain(fakeRegistry);
-
-    // planReviewPhase should also have been called
-    expect(mockPlanReviewPhase).toHaveBeenCalledTimes(1);
-    const reviewArgs = mockPlanReviewPhase.mock.calls[0];
-    expect(reviewArgs).toContain(fakeRegistry);
   });
 
   it('passes undefined rendererRegistry when ctx has none (implementing)', async () => {
@@ -1058,7 +1023,6 @@ describe('executePhase — rendererRegistry passthrough', () => {
       scoutingReports: [],
       scoutingRounds: 0,
       scoutingGaps: [],
-      planningRounds: 0,
     };
 
     await spir.executePhase('implementing' as Phase, state, ctx);
@@ -1084,7 +1048,6 @@ describe('runSpir — rendererRegistry → ctx wiring', () => {
   beforeEach(() => {
     mockImplementationPhase.mockClear();
     mockPlanningPhase.mockClear();
-    mockPlanReviewPhase.mockClear();
     mockScoutingPhase.mockClear();
     mockScoutingReviewPhase.mockClear();
     mockFinalReviewPhase.mockClear();

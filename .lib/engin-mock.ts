@@ -30,6 +30,7 @@ export function createEnginMock(): Record<string, unknown> {
     loadProfilesFromDirs: async () => new Map(),
     forwardAgentStatus: (cb: unknown) => cb,
     runStepTask: jest.fn().mockResolvedValue(undefined),
+    runMultiStepTask: jest.fn().mockResolvedValue({ results: [], approved: true }),
     getDiff: () => '',
     // planning.ts reads/writes the plan artifact via these engine helpers.
     ensureDir: async (_dir: string) => {},
