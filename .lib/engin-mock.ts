@@ -31,6 +31,10 @@ export function createEnginMock(): Record<string, unknown> {
     forwardAgentStatus: (cb: unknown) => cb,
     runStepTask: jest.fn().mockResolvedValue(undefined),
     getDiff: () => '',
+    // planning.ts reads/writes the plan artifact via these engine helpers.
+    ensureDir: async (_dir: string) => {},
+    parseJsonWithRepair: (s: string) => JSON.parse(s),
+    schemaToString: (_schema: unknown) => '<schema>',
     createHarness: jest.fn().mockResolvedValue({
       prompt: jest.fn().mockResolvedValue(undefined),
       getLastAssistantText: jest.fn().mockReturnValue(''),

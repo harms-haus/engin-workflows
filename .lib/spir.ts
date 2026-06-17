@@ -208,7 +208,7 @@ export async function executePhase(
             }
 
             state.plan = await planningPhase(
-                tracker, profilesDirs, state.research, state.scoutingFiles ?? [], taskPrompt, cwd,
+                tracker, profilesDirs, state.research, state.scoutingFiles ?? [], taskPrompt, cwd, workDir,
                 state.planReviewFeedback, state.planReviewSuggestions,
                 apiKeys, onStatus, signal,
                 rendererRegistry,
@@ -219,7 +219,7 @@ export async function executePhase(
             }
 
             const planReview = await planReviewPhase(
-                tracker, profilesDirs, state.plan!, state.research, state.scoutingFiles ?? [], taskPrompt, cwd, apiKeys, onStatus, signal,
+                tracker, profilesDirs, workDir, state.research, state.scoutingFiles ?? [], taskPrompt, cwd, apiKeys, onStatus, signal,
                 rendererRegistry,
             );
             state.planningRounds++;

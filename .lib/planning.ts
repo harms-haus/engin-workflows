@@ -1,10 +1,27 @@
 import type { RendererRegistry, StatusCallbacks, WorkflowStatusTracker } from "@harms-haus/engin";
-import { runStepTask } from "@harms-haus/engin";
-import { open } from "node:fs/promises";
+import { ensureDir, parseJsonWithRepair, runStepTask, schemaToString } from "@harms-haus/engin";
+import { open, readFile } from "node:fs/promises";
 import { extname, isAbsolute, join } from "node:path";
 import { PlanSchema, PlanReviewSchema } from "./schemas";
 import type { Plan, PlanReview } from "./schemas";
 import { structuredOutputEvent, decisionEvent } from "./helpers";
+
+// ─── Plan artifact paths ───────────────────────────────────────────────────
+//
+// The planner writes its output as a JSON file under the run's `artifacts`
+// directory rather than as a structured text response. A single source of
+// truth for the path keeps the planner (which writes it), the orchestrator
+// (which reads it back), and the plan-reviewer (which reviews it) in sync.
+
+/** Directory holding durable artifacts for a run (created on demand). */
+export function getArtifactsDir(workDir: string): string {
+    return join(workDir, "artifacts");
+}
+
+/** Absolute path to the plan JSON artifact for a run. */
+export function getPlanPath(workDir: string): string {
+    return join(getArtifactsDir(workDir), "plan.json");
+}
 
 // ─── Scouting file-context inlining ────────────────────────────────────────
 //
@@ -89,8 +106,68 @@ async function formatScoutingFilesSection(files: string[] | undefined, cwd: stri
 
 // ─── Phase 3: Planning ──────────────────────────────────────────────────────
 
+/** Concise JSON example of the plan artifact shape (see PlanSchema for the full contract). */
+const PLAN_SHAPE_EXAMPLE = `{
+  "tasks": [
+    {
+      "id": "task-1",
+      "title": "Short description of the task",
+      "prompt": "Detailed prompt for the implementing agent",
+      "profile": "implementer",
+      "files": ["src/foo.ts"],
+      "is_code": true,
+      "dependencies": []
+    }
+  ],
+  "strategy": "High-level implementation strategy"
+}`;
+
+/**
+ * Read and validate the plan JSON artifact written by the planner.
+ *
+ * Returns `{ plan }` on success, or `{ error }` with a clear, actionable
+ * message when the file is missing, unparseable, or fails `PlanSchema`
+ * validation. Returning the error (rather than throwing) lets the planner's
+ * `validateOutput` retry gate feed it back to the agent.
+ */
+async function readAndValidatePlan(planPath: string): Promise<{ plan: Plan } | { error: string }> {
+    let raw: string;
+    try {
+        raw = await readFile(planPath, "utf-8");
+    } catch {
+        return {
+            error:
+                `No plan file found at ${planPath}. You must use the \`write\` tool to create it ` +
+                `(you are sandboxed to the artifacts directory).`,
+        };
+    }
+
+    let parsed: unknown;
+    try {
+        parsed = parseJsonWithRepair(raw);
+    } catch (err: unknown) {
+        return {
+            error:
+                `The plan file at ${planPath} is not valid JSON: ` +
+                (err instanceof Error ? err.message : String(err)),
+        };
+    }
+
+    const result = PlanSchema.safeParse(parsed);
+    if (!result.success) {
+        return { error: `The plan file at ${planPath} failed schema validation: ${result.error.message}` };
+    }
+    return { plan: result.data };
+}
+
 /**
  * Create an implementation plan based on the scouting research and task prompt.
+ *
+ * Unlike most agents, the planner does NOT respond with structured output.
+ * Instead it WRITES its plan to a JSON artifact at `getPlanPath(workDir)` using
+ * the `write` tool, confined by a write sandbox to the run's `artifacts`
+ * directory. This function runs the planner, then reads and validates that
+ * artifact back into a typed `Plan`.
  *
  * `files` is the list of key files the scouting review surfaced for this task;
  * their contents are inlined into the planner prompt so the planner can ground
@@ -103,6 +180,7 @@ export async function planningPhase(
     files: string[],
     taskPrompt: string,
     cwd: string,
+    workDir: string,
     planReviewFeedback?: string,
     planReviewSuggestions?: string[],
     apiKeys?: Record<string, string>,
@@ -110,6 +188,10 @@ export async function planningPhase(
     signal?: AbortSignal,
     rendererRegistry?: RendererRegistry,
 ): Promise<Plan> {
+    const artifactsDir = getArtifactsDir(workDir);
+    const planPath = getPlanPath(workDir);
+    await ensureDir(artifactsDir);
+
     const filesSection = await formatScoutingFilesSection(files, cwd);
 
     const promptLines: string[] = [
@@ -128,6 +210,20 @@ export async function planningPhase(
     promptLines.push(
         "",
         "Create a plan with specific tasks. Each task should be independently implementable.",
+        "",
+        "## How to deliver your plan",
+        `You MUST write your plan as a JSON file at: \`${planPath}\``,
+        `Use the \`write\` tool to create that file. You are sandboxed: you may ONLY create or modify files under \`${artifactsDir}\`. Any attempt to write elsewhere will be rejected.`,
+        "Do NOT output the plan as text in your response — write it to the file. After writing it, reply with a single short line confirming the path.",
+        "",
+        "The JSON file must match this shape:",
+        "```json",
+        PLAN_SHAPE_EXAMPLE,
+        "```",
+        "Full schema:",
+        "```",
+        schemaToString(PlanSchema),
+        "```",
     );
 
     if (planReviewFeedback) {
@@ -147,7 +243,13 @@ export async function planningPhase(
 
     const prompt = promptLines.join("\n");
 
-    const plan = await runStepTask<Plan>({
+    // The planner writes a FILE (not structured text), so there is no `schema`.
+    // Instead, `validateOutput` reads plan.json back, validates it against
+    // PlanSchema, and on failure feeds the error back to the planner within the
+    // SAME session so it can rewrite the file — up to 3 attempts (handled in
+    // runStepTask). The validated plan is captured via closure.
+    let plan: Plan | undefined;
+    await runStepTask({
         profilesDirs,
         phaseId: "planning",
         taskId: "planner",
@@ -157,26 +259,43 @@ export async function planningPhase(
         cwd,
         apiKeys,
         onStatus,
-        isReadOnly: true,
-        schema: PlanSchema,
+        isReadOnly: false,
+        allowedWriteDirs: [artifactsDir],
         prompt,
         signal,
         rendererRegistry,
+        validateOutput: async () => {
+            const res = await readAndValidatePlan(planPath);
+            if ("plan" in res) {
+                plan = res.plan;
+                return;
+            }
+            return { error: res.error };
+        },
     });
 
-    tracker.setWorkflowData({ plan });
+    // runStepTask throws if validation never passes, so `plan` is guaranteed set.
+    const validatedPlan: Plan = plan!;
+
+    tracker.setWorkflowData({ plan: validatedPlan });
 
     await tracker.auditLog.append(
-        structuredOutputEvent("planner", plan),
+        structuredOutputEvent("planner", validatedPlan),
     );
 
-    return plan;
+    return validatedPlan;
 }
 
 // ─── Phase 4: Plan Review ───────────────────────────────────────────────────
 
 /**
  * Review the plan and determine if it's ready for implementation.
+ *
+ * The reviewer reads the plan from the artifact the planner wrote
+ * (`getPlanPath(workDir)`) and its contents are inlined into the prompt, so the
+ * reviewer sees the exact file the planner produced — no separate handoff of
+ * the parsed `Plan`. It stays fully read-only (no write tools) and responds
+ * with structured output.
  *
  * `files` is the same scouting key-files list the planner saw; their contents
  * are inlined so the plan-reviewer can judge the plan against the actual code
@@ -185,7 +304,7 @@ export async function planningPhase(
 export async function planReviewPhase(
     tracker: WorkflowStatusTracker,
     profilesDirs: string[],
-    plan: Plan,
+    workDir: string,
     research: string,
     files: string[],
     taskPrompt: string,
@@ -196,6 +315,18 @@ export async function planReviewPhase(
     rendererRegistry?: RendererRegistry,
 ): Promise<PlanReview> {
     const filesSection = await formatScoutingFilesSection(files, cwd);
+
+    // Read the plan artifact the planner wrote and inline it verbatim.
+    const planPath = getPlanPath(workDir);
+    let planText: string;
+    try {
+        planText = await readFile(planPath, "utf-8");
+    } catch {
+        throw new Error(
+            `Cannot review the plan: no plan file found at ${planPath}. ` +
+                `The planning phase must have written it first.`,
+        );
+    }
 
     const prompt = [
         "You are reviewing an implementation plan. Evaluate it for completeness, correctness, and feasibility.",
@@ -212,8 +343,10 @@ export async function planReviewPhase(
 
     prompt.push(
         "",
-        "Proposed plan:",
-        JSON.stringify(plan, null, 2),
+        "Proposed plan (written by the planner):",
+        "```json",
+        planText.trim(),
+        "```",
         "",
         "Approve the plan if it's sound, or provide specific feedback for improvement.",
     );
