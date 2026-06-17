@@ -1,5 +1,5 @@
-import type { StatusCallbacks, WorkflowStatusTracker } from "@harms-haus/engin";
-import { LanePool } from "@harms-haus/engin";
+import type { RendererRegistry, StatusCallbacks, WorkflowStatusTracker } from "@harms-haus/engin";
+import { LanePool, assignSequentialTaskIds, clearTaskSessions } from "@harms-haus/engin";
 import type { Plan } from "./schemas";
 import { CODE_STEPS, NON_CODE_STEPS } from "./steps";
 import { join } from "node:path";
@@ -23,9 +23,11 @@ export async function implementationPhase(
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
     signal?: AbortSignal,
+    rendererRegistry?: RendererRegistry,
 ): Promise<void> {
-    // 1. Load plan tasks into the tracker
-    for (const task of plan.tasks) {
+    // 1. Load plan tasks into the tracker (renumber IDs to sequential t-0N form)
+    const renumberedTasks = assignSequentialTaskIds(plan.tasks);
+    for (const task of renumberedTasks) {
         if (!tracker.taskTracker.getTask(task.id)) {
             tracker.taskTracker.addTask({
                 id: task.id,
@@ -43,17 +45,32 @@ export async function implementationPhase(
     // Validate that all dependency references are valid
     tracker.taskTracker.validateAllDependencies();
 
+    // 1b. On a resumed run, tasks that didn't complete (failed / interrupted /
+    // never-started) must restart from step 1 with a clean slate. Clear their
+    // persisted sessions so nothing resumes stale state. Completed tasks keep
+    // their sessions. On a fresh run this is a harmless no-op (no sessions yet).
+    const sessionBaseDir = join(workDir, 'sessions');
+    for (const task of tracker.taskTracker.getAllTasks()) {
+        if (task.status !== 'complete') {
+            clearTaskSessions(sessionBaseDir, task.id);
+        }
+    }
+
     // 2. Create and run the lane pool
     const pool = new LanePool({
         maxConcurrentLanes: maxConcurrentTasks,
         profilesDirs,
         phaseId: 'implementing',
-        sessionBaseDir: join(workDir, 'sessions'),
+        sessionBaseDir,
         cwd,
         apiKeys,
         onStatus,
         auditLog: tracker.auditLog,
         taskTracker: tracker.taskTracker,
+        rendererRegistry,
+        // A failed task is reset and re-run from step 1 (sessions cleared) up to
+        // 2 extra times — 3 total attempts — before it is left failed.
+        maxTaskRetries: 2,
         getStepsForTask: (task) => {
             const steps = task.isCode !== false ? CODE_STEPS : NON_CODE_STEPS;
             // If the task specifies a non-default implementer profile (e.g. 'implementer-lite'),

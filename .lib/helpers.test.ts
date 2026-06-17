@@ -1,21 +1,14 @@
 import { describe, expect, it, jest, mock } from 'bun:test';
+import { createEnginMock } from './engin-mock';
 
 // ─── Mock the broken engin module ───────────────────────────────────────────
 // The @harms-haus/engin package has a broken source tree (missing
 // lane-pool-widget.ts).  Mock the module so helpers.ts' value-imports
 // don't cascade into the TUI tree.
 
-mock.module('@harms-haus/engin', () => {
-  const MockTracker = class {
-    recordAgentSpawn() {}
-    incrementAgentCount() {}
-  };
-  return {
-    WorkflowStatusTracker: MockTracker,
-    loadProfilesFromDirs: async () => new Map(),
-    forwardAgentStatus: (cb: unknown) => cb,
-  };
-});
+mock.module('@harms-haus/engin', () => ({
+  ...createEnginMock(),
+}));
 
 // Dynamic import to ensure mock is applied first
 const helpers = await import('./helpers');

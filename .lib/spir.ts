@@ -5,7 +5,7 @@
 // `runSpir`. All phase logic lives in the sibling .lib modules; this file
 // owns only the phase ordering, the phase-transition helper, the per-phase
 // dispatcher, and the top-level orchestrator.
-import type { StatusCallbacks } from "@harms-haus/engin";
+import type { RendererRegistry, StatusCallbacks } from "@harms-haus/engin";
 import { WorkflowStatusTracker, resolveProfilesDirs } from "@harms-haus/engin";
 import type { WorkflowConfig, SpirRunOptions } from "./config";
 import type { Plan, ScoutingGap } from "./schemas";
@@ -24,6 +24,7 @@ export * from "./initialization";
 export * from "./schemas";
 export * from "./steps";
 export * from "./config";
+export * from "./renderers";
 
 // ─── SPIR Workflow Phase Order ───────────────────────────────────────────────
 
@@ -111,6 +112,7 @@ export interface PhaseContext {
     apiKeys?: Record<string, string>;
     onStatus?: StatusCallbacks;
     signal?: AbortSignal;
+    rendererRegistry?: RendererRegistry;
 }
 
 function getSpirData(tracker: WorkflowStatusTracker): SpirWorkflowData {
@@ -136,7 +138,7 @@ export async function executePhase(
 ): Promise<Phase | void> {
     const {
         tracker, profilesDirs, taskPrompt, cwd, workDir,
-        maxConcurrentTasks, config, apiKeys, onStatus, signal,
+        maxConcurrentTasks, config, apiKeys, onStatus, signal, rendererRegistry,
     } = ctx;
     const phaseStartTime = Date.now();
     const round = (phase === "scouting")
@@ -208,7 +210,8 @@ export async function executePhase(
             state.plan = await planningPhase(
                 tracker, profilesDirs, state.research, state.scoutingFiles ?? [], taskPrompt, cwd,
                 state.planReviewFeedback, state.planReviewSuggestions,
-                apiKeys, onStatus,
+                apiKeys, onStatus, signal,
+                rendererRegistry,
             );
 
             if (!state.plan) {
@@ -216,7 +219,8 @@ export async function executePhase(
             }
 
             const planReview = await planReviewPhase(
-                tracker, profilesDirs, state.plan!, state.research, state.scoutingFiles ?? [], taskPrompt, cwd, apiKeys, onStatus,
+                tracker, profilesDirs, state.plan!, state.research, state.scoutingFiles ?? [], taskPrompt, cwd, apiKeys, onStatus, signal,
+                rendererRegistry,
             );
             state.planningRounds++;
 
@@ -252,6 +256,7 @@ export async function executePhase(
             if (state.plan) {
                 await implementationPhase(
                     tracker, profilesDirs, state.plan, cwd, maxConcurrentTasks, workDir, apiKeys, onStatus, signal,
+                    rendererRegistry,
                 );
             }
             await completePhase(phase, tracker, onStatus, phaseStartTime);
@@ -290,7 +295,7 @@ export async function runSpir(
     taskPrompt: string,
     options: SpirRunOptions,
 ): Promise<void> {
-    const { cwd, apiKeys, workDir, onStatus, signal } = options;
+    const { cwd, apiKeys, workDir, onStatus, signal, rendererRegistry } = options;
     const maxConcurrentTasks = options.maxConcurrentTasks ?? config.defaultMaxConcurrentTasks;
     const profilesDirs: string[] = options.profilesDirs ?? resolveProfilesDirs(options.cwd, config.name);
     const workflowStartTime = Date.now();
@@ -365,7 +370,7 @@ export async function runSpir(
 
     // ── Shared context for every executePhase call ───────────────────
     const ctx: PhaseContext = {
-        tracker, profilesDirs, taskPrompt, cwd, workDir, maxConcurrentTasks, config, apiKeys, onStatus, signal,
+        tracker, profilesDirs, taskPrompt, cwd, workDir, maxConcurrentTasks, config, apiKeys, onStatus, signal, rendererRegistry,
     };
 
     try {

@@ -95,20 +95,15 @@ describe("workflowConfig", () => {
         expect(step.isReadOnly).toBe(false);
     });
 
-    it("has phases as an array with 5 entries", () => {
+    it("has phases as an array with 4 entries (initialization excluded)", () => {
         expect(Array.isArray(workflowConfig.phases)).toBe(true);
-        expect(workflowConfig.phases).toHaveLength(5);
+        // Initialization is an internal setup step, not a sidebar phase.
+        expect(workflowConfig.phases).toHaveLength(4);
     });
 
-    it("phases ids are: initialization, scouting, planning, implementing, review", () => {
+    it("phases ids are: scouting, planning, implementing, review", () => {
         const ids = workflowConfig.phases.map((p: { id: string }) => p.id);
-        expect(ids).toEqual([
-            "initialization",
-            "scouting",
-            "planning",
-            "implementing",
-            "review",
-        ]);
+        expect(ids).toEqual(["scouting", "planning", "implementing", "review"]);
     });
 
     it("has titleFormatter as a function", () => {

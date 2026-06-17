@@ -1,7 +1,7 @@
 ---
 name: fixer
-provider: opencode-go
-model: mimo-v2.5
+provider: zai
+model: glm-5.2
 thinkingLevel: low
 excludeTools:
   - ask_user_question

@@ -149,20 +149,19 @@ beforeEach(() => {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe("workflowConfig.phases", () => {
-    it("contains initialization as the first phase entry", () => {
+    it("contains scouting as the first phase entry (initialization is handled separately)", () => {
         const phases = workflowConfig.phases;
-        expect(phases).toHaveLength(5);
+        expect(phases).toHaveLength(4);
 
-        // First entry must be initialization
-        expect(phases[0].id).toBe("initialization");
-        expect(phases[0].label).toBe("Initialization");
-        expect(phases[0].icon).toBe("⚙");
+        // Initialization (title generation) still runs but is no longer listed
+        // as a sidebar phase, so scouting is now first.
+        expect(phases.find((p) => p.id === "initialization")).toBeUndefined();
 
-        // Subsequent entries should match existing phases in order
-        expect(phases[1].id).toBe("scouting");
-        expect(phases[2].id).toBe("planning");
-        expect(phases[3].id).toBe("implementing");
-        expect(phases[4].id).toBe("review");
+        // Entries match the user-facing workflow phases in order
+        expect(phases[0].id).toBe("scouting");
+        expect(phases[1].id).toBe("planning");
+        expect(phases[2].id).toBe("implementing");
+        expect(phases[3].id).toBe("review");
     });
 
     it("has correct structure for each entry", () => {
@@ -186,11 +185,10 @@ describe("workflowConfig.phases", () => {
         expect(uniqueIds.size).toBe(ids.length);
     });
 
-    it("initialization entry uses gear emoji (U+2699)", () => {
-        const initPhase = workflowConfig.phases.find((p) => p.id === "initialization");
-        expect(initPhase).toBeDefined();
-        expect(initPhase!.icon).toBe("⚙");
-        expect(initPhase!.icon.codePointAt(0)).toBe(0x2699);
+    it("does not surface initialization as a sidebar phase entry", () => {
+        // Initialization is an internal setup step (title generation), not a
+        // tracked sidebar phase, so it must be absent from config.phases.
+        expect(workflowConfig.phases.find((p) => p.id === "initialization")).toBeUndefined();
     });
 });
 
@@ -276,28 +274,24 @@ describe("onPhaseRegister concept", () => {
             onPhaseRegister({ id: phase.id, label: phase.label, icon: phase.icon });
         }
 
-        expect(onPhaseRegister).toHaveBeenCalledTimes(5);
+        // Initialization is no longer a registered sidebar phase.
+        expect(onPhaseRegister).toHaveBeenCalledTimes(4);
         expect(onPhaseRegister).toHaveBeenNthCalledWith(1, {
-            id: "initialization",
-            label: "Initialization",
-            icon: "⚙",
-        });
-        expect(onPhaseRegister).toHaveBeenNthCalledWith(2, {
             id: "scouting",
             label: "Scouting",
             icon: "🔍",
         });
-        expect(onPhaseRegister).toHaveBeenNthCalledWith(3, {
+        expect(onPhaseRegister).toHaveBeenNthCalledWith(2, {
             id: "planning",
             label: "Planning",
             icon: "📋",
         });
-        expect(onPhaseRegister).toHaveBeenNthCalledWith(4, {
+        expect(onPhaseRegister).toHaveBeenNthCalledWith(3, {
             id: "implementing",
             label: "Implementing",
             icon: "🔨",
         });
-        expect(onPhaseRegister).toHaveBeenNthCalledWith(5, {
+        expect(onPhaseRegister).toHaveBeenNthCalledWith(4, {
             id: "review",
             label: "Review",
             icon: "🔎",

@@ -5,6 +5,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 import type { StatusCallbacks, WorkflowStatusTracker } from '@harms-haus/engin';
+import { createEnginMock } from './engin-mock';
 
 // ─── Mock @harms-haus/engin ────────────────────────────────────────────────
 //
@@ -44,16 +45,10 @@ mockRunStepTask.mockImplementation(async () => ({
 }));
 
 mock.module('@harms-haus/engin', () => ({
+  ...createEnginMock(),
   LanePool: MockLanePool,
   TaskTracker: MockTaskTracker,
   runStepTask: mockRunStepTask,
-  // Helpers used by ./helpers (transitively loaded)
-  loadProfilesFromDirs: async () => new Map(),
-  forwardAgentStatus: (cb: unknown) => cb,
-  // Type stubs for module resolution
-  WorkflowStatusTracker: class {},
-  StatusCallbacks: {},
-  StepDefinition: {},
 }));
 
 // Dynamic import after mock is set up

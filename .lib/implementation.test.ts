@@ -5,13 +5,28 @@
 // ────────────────────────────────────────────────────────────────────────────
 
 import { describe, expect, it, jest, mock, beforeEach } from 'bun:test';
+import { createEnginMock } from './engin-mock';
 
 // ─── Mock @harms-haus/engin ────────────────────────────────────────────────
 const mockAddTask = jest.fn<(task: { id: string; title: string; prompt: string; profile: string; files: string[]; dependencies: string[]; isCode: boolean; phaseId: string }) => void>();
+const mockAssignSequentialTaskIds = jest.fn((tasks: { id: string; dependencies: string[] }[]) => {
+  // Default: renumber IDs like the real function (t-01, t-02, …) and remap deps
+  const idMap = new Map<string, string>();
+  const result = tasks.map((t, i) => {
+    const newId = `t-${String(i + 1).padStart(2, '0')}`;
+    idMap.set(t.id, newId);
+    return { ...t, id: newId };
+  });
+  for (const t of result) {
+    t.dependencies = t.dependencies.map((d: string) => idMap.get(d) ?? d);
+  }
+  return result;
+});
 const mockValidateAllDependencies = jest.fn<() => void>();
 const mockGetAllTasks = jest.fn<() => { id: string; status: string }[]>();
 const mockGetTask = jest.fn<(id: string) => { id: string } | undefined>();
 const mockPoolRun = jest.fn<() => Promise<{ completedTasks: number; failedTasks: number }>>();
+const mockClearTaskSessions = jest.fn<(sessionBaseDir: string, taskId: string) => void>();
 
 const MockTaskTracker = jest.fn().mockImplementation(() => ({
   addTask: mockAddTask,
@@ -25,24 +40,11 @@ const MockLanePool = jest.fn().mockImplementation(() => ({
 }));
 
 mock.module('@harms-haus/engin', () => ({
+  ...createEnginMock(),
   LanePool: MockLanePool,
   TaskTracker: MockTaskTracker,
-  WorkflowStatusTracker: jest.fn().mockImplementation(() => ({
-    setPhase: jest.fn(),
-    save: jest.fn().mockResolvedValue(undefined),
-    setWorkflowData: jest.fn(),
-    get workflowData() {
-      return {};
-    },
-    get currentPhase() {
-      return '';
-    },
-    get completedPhases() {
-      return [];
-    },
-  })),
-  loadProfilesFromDirs: async () => new Map(),
-  forwardAgentStatus: (cb: unknown) => cb,
+  clearTaskSessions: mockClearTaskSessions,
+  assignSequentialTaskIds: mockAssignSequentialTaskIds,
 }));
 
 // Dynamic import to ensure mock is applied first
@@ -99,6 +101,7 @@ describe('implementationPhase — phaseId threading', () => {
     mockGetAllTasks.mockClear();
     mockGetTask.mockClear();
     mockPoolRun.mockClear();
+    mockClearTaskSessions.mockClear();
     MockLanePool.mockClear();
     // Default: pool returns all tasks as completed
     mockPoolRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
@@ -129,7 +132,7 @@ describe('implementationPhase — phaseId threading', () => {
     expect(mockAddTask).toHaveBeenCalledTimes(2);
 
     expect(mockAddTask).toHaveBeenNthCalledWith(1, {
-      id: 'task-1',
+      id: 't-01',
       title: 'Add feature A',
       prompt: 'Implement feature A in module X',
       profile: 'implementer',
@@ -140,12 +143,12 @@ describe('implementationPhase — phaseId threading', () => {
     });
 
     expect(mockAddTask).toHaveBeenNthCalledWith(2, {
-      id: 'task-2',
+      id: 't-02',
       title: 'Update docs',
       prompt: 'Document feature A',
       profile: 'implementer',
       files: ['README.md'],
-      dependencies: ['task-1'],
+      dependencies: ['t-01'],
       isCode: false,
       phaseId: 'implementing',
     });
@@ -153,9 +156,9 @@ describe('implementationPhase — phaseId threading', () => {
 
   it('skips addTask for tasks already in the tracker', async () => {
     const tracker = makeMockTracker();
-    // Simulate task-1 already present
+    // Simulate t-01 (renumbered from task-1) already present
     mockGetTask.mockImplementation((id: string) => {
-      return id === 'task-1' ? { id: 'task-1' } : undefined;
+      return id === 't-01' ? { id: 't-01' } : undefined;
     });
 
     await implementationPhase(
@@ -167,10 +170,10 @@ describe('implementationPhase — phaseId threading', () => {
       '/work',
     );
 
-    // Only task-2 should be added (task-1 already exists)
+    // Only t-02 should be added (t-01 already exists)
     expect(mockAddTask).toHaveBeenCalledTimes(1);
     expect(mockAddTask).toHaveBeenCalledWith(expect.objectContaining({
-      id: 'task-2',
+      id: 't-02',
     }));
   });
 
@@ -404,6 +407,7 @@ describe('implementationPhase — pool result handling', () => {
     mockGetAllTasks.mockClear();
     mockGetTask.mockClear();
     mockPoolRun.mockClear();
+    mockClearTaskSessions.mockClear();
     MockLanePool.mockClear();
     mockGetTask.mockReturnValue(undefined);
   });
@@ -524,6 +528,7 @@ describe('implementationPhase — edge cases', () => {
     mockGetAllTasks.mockClear();
     mockGetTask.mockClear();
     mockPoolRun.mockClear();
+    mockClearTaskSessions.mockClear();
     MockLanePool.mockClear();
     mockGetTask.mockReturnValue(undefined);
     mockPoolRun.mockResolvedValue({ completedTasks: 1, failedTasks: 0 });
@@ -593,6 +598,234 @@ describe('implementationPhase — edge cases', () => {
     expect(MockLanePool).toHaveBeenCalledWith(
       expect.objectContaining({ maxConcurrentLanes: 5 }),
     );
+  });
+});
+
+// ─── Retry & Session Reset ────────────────────────────────────────────────
+
+describe('implementationPhase — retry & session reset', () => {
+  beforeEach(() => {
+    mockAddTask.mockClear();
+    mockValidateAllDependencies.mockClear();
+    mockGetAllTasks.mockClear();
+    mockGetTask.mockClear();
+    mockPoolRun.mockClear();
+    mockClearTaskSessions.mockClear();
+    MockLanePool.mockClear();
+    mockGetTask.mockReturnValue(undefined);
+    mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
+  });
+
+  it('passes maxTaskRetries: 2 to the LanePool (3 total attempts per task)', async () => {
+    mockGetAllTasks.mockReturnValue([]);
+    const tracker = makeMockTracker();
+
+    await implementationPhase(tracker, ['/profiles'], SAMPLE_PLAN, '/cwd', 5, '/work');
+
+    expect(MockLanePool).toHaveBeenCalledWith(expect.objectContaining({ maxTaskRetries: 2 }));
+  });
+
+  it('clears sessions for non-complete tasks before the pool runs (resume path)', async () => {
+    // On a resume, failed / interrupted tasks must restart from step 1 with
+    // a clean slate; only completed tasks keep their sessions.
+    mockGetAllTasks.mockReturnValue([
+      { id: 'task-1', status: 'complete' },
+      { id: 'task-2', status: 'failed' },
+      { id: 'task-3', status: 'ready' },
+    ]);
+    const tracker = makeMockTracker();
+
+    await implementationPhase(tracker, ['/profiles'], SAMPLE_PLAN, '/cwd', 5, '/work');
+
+    const clearedIds = mockClearTaskSessions.mock.calls.map((c) => c[1]);
+    expect(clearedIds).toEqual(['task-2', 'task-3']);
+    expect(clearedIds).not.toContain('task-1');
+    // sessionBaseDir passed is {workDir}/sessions
+    expect(mockClearTaskSessions.mock.calls[0][0]).toContain('/work/sessions');
+  });
+
+  it('clears sessions for all tasks on a fresh run (none are complete yet)', async () => {
+    mockGetAllTasks.mockReturnValue([
+      { id: 'task-1', status: 'ready' },
+      { id: 'task-2', status: 'ready' },
+    ]);
+    const tracker = makeMockTracker();
+
+    await implementationPhase(tracker, ['/profiles'], SAMPLE_PLAN, '/cwd', 5, '/work');
+
+    const clearedIds = mockClearTaskSessions.mock.calls.map((c) => c[1]);
+    expect(clearedIds).toEqual(['task-1', 'task-2']);
+  });
+
+  it('does not clear any sessions when every task is complete', async () => {
+    mockGetAllTasks.mockReturnValue([
+      { id: 'task-1', status: 'complete' },
+      { id: 'task-2', status: 'complete' },
+    ]);
+    const tracker = makeMockTracker();
+
+    await implementationPhase(tracker, ['/profiles'], SAMPLE_PLAN, '/cwd', 5, '/work');
+
+    expect(mockClearTaskSessions).not.toHaveBeenCalled();
+  });
+});
+
+// ─── rendererRegistry and task-id renumbering ─────────────────────────────
+
+describe('implementationPhase — rendererRegistry and task-id renumbering', () => {
+  beforeEach(() => {
+    mockAddTask.mockClear();
+    mockValidateAllDependencies.mockClear();
+    mockGetAllTasks.mockClear();
+    mockGetTask.mockClear();
+    mockPoolRun.mockClear();
+    mockClearTaskSessions.mockClear();
+    MockLanePool.mockClear();
+    mockAssignSequentialTaskIds.mockClear();
+    mockGetTask.mockReturnValue(undefined);
+    mockPoolRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
+    mockGetAllTasks.mockReturnValue([
+      { id: 't-01', status: 'done' },
+      { id: 't-02', status: 'done' },
+    ]);
+  });
+
+  it('renumbers task ids: arbitrary IDs become sequential (t-01, t-02) and dependencies are remapped', async () => {
+    const tracker = makeMockTracker();
+    const planWithArbitraryIds: Plan = {
+      tasks: [
+        {
+          id: 'auth-a',
+          title: 'Auth module',
+          prompt: 'Implement auth',
+          profile: 'implementer',
+          files: ['src/auth.ts'],
+          is_code: true,
+          dependencies: [],
+        },
+        {
+          id: 'auth-b',
+          title: 'Auth tests',
+          prompt: 'Write auth tests',
+          profile: 'implementer',
+          files: ['src/auth.test.ts'],
+          is_code: true,
+          dependencies: ['auth-a'],
+        },
+      ],
+      strategy: 'Auth first',
+    };
+
+    await implementationPhase(
+      tracker,
+      ['/profiles'],
+      planWithArbitraryIds,
+      '/cwd',
+      5,
+      '/work',
+    );
+
+    // The tracker should receive the renumbered IDs
+    const addedIds = mockAddTask.mock.calls.map(c => c[0].id);
+    expect(addedIds).toContain('t-01');
+    expect(addedIds).toContain('t-02');
+
+    // First task: no dependencies
+    expect(mockAddTask).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      id: 't-01',
+      dependencies: [],
+    }));
+
+    // Second task: dependency remapped from 'auth-a' to 't-01'
+    expect(mockAddTask).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      id: 't-02',
+      dependencies: ['t-01'],
+    }));
+  });
+
+  it('assignSequentialTaskIds is called with plan.tasks and OLD ids never reach the tracker', async () => {
+    const tracker = makeMockTracker();
+    const planWithArbitraryIds: Plan = {
+      tasks: [
+        {
+          id: 'auth-a',
+          title: 'Auth module',
+          prompt: 'Implement auth',
+          profile: 'implementer',
+          files: ['src/auth.ts'],
+          is_code: true,
+          dependencies: [],
+        },
+        {
+          id: 'auth-b',
+          title: 'Auth tests',
+          prompt: 'Write auth tests',
+          profile: 'implementer',
+          files: ['src/auth.test.ts'],
+          is_code: true,
+          dependencies: ['auth-a'],
+        },
+      ],
+      strategy: 'Auth first',
+    };
+
+    await implementationPhase(
+      tracker,
+      ['/profiles'],
+      planWithArbitraryIds,
+      '/cwd',
+      5,
+      '/work',
+    );
+
+    // assignSequentialTaskIds must have been called
+    expect(mockAssignSequentialTaskIds).toHaveBeenCalledTimes(1);
+    expect(mockAssignSequentialTaskIds).toHaveBeenCalledWith(planWithArbitraryIds.tasks);
+
+    // OLD IDs must NEVER reach the tracker
+    const addedIds = mockAddTask.mock.calls.map(c => c[0].id);
+    expect(addedIds).not.toContain('auth-a');
+    expect(addedIds).not.toContain('auth-b');
+  });
+
+  it('forwards rendererRegistry into LanePool options when provided', async () => {
+    const tracker = makeMockTracker();
+    const fakeRegistry = { renderers: new Map(), register: jest.fn(), get: jest.fn(), render: jest.fn() };
+
+    await implementationPhase(
+      tracker,
+      ['/profiles'],
+      SAMPLE_PLAN,
+      '/cwd',
+      5,
+      '/work',
+      undefined,
+      undefined,
+      undefined,
+      fakeRegistry,
+    );
+
+    expect(MockLanePool).toHaveBeenCalledTimes(1);
+    const poolOptions = MockLanePool.mock.calls[0][0];
+    expect(poolOptions).toHaveProperty('rendererRegistry', fakeRegistry);
+  });
+
+  it('rendererRegistry is optional: omitting it still works', async () => {
+    const tracker = makeMockTracker();
+
+    await implementationPhase(
+      tracker,
+      ['/profiles'],
+      SAMPLE_PLAN,
+      '/cwd',
+      5,
+      '/work',
+    );
+
+    // Should not throw and pool should still be created
+    expect(MockLanePool).toHaveBeenCalledTimes(1);
+    const poolOptions = MockLanePool.mock.calls[0][0];
+    expect(poolOptions.rendererRegistry).toBeUndefined();
   });
 });
 

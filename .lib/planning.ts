@@ -1,4 +1,4 @@
-import type { StatusCallbacks, WorkflowStatusTracker } from "@harms-haus/engin";
+import type { RendererRegistry, StatusCallbacks, WorkflowStatusTracker } from "@harms-haus/engin";
 import { runStepTask } from "@harms-haus/engin";
 import { open } from "node:fs/promises";
 import { extname, isAbsolute, join } from "node:path";
@@ -108,6 +108,7 @@ export async function planningPhase(
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
     signal?: AbortSignal,
+    rendererRegistry?: RendererRegistry,
 ): Promise<Plan> {
     const filesSection = await formatScoutingFilesSection(files, cwd);
 
@@ -160,6 +161,7 @@ export async function planningPhase(
         schema: PlanSchema,
         prompt,
         signal,
+        rendererRegistry,
     });
 
     tracker.setWorkflowData({ plan });
@@ -191,6 +193,7 @@ export async function planReviewPhase(
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
     signal?: AbortSignal,
+    rendererRegistry?: RendererRegistry,
 ): Promise<PlanReview> {
     const filesSection = await formatScoutingFilesSection(files, cwd);
 
@@ -229,6 +232,7 @@ export async function planReviewPhase(
         schema: PlanReviewSchema,
         prompt: prompt.join("\n"),
         signal,
+        rendererRegistry,
     });
 
     onStatus?.onDecision?.({

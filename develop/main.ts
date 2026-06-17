@@ -21,7 +21,6 @@ export const workflowConfig = {
         { profileId: 'documentation-reviewer', dimension: 'documentation', label: 'Documentation' },
     ] as FinalReviewerConfig[],
     phases: [
-        { id: 'initialization', label: 'Initialization', icon: '⚙' },
         { id: 'scouting', label: 'Scouting', icon: '🔍' },
         { id: 'planning', label: 'Planning', icon: '📋' },
         { id: 'implementing', label: 'Implementing', icon: '🔨' },

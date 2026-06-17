@@ -1,8 +1,8 @@
 ---
 name: test-writer
-provider: opencode-go
-model: deepseek-v4-flash
-thinkingLevel: high
+provider: zai
+model: glm-5.2
+thinkingLevel: low
 excludeTools:
   - ask_user_question
   - delegate_to_subagents

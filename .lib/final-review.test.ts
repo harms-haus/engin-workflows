@@ -18,11 +18,13 @@
 // ────────────────────────────────────────────────────────────────────────────
 
 import { describe, expect, it, jest, mock, beforeEach } from 'bun:test';
+import { createEnginMock } from './engin-mock';
 import type { FinalReviewResult, FinalReviewFinding, FinalReviewSeverity } from './schemas';
 
 // ─── Mock @harms-haus/engin ────────────────────────────────────────────────
 const mockRunStepTask = jest.fn<(opts: any) => Promise<unknown>>();
 const mockGetDiff = jest.fn<() => string>().mockReturnValue('MOCK-DIFF-CONTENT');
+const mockClearTaskSessions = jest.fn<(sessionBaseDir: string, taskId: string) => void>();
 const mockPoolRun = jest.fn<() => Promise<{ completedTasks: number; failedTasks: number }>>();
 const mockAddTask = jest.fn<(task: any) => void>();
 const mockGetAllTasks = jest.fn<() => { id: string; status: string; result?: unknown }[]>();
@@ -37,36 +39,12 @@ const MockLanePool = jest.fn().mockImplementation(() => ({
 }));
 
 mock.module('@harms-haus/engin', () => ({
+  ...createEnginMock(),
   runStepTask: mockRunStepTask,
   getDiff: mockGetDiff,
+  clearTaskSessions: mockClearTaskSessions,
   LanePool: MockLanePool,
   TaskTracker: MockTaskTracker,
-  createHarness: jest.fn().mockResolvedValue({
-    prompt: jest.fn(),
-    getLastAssistantText: jest.fn().mockReturnValue(''),
-    sessionId: 'test-session',
-    dispose: jest.fn(),
-  }),
-  promptForStructured: jest.fn().mockResolvedValue({ result: {}, attempts: 1 }),
-  loadProfilesFromDirs: async () => new Map(),
-  forwardAgentStatus: (cb: unknown) => cb,
-  resolveProfilesDirs: (cwd: string, name: string) => [`/profiles/${name}`],
-  WorkflowStatusTracker: jest.fn().mockImplementation(() => ({
-    recordAgentSpawn: jest.fn(),
-    incrementAgentCount: jest.fn(),
-    setPhase: jest.fn(),
-    save: jest.fn().mockResolvedValue(undefined),
-    setWorkflowData: jest.fn(),
-    get workflowData() {
-      return {};
-    },
-    get currentPhase() {
-      return '';
-    },
-    get completedPhases() {
-      return [];
-    },
-  })),
 }));
 
 // Dynamic import to ensure mock is applied first

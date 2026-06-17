@@ -5,42 +5,16 @@
 // ────────────────────────────────────────────────────────────────────────────
 
 import { describe, expect, it, jest, mock, beforeEach } from 'bun:test';
+import { createEnginMock } from './engin-mock';
 
 // ─── Mock @harms-haus/engin ────────────────────────────────────────────────
 const mockRunStepTask = jest.fn<(opts: any) => Promise<{ title: string }>>();
 const mockOnTaskRejected = jest.fn<() => void>();
 
 mock.module('@harms-haus/engin', () => ({
+  ...createEnginMock(),
   // runStepTask is the key replacement for the old createHarness + promptForStructured sequence
   runStepTask: mockRunStepTask,
-  // We still export these for type compatibility, but they are no longer called
-  // by initializationPhase directly.
-  createHarness: jest.fn().mockResolvedValue({
-    prompt: jest.fn(),
-    getLastAssistantText: jest.fn().mockReturnValue(''),
-    sessionId: 'test-session',
-    dispose: jest.fn(),
-  }),
-  promptForStructured: jest.fn().mockResolvedValue({ result: {}, attempts: 1 }),
-  loadProfilesFromDirs: async () => new Map(),
-  forwardAgentStatus: (cb: unknown) => cb,
-  resolveProfilesDirs: (cwd: string, name: string) => [`/profiles/${name}`],
-  WorkflowStatusTracker: jest.fn().mockImplementation(() => ({
-    recordAgentSpawn: jest.fn(),
-    incrementAgentCount: jest.fn(),
-    setPhase: jest.fn(),
-    save: jest.fn().mockResolvedValue(undefined),
-    setWorkflowData: jest.fn(),
-    get workflowData() {
-      return {};
-    },
-    get currentPhase() {
-      return '';
-    },
-    get completedPhases() {
-      return [];
-    },
-  })),
 }));
 
 // Dynamic import to ensure mock is applied first

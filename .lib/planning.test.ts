@@ -8,6 +8,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { StatusCallbacks, WorkflowStatusTracker } from '@harms-haus/engin';
+import { createEnginMock } from './engin-mock';
 
 // ─── Mock @harms-haus/engin ────────────────────────────────────────────────
 //
@@ -48,16 +49,10 @@ mockRunStepTask.mockImplementation(async () => ({
 }));
 
 mock.module('@harms-haus/engin', () => ({
+  ...createEnginMock(),
   LanePool: MockLanePool,
   TaskTracker: MockTaskTracker,
   runStepTask: mockRunStepTask,
-  // Helpers used by ./helpers (transitively loaded)
-  loadProfilesFromDirs: async () => new Map(),
-  forwardAgentStatus: (cb: unknown) => cb,
-  // Type stubs for module resolution
-  WorkflowStatusTracker: class {},
-  StatusCallbacks: {},
-  StepDefinition: {},
 }));
 
 // Dynamic import after mock is set up
@@ -469,5 +464,74 @@ describe('planReviewPhase', () => {
         reasoning: 'Plan approved',
       }),
     );
+  });
+});
+
+// ─── rendererRegistry forwarding ──────────────────────────────────────────
+//
+// planningPhase and planReviewPhase must accept an optional trailing
+// rendererRegistry parameter and forward it into the runStepTask options.
+
+describe('planningPhase — rendererRegistry forwarding', () => {
+  beforeEach(() => {
+    mockRunStepTask.mockClear();
+  });
+
+  it('forwards rendererRegistry into runStepTask options when provided', async () => {
+    const tracker = makeMockTracker();
+    const fakeRegistry = { renderers: new Map(), register: mock(() => {}), get: mock(() => {}), render: mock(() => {}) };
+    mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: '' });
+
+    await planningPhase(
+      tracker, ['/profiles'], 'Research', [], 'Task', '/cwd',
+      undefined, undefined, undefined, undefined, undefined, fakeRegistry as never,
+    );
+
+    const callOpts = mockRunStepTask.mock.calls[0]![0] as Record<string, unknown>;
+    expect(callOpts).toHaveProperty('rendererRegistry', fakeRegistry);
+  });
+
+  it('rendererRegistry is optional: omitting it still works', async () => {
+    const tracker = makeMockTracker();
+    mockRunStepTask.mockResolvedValueOnce({ tasks: [], strategy: '' });
+
+    await planningPhase(
+      tracker, ['/profiles'], 'Research', [], 'Task', '/cwd',
+    );
+
+    const callOpts = mockRunStepTask.mock.calls[0]![0] as Record<string, unknown>;
+    expect(callOpts.rendererRegistry).toBeUndefined();
+  });
+});
+
+describe('planReviewPhase — rendererRegistry forwarding', () => {
+  beforeEach(() => {
+    mockRunStepTask.mockClear();
+  });
+
+  it('forwards rendererRegistry into runStepTask options when provided', async () => {
+    const tracker = makeMockTracker();
+    const fakeRegistry = { renderers: new Map(), register: mock(() => {}), get: mock(() => {}), render: mock(() => {}) };
+    mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: '', suggestions: [] });
+
+    await planReviewPhase(
+      tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', [], 'Task', '/cwd',
+      undefined, undefined, undefined, fakeRegistry as never,
+    );
+
+    const callOpts = mockRunStepTask.mock.calls[0]![0] as Record<string, unknown>;
+    expect(callOpts).toHaveProperty('rendererRegistry', fakeRegistry);
+  });
+
+  it('rendererRegistry is optional: omitting it still works', async () => {
+    const tracker = makeMockTracker();
+    mockRunStepTask.mockResolvedValueOnce({ ready: true, feedback: '', suggestions: [] });
+
+    await planReviewPhase(
+      tracker, ['/profiles'], { tasks: [], strategy: '' }, 'Research', [], 'Task', '/cwd',
+    );
+
+    const callOpts = mockRunStepTask.mock.calls[0]![0] as Record<string, unknown>;
+    expect(callOpts.rendererRegistry).toBeUndefined();
   });
 });

@@ -1,8 +1,8 @@
 ---
 name: scout-coordinator
-provider: opencode-go
-model: deepseek-v4-flash
-thinkingLevel: medium
+provider: zai
+model: glm-5.2
+thinkingLevel: high
 excludeTools:
   - write
   - edit
