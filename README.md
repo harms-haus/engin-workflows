@@ -89,7 +89,7 @@ Each `main.ts` does four things and nothing else:
 This is the complete `develop/main.ts`:
 
 ```ts
-import { runSpir, type SpirRunOptions, type FinalReviewerConfig, normalizeOptions } from '../.lib/spir';
+import { runSpir, type SpirRunOptions, type FinalReviewerConfig, normalizeOptions, ReviewResultSchema } from '../.lib/spir';
 import type { StepDefinition } from '@harms-haus/engin';
 
 export * from '../.lib/spir';
@@ -99,6 +99,7 @@ export const workflowConfig = {
     defaultMaxConcurrentTasks: 5,
     fixerSteps: [
         { name: 'fix', profileId: 'fixer', isReadOnly: false },
+        { name: 'verify', profileId: 'fixer-reviewer', isReadOnly: true, schema: ReviewResultSchema },
     ] as StepDefinition[],
     finalReviewers: [
         { profileId: 'efficiency-reviewer',   dimension: 'efficiency',   label: 'Efficiency' },
@@ -134,7 +135,7 @@ export async function run(taskPrompt: string, options: RunOptions): Promise<void
 |---|---|---|---|
 | `name` | `'develop'` | `'improve'` | `'debug'` |
 | `defaultMaxConcurrentTasks` | `5` | `5` | `3` |
-| `fixerSteps` | `fix` (writable) | `fix` + `verify` (read-only review) | `fix` (writable) |
+| `fixerSteps` | `fix` + `verify` (read-only review) | `fix` + `verify` (read-only review) | `fix` + `verify` (read-only review) |
 | `finalReviewers` | efficiency / code-quality / ui-ux / security / documentation (same 5) | same 5 | same 5 |
 | `phases` | 5 (incl. initialization) | 4 (no initialization) | 5 (incl. initialization) |
 | `titleFormatter` | `d.slice(0, 100)` | `d.slice(0, 100)` | `d.slice(0, 100)` |
@@ -164,9 +165,9 @@ definition.
 
 5. **Define `fixerSteps`** — the ordered repair steps run on each actionable
    finding in the final `review` phase. Each step is a `StepDefinition`
-   (`{ name, profileId, isReadOnly, schema? }`). `develop`/`debug` use one
-   writable `fix` step; `improve` chains a read-only `verify` step (with
-   `ReviewResultSchema`) after it.
+   (`{ name, profileId, isReadOnly, schema? }`). All three workflows chain a
+   writable `fix` step with a read-only `verify` step (against
+   `ReviewResultSchema`, run by the `fixer-reviewer` profile) after it.
 
 5b. **Define `finalReviewers`** *(optional)* — the specialized reviewers run in
    the final review phase. Each entry is a `FinalReviewerConfig`
@@ -219,7 +220,7 @@ option). The backbone and step definitions reference profiles by `profileId`:
 
 | Referenced by | `profileId`s |
 |---|---|
-| `fixerSteps` (config) | `fixer`, `implement-reviewer` |
+| `fixerSteps` (config) | `fixer`, `fixer-reviewer` |
 | `CODE_STEPS` (`.lib/steps.ts`) | `test-writer`, `test-reviewer`, `implementer`, `implement-reviewer` |
 | `NON_CODE_STEPS` (`.lib/steps.ts`) | `implementer`, `implement-reviewer` |
 | Scouting phase | `scout-coordinator`, `scout`, `scouting-reviewer` |

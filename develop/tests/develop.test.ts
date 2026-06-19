@@ -4,11 +4,11 @@ import { z } from "zod";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
-import type { AgentProfile } from "@harms-haus/engin";
+import type { AgentProfile } from "@harms-haus/engin-engine";
 import type { Plan, ScoutingReview, PlanReview, ReviewResult, FinalReviewTopics } from "../main";
 
 // Capture real module before mocking so we can restore it in afterAll.
-const realModule = Object.assign({}, await import("@harms-haus/engin"));
+const realModule = Object.assign({}, await import("@harms-haus/engin-engine"));
 
 // ─── Mocks ──────────────────────────────────────────────────────────────────
 
@@ -20,7 +20,7 @@ const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[
 const mockRunStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockRunMultiStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
-mock.module("@harms-haus/engin", () => ({
+mock.module("@harms-haus/engin-engine", () => ({
     ...realModule,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
@@ -40,7 +40,7 @@ import {
     promptForStructured,
     loadProfilesFromDirs,
     WorkflowStatusTracker,
-} from "@harms-haus/engin";
+} from "@harms-haus/engin-engine";
 import {
     scoutingPhase,
     scoutingReviewPhase,
@@ -919,5 +919,5 @@ describe("run", () => {
 });
 
 afterAll(() => {
-    mock.module("@harms-haus/engin", () => realModule);
+    mock.module("@harms-haus/engin-engine", () => realModule);
 });

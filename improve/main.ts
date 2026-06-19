@@ -1,6 +1,6 @@
 // ─── Improvement Workflow ────────────────────────────────────────────────────
 import { runSpir, type SpirRunOptions, type FinalReviewerConfig, normalizeOptions, ReviewResultSchema } from '../.lib/spir';
-import type { StepDefinition } from '@harms-haus/engin';
+import type { StepDefinition } from '@harms-haus/engin-engine';
 
 // Re-export everything from the SPIR backbone (schemas, phase fns, types, etc.)
 export * from '../.lib/spir';
@@ -12,7 +12,7 @@ export const workflowConfig = {
     defaultMaxConcurrentTasks: 5,
     fixerSteps: [
         { name: 'fix', profileId: 'fixer', isReadOnly: false },
-        { name: 'verify', profileId: 'implement-reviewer', isReadOnly: true, schema: ReviewResultSchema },
+        { name: 'verify', profileId: 'fixer-reviewer', isReadOnly: true, schema: ReviewResultSchema },
     ] as StepDefinition[],
     finalReviewers: [
         { profileId: 'efficiency-reviewer', dimension: 'efficiency', label: 'Efficiency' },

@@ -1,9 +1,9 @@
-// ─── Shared @harms-haus/engin mock factory ───────────────────────────────────
+// ─── Shared @harms-haus/engin-engine mock factory ──────────────────────────────
 //
 // bun's `mock.module` is process-global: when several test files each register
-// a PARTIAL mock of `@harms-haus/engin`, whichever mock bun resolves first wins
+// a PARTIAL mock of `@harms-haus/engin-engine`, whichever mock bun resolves first wins
 // for the ENTIRE test process. Every source file imported during the run then
-// resolves its `@harms-haus/engin` imports against that one winning mock — so a
+// resolves its `@harms-haus/engin-engine` imports against that one winning mock — so a
 // mock missing a symbol any source imports makes that source fail to load with
 // `SyntaxError: Export named 'X' not found`.
 //
@@ -14,7 +14,7 @@
 import { jest } from 'bun:test';
 
 /**
- * Build a fresh, complete mock of @harms-haus/engin's runtime export surface.
+ * Build a fresh, complete mock of @harms-haus/engin-engine's runtime export surface.
  * Spread `...createEnginMock()` then add/override file-specific stubs.
  */
 export function createEnginMock(): Record<string, unknown> {

@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'bun:test';
-import type { StepDefinition } from '@harms-haus/engin';
+import type { StepDefinition } from '@harms-haus/engin-engine';
 import { CODE_STEPS, NON_CODE_STEPS } from './steps';
 
 // ─── StepDefinition import resolution ──────────────────────────────────────
 
 describe('StepDefinition', () => {
-  it('is importable from @harms-haus/engin', () => {
+  it('is importable from @harms-haus/engin-engine', () => {
     // Type-level check: the import must resolve and be usable
     const step: StepDefinition = {
       name: 'test-step',

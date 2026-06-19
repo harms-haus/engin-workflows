@@ -34,7 +34,7 @@
 // write-tests step.
 // ────────────────────────────────────────────────────────────────────────────
 import { describe, it, expect } from "bun:test";
-import { RendererRegistry } from "@harms-haus/engin";
+import { RendererRegistry } from "@harms-haus/engin-engine";
 import { registerRenderers } from "../main";
 import * as mainNamespace from "../main";
 import type { Plan, PlanReview } from "../main";

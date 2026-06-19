@@ -6,7 +6,7 @@ import { createEnginMock } from './engin-mock';
 // lane-pool-widget.ts).  Mock the module so helpers.ts' value-imports
 // don't cascade into the TUI tree.
 
-mock.module('@harms-haus/engin', () => ({
+mock.module('@harms-haus/engin-engine', () => ({
   ...createEnginMock(),
 }));
 
@@ -16,7 +16,7 @@ const helpers = await import('./helpers');
 const { spawnAgent, structuredOutputEvent, decisionEvent, errorEvent } = helpers;
 type SpawnInfo = helpers.SpawnInfo;
 
-import type { StatusCallbacks, WorkflowStatusTracker } from '@harms-haus/engin';
+import type { StatusCallbacks, WorkflowStatusTracker } from '@harms-haus/engin-engine';
 
 // ─── SpawnInfo interface ───────────────────────────────────────────────────
 

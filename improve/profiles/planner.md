@@ -54,4 +54,19 @@ Each task has a `profile` field. Choose between two implementer profiles:
 
 When in doubt, use `implementer`. Prefer `implementer-lite` when the task is small, the change is mechanical, and speed matters more than heavy reasoning.
 
+**The improve workflow converts findings into atomic improvement tasks.** Typical improvement task shapes — make each one atomic and independently verifiable:
+- **Remove dead code / dead tests** — delete unused symbols, unreachable branches, orphaned files, or skipped/empty/tautological tests. (Verify: the build/tests still pass.)
+- **Split a monolith file** — break an oversized/multi-responsibility file into focused modules, updating all imports. Often depends on first stabilizing behavior with tests.
+- **Decompose a god function** — extract cohesive sub-steps into well-named helpers; preserve outputs/behavior.
+- **Extract a magic value to a named constant** — move a raw literal into a well-named constant near its use (or a shared constants module if reused).
+- **Extract duplicate code into a shared utility** — pull repeated logic into one helper/util and replace all call sites; consolidate into a utilities module or small system if it spans files.
+- **Rename misleading identifiers / fix name-file mismatches** — rename and update every reference; ensure a symbol's name matches its file when appropriate.
+- **Remove timely comments** — delete or rewrite comments describing past/"old way" behavior so only current-truth remains.
+- **Add/refresh docstrings** — document public/exported functions and types (params, returns, throws, intent).
+- **Improve test quality** — strengthen existing tests around touched code: more scenarios, edge/boundary/invalid inputs, meaningful assertions.
+
+**Refactors must preserve behavior.** For any restructure/split/decompose/extract task, the test-writing step should produce *characterization tests* first (pinning current behavior) so the change is provably behavior-preserving. Each task's verification must run the relevant tests/build/typecheck/lint.
+
+**Profile choice for improvement tasks:** use `implementer-lite` for mechanical changes (delete dead code, extract a constant, rename, add a docstring, remove a comment); use `implementer` for structural changes (split a file, decompose a function, build a shared-utility system) or anything with tricky edge cases. Test-only improvement tasks (remove dead/tautological tests, strengthen scenarios) are executed by the test-writing step — still mark them `is_code: true`; the implementer must not edit tests.
+
 **Write your plan to the plan file:** Use the `write` tool to save valid JSON matching the shape and schema given in the task prompt, at the plan file path provided. Do not return the plan as text in your response.

@@ -64,7 +64,7 @@ const MockTaskTracker = jest.fn().mockImplementation(() => ({
   submitForReview: jest.fn(),
 }));
 
-mock.module('@harms-haus/engin', () => ({
+mock.module('@harms-haus/engin-engine', () => ({
   ...createEnginMock(),
   // Types are compile-time only; these are the runtime values
   WorkflowStatusTracker: MockWorkflowStatusTracker,

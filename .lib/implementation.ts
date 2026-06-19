@@ -1,5 +1,5 @@
-import type { RendererRegistry, StatusCallbacks, WorkflowStatusTracker } from "@harms-haus/engin";
-import { LanePool, assignSequentialTaskIds, clearTaskSessions } from "@harms-haus/engin";
+import type { RendererRegistry, StatusCallbacks, WorkflowStatusTracker } from "@harms-haus/engin-engine";
+import { LanePool, assignSequentialTaskIds, clearTaskSessions } from "@harms-haus/engin-engine";
 import type { Plan } from "./schemas";
 import { CODE_STEPS, NON_CODE_STEPS } from "./steps";
 import { join } from "node:path";

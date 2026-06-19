@@ -11,7 +11,7 @@ import { createEnginMock } from './engin-mock';
 const mockRunStepTask = jest.fn<(opts: any) => Promise<{ title: string }>>();
 const mockOnTaskRejected = jest.fn<() => void>();
 
-mock.module('@harms-haus/engin', () => ({
+mock.module('@harms-haus/engin-engine', () => ({
   ...createEnginMock(),
   // runStepTask is the key replacement for the old createHarness + promptForStructured sequence
   runStepTask: mockRunStepTask,

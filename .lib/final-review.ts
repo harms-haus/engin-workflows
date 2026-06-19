@@ -1,10 +1,10 @@
-import type { StatusCallbacks, StepDefinition, WorkflowStatusTracker } from "@harms-haus/engin";
-import { LanePool, TaskTracker, runStepTask, getDiff } from "@harms-haus/engin";
+import type { StatusCallbacks, StepDefinition, WorkflowStatusTracker } from "@harms-haus/engin-engine";
+import { LanePool, TaskTracker, runStepTask, getDiff } from "@harms-haus/engin-engine";
 import { join } from "node:path";
 import { FinalReviewResultSchema } from "./schemas";
 import type { FinalReviewResult, FinalReviewFinding, FinalReviewSeverity } from "./schemas";
 import type { FinalReviewerConfig } from "./config";
-import { structuredOutputEvent } from "./helpers";
+import { structuredOutputEvent, errorEvent } from "./helpers";
 
 // ─── Phase 6: Multi-Dimensional Final Review (per-lane loops) ───────────────
 //
@@ -288,6 +288,9 @@ async function runFinalReviewLane(
     const history: FinalReviewResult[] = [];
 
     // 1. Initial review pass.
+    // Persist the reviewer session so a failed structured-output attempt
+    // (e.g. no JSON produced) leaves a debuggable/resumable trace on disk
+    // instead of vanishing with an in-memory session.
     const reviewTaskId = `${reviewer.profileId}-round-0`;
     let result = await runStepTask<FinalReviewResult>({
         profilesDirs: ctx.profilesDirs,
@@ -300,6 +303,7 @@ async function runFinalReviewLane(
         apiKeys: ctx.apiKeys,
         onStatus: ctx.onStatus,
         isReadOnly: true,
+        sessionBaseDir: join(ctx.workDir, "sessions", "review"),
         schema: FinalReviewResultSchema,
         prompt: buildReviewerPrompt(reviewer, [], ctx.collectDiff()),
         signal: ctx.signal,
@@ -327,6 +331,7 @@ async function runFinalReviewLane(
             apiKeys: ctx.apiKeys,
             onStatus: ctx.onStatus,
             isReadOnly: true,
+            sessionBaseDir: join(ctx.workDir, "sessions", "review"),
             schema: FinalReviewResultSchema,
             prompt: buildReviewFixesPrompt(reviewer, history, fixRound, ctx.collectDiff()),
             signal: ctx.signal,
@@ -379,8 +384,30 @@ export async function finalReviewPhase(
     };
 
     // Run all lanes in parallel; the phase is clean iff every lane is clean.
+    //
+    // Each lane is ISOLATED so a single flaky reviewer cannot abort the whole
+    // run. The most common lane failure is a structured-output failure — the
+    // reviewer (e.g. glm-5.2 with high thinking) produced no JSON after its 3
+    // retries, so runStepTask re-threw. Rather than letting that propagate and
+    // fail the entire workflow, record the failure (audit + onError) and count
+    // the lane as not-clean (false); the other lanes still run to completion.
     const results = await Promise.all(
-        finalReviewers.map((reviewer) => runFinalReviewLane(reviewer, ctx)),
+        finalReviewers.map(async (reviewer) => {
+            try {
+                return await runFinalReviewLane(reviewer, ctx);
+            } catch (err) {
+                const reason = err instanceof Error ? err.message : String(err);
+                await ctx.tracker.auditLog.append(
+                    errorEvent(reviewer.profileId, `Review lane failed and was skipped: ${reason}`),
+                );
+                ctx.onStatus?.onError?.({
+                    agentId: reviewer.profileId,
+                    error: `Final review lane "${reviewer.label}" failed and was skipped: ${reason}`,
+                    phaseId: "review",
+                });
+                return false;
+            }
+        }),
     );
 
     return results.every(Boolean);

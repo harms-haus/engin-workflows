@@ -1,5 +1,5 @@
-import type { StatusCallbacks, StepDefinition, WorkflowStatusTracker } from "@harms-haus/engin";
-import { LanePool, TaskTracker, runStepTask } from "@harms-haus/engin";
+import type { StatusCallbacks, StepDefinition, WorkflowStatusTracker } from "@harms-haus/engin-engine";
+import { LanePool, TaskTracker, runStepTask } from "@harms-haus/engin-engine";
 import { join } from "node:path";
 import { ScoutingTopicSchema, ScoutingReviewSchema } from "./schemas";
 import type { ScoutingTopics, ScoutingReview } from "./schemas";

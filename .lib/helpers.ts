@@ -1,5 +1,5 @@
-import type { AgentProfile, HarnessCreationOptions, StatusCallbacks, WorkflowStatusTracker, AuditEvent } from "@harms-haus/engin";
-import { loadProfilesFromDirs, forwardAgentStatus } from "@harms-haus/engin";
+import type { AgentProfile, HarnessCreationOptions, StatusCallbacks, WorkflowStatusTracker, AuditEvent } from "@harms-haus/engin-engine";
+import { loadProfilesFromDirs, forwardAgentStatus } from "@harms-haus/engin-engine";
 
 // ─── Audit Event Helpers ─────────────────────────────────────────────────
 

@@ -6,6 +6,7 @@
       "name": "engin-workflow-develop",
       "dependencies": {
         "@harms-haus/engin": "link:@harms-haus/engin",
+        "@harms-haus/engin-engine": "link:@harms-haus/engin-engine",
         "zod": "^3.25.0",
       },
       "devDependencies": {
@@ -15,6 +16,8 @@
   },
   "packages": {
     "@harms-haus/engin": ["@harms-haus/engin@link:@harms-haus/engin", { "bin": { "engin": "./dist/cli.js" } }],
+
+    "@harms-haus/engin-engine": ["@harms-haus/engin-engine@link:@harms-haus/engin-engine", {}],
 
     "@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 

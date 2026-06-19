@@ -9,7 +9,7 @@
 // Renderers must be total: they never throw on malformed input — they fall
 // back to `String(data)` so a bad payload degrades to a (boring but safe) line
 // rather than crashing the run.
-import type { RendererRegistry } from "@harms-haus/engin";
+import type { RendererRegistry } from "@harms-haus/engin-engine";
 import type { Plan, PlanReview } from "./schemas";
 
 const CHECKMARK = "\u2705"; // ✅

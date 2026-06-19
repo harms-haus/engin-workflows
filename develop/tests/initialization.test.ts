@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 
-const realEngin = Object.assign({}, await import("@harms-haus/engin"));
+const realEngin = Object.assign({}, await import("@harms-haus/engin-engine"));
 
 // ─── Mocks ──────────────────────────────────────────────────────────────────
 
@@ -16,7 +16,7 @@ const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[
 const mockRunStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockRunMultiStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
-mock.module("@harms-haus/engin", () => ({
+mock.module("@harms-haus/engin-engine", () => ({
     ...realEngin,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
@@ -32,7 +32,7 @@ mock.module("@harms-haus/engin", () => ({
 // ─── Imports (after mocks) ─────────────────────────────────────────────────
 
 import { run, TitleSchema } from "../main";
-import { WorkflowStatusTracker } from "@harms-haus/engin";
+import { WorkflowStatusTracker } from "@harms-haus/engin-engine";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -258,5 +258,5 @@ describe("Initialization Phase - runStepTask", () => {
 });
 
 afterAll(() => {
-    mock.module("@harms-haus/engin", () => realEngin);
+    mock.module("@harms-haus/engin-engine", () => realEngin);
 });

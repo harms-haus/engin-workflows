@@ -39,7 +39,7 @@ const MockLanePool = jest.fn().mockImplementation(() => ({
   run: mockPoolRun,
 }));
 
-mock.module('@harms-haus/engin', () => ({
+mock.module('@harms-haus/engin-engine', () => ({
   ...createEnginMock(),
   LanePool: MockLanePool,
   TaskTracker: MockTaskTracker,

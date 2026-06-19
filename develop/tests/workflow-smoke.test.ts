@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 
-const realEngin = Object.assign({}, await import("@harms-haus/engin"));
+const realEngin = Object.assign({}, await import("@harms-haus/engin-engine"));
 
 const mockCreateHarness = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockPromptForStructured = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
@@ -13,7 +13,7 @@ const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[
 const mockRunStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockRunMultiStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
-mock.module("@harms-haus/engin", () => ({
+mock.module("@harms-haus/engin-engine", () => ({
     ...realEngin,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
@@ -27,7 +27,7 @@ mock.module("@harms-haus/engin", () => ({
 }));
 
 import { run } from "../main";
-import { WorkflowStatusTracker } from "@harms-haus/engin";
+import { WorkflowStatusTracker } from "@harms-haus/engin-engine";
 
 function makeHarness() {
     return { prompt: mock(async () => {}), getLastAssistantText: mock(() => ""), messages: [] as unknown[], subscribe: mock(() => mock()), sessionId: "test-session", dispose: mock() };
@@ -249,5 +249,5 @@ describe("Workflow Smoke Tests", () => {
 });
 
 afterAll(() => {
-    mock.module("@harms-haus/engin", () => realEngin);
+    mock.module("@harms-haus/engin-engine", () => realEngin);
 });

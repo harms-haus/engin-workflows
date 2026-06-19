@@ -4,7 +4,7 @@
 // manual createHarness / spawnAgent / promptForStructured sequences.
 
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
-import type { StatusCallbacks, WorkflowStatusTracker } from '@harms-haus/engin';
+import type { StatusCallbacks, WorkflowStatusTracker } from '@harms-haus/engin-engine';
 import { createEnginMock } from './engin-mock';
 
 // ─── Mock @harms-haus/engin ────────────────────────────────────────────────
@@ -44,7 +44,7 @@ mockRunStepTask.mockImplementation(async () => ({
   suggestions: [],
 }));
 
-mock.module('@harms-haus/engin', () => ({
+mock.module('@harms-haus/engin-engine', () => ({
   ...createEnginMock(),
   LanePool: MockLanePool,
   TaskTracker: MockTaskTracker,

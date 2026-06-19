@@ -201,7 +201,7 @@ export interface FinalReviewerConfig {
 |---|---|---|---|
 | `name` | `'develop'` | `'improve'` | `'debug'` |
 | `defaultMaxConcurrentTasks` | `5` | `5` | `3` |
-| `fixerSteps` length | **1** | **2** | **1** |
+| `fixerSteps` length | **2** | **2** | **2** |
 | `finalReviewers` length | **5** | **5** | **5** |
 | `phases` length | **5** (incl. initialization) | **4** (no initialization) | **5** (incl. initialization) |
 
@@ -211,15 +211,11 @@ same `titleFormatter`.
 **fixerSteps detail:**
 
 ```ts
-// develop & debug — single fix step:
+// All three workflows — a writable fix step followed by a read-only
+// verification step (using ReviewResultSchema, run by the fixer-reviewer):
 fixerSteps: [
-    { name: 'fix', profileId: 'fixer', isReadOnly: false },
-]
-
-// improve — fix step + a read-only verification step using ReviewResultSchema:
-fixerSteps: [
-    { name: 'fix',    profileId: 'fixer',             isReadOnly: false },
-    { name: 'verify', profileId: 'implement-reviewer', isReadOnly: true, schema: ReviewResultSchema },
+    { name: 'fix',    profileId: 'fixer',          isReadOnly: false },
+    { name: 'verify', profileId: 'fixer-reviewer', isReadOnly: true, schema: ReviewResultSchema },
 ]
 ```
 
@@ -387,10 +383,11 @@ The backbone references the following profile IDs:
 | `plan-reviewer` | `planning.ts` | planning | Approves or rejects a plan with feedback |
 | `implementer` | `steps.ts` | implementing | Executes a code or non-code task (default implementer profile) |
 | `implementer-lite` | `implementation.ts` *(example)* | implementing | Any non-default `profile` on a plan task replaces `implementer` in the `execute` step |
-| `implement-reviewer` | `steps.ts`, `improve` fixerSteps | implementing, review | Reviews completed task output against `ReviewResultSchema` |
+| `implement-reviewer` | `steps.ts` | implementing, review | Reviews completed task output against `ReviewResultSchema` |
 | `test-writer` | `steps.ts` (`CODE_STEPS`) | implementing | Writes tests first for code tasks |
 | `test-reviewer` | `steps.ts` (`CODE_STEPS`) | implementing | Reviews the written tests |
 | `fixer` | `final-review.ts`, `develop`/`debug`/`improve` fixerSteps | review | Resolves actionable findings (severity ≥ medium) found by the specialized reviewers |
+| `fixer-reviewer` | `develop`/`debug`/`improve` fixerSteps | review | The `verify` step — reviews a completed fix (resolution, regressions, scope) against `ReviewResultSchema` |
 | `final-reviewer` | *(legacy, unused by default)* | review | The original single whole-codebase quality reviewer; superseded by the specialized reviewers |
 | `efficiency-reviewer` | `final-review.ts` | review | Performance / resource-efficiency dimension of the final review |
 | `code-quality-reviewer` | `final-review.ts` | review | Correctness / readability / maintainability dimension of the final review |

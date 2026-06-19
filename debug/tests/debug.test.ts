@@ -18,11 +18,11 @@ import { z } from "zod";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
-import type { AgentProfile } from "@harms-haus/engin";
+import type { AgentProfile } from "@harms-haus/engin-engine";
 import type { Plan, ScoutingReview, PlanReview, ReviewResult, FinalReviewResult, FinalReviewFinding } from "../main.ts";
 
 // Capture real module before mocking so we can restore it in afterAll.
-const realModule = Object.assign({}, await import("@harms-haus/engin"));
+const realModule = Object.assign({}, await import("@harms-haus/engin-engine"));
 
 // ─── Mocks ──────────────────────────────────────────────────────────────────
 
@@ -34,7 +34,7 @@ const mockLanePoolRun = mock() as ReturnType<typeof mock> & ((...args: unknown[]
 const mockLanePoolCtor = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 const mockRunMultiStepTask = mock() as ReturnType<typeof mock> & ((...args: unknown[]) => unknown);
 
-mock.module("@harms-haus/engin", () => ({
+mock.module("@harms-haus/engin-engine", () => ({
     ...realModule,
     createHarness: (...args: unknown[]) => mockCreateHarness(...args),
     promptForStructured: (...args: unknown[]) => mockPromptForStructured(...args),
@@ -51,7 +51,7 @@ mock.module("@harms-haus/engin", () => ({
 
 import {
     WorkflowStatusTracker,
-} from "@harms-haus/engin";
+} from "@harms-haus/engin-engine";
 import {
     scoutingPhase,
     scoutingReviewPhase,
@@ -1333,5 +1333,5 @@ describe("DebugWorkflowOptions and RunOptions", () => {
 
 // Restore the real module so mocks don't leak into other test files.
 afterAll(() => {
-    mock.module("@harms-haus/engin", () => realModule);
+    mock.module("@harms-haus/engin-engine", () => realModule);
 });

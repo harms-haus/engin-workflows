@@ -38,7 +38,7 @@ const MockLanePool = jest.fn().mockImplementation(() => ({
   run: mockPoolRun,
 }));
 
-mock.module('@harms-haus/engin', () => ({
+mock.module('@harms-haus/engin-engine', () => ({
   ...createEnginMock(),
   runStepTask: mockRunStepTask,
   getDiff: mockGetDiff,
@@ -822,5 +822,70 @@ describe('DEFAULT_FINAL_REVIEWERS', () => {
     expect(byDim['ui-ux'].profileId).toBe('ui-ux-reviewer');
     expect(byDim.security.profileId).toBe('security-reviewer');
     expect(byDim.documentation.profileId).toBe('documentation-reviewer');
+  });
+});
+
+// ── Reviewer session persistence ─────────────────────────────────────────────
+
+describe('finalReviewPhase — reviewer session persistence', () => {
+  it('passes a sessionBaseDir to every reviewer runStepTask call so failures are debuggable on disk', async () => {
+    const tracker = makeMockTracker();
+    await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    expect(mockRunStepTask.mock.calls.length).toBeGreaterThan(0);
+    for (const call of mockRunStepTask.mock.calls) {
+      expect(call[0].sessionBaseDir).toBe('/work/sessions/review');
+    }
+  });
+});
+
+// ── Lane isolation (one flaky reviewer must not abort the run) ───────────────
+
+describe('finalReviewPhase — lane isolation on reviewer failure', () => {
+  it('a throwing reviewer does NOT abort the run; the lane is not-clean and the others still run', async () => {
+    const tracker = makeMockTracker();
+    // ui-ux-reviewer's INITIAL review throws (structured-output failure); all others clean.
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'ui-ux-reviewer-round-0') {
+        throw new Error('Failed to produce structured output after 3 attempts: No JSON found in response');
+      }
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
+
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
+
+    // Phase resolves (does not throw) and is not clean because the ui-ux lane failed.
+    expect(result).toBe(false);
+    // The other four reviewers still ran their initial pass.
+    const cleanInitials = mockRunStepTask.mock.calls.filter(
+      (c) => isInitialReviewCall(c[0].taskId) && c[0].taskId !== 'ui-ux-reviewer-round-0',
+    );
+    expect(cleanInitials).toHaveLength(EXPECTED_REVIEWER_COUNT - 1);
+    // No fixer pool spawned for the failed lane.
+    expect(MockLanePool).not.toHaveBeenCalled();
+  });
+
+  it('audit-logs the lane failure as an error event and fires onError', async () => {
+    const append = jest.fn().mockResolvedValue(undefined);
+    const tracker = { auditLog: { append } } as never;
+    const onError = jest.fn();
+    const onStatus = { onError } as never;
+    mockRunStepTask.mockImplementation(async (opts: any) => {
+      if (opts.taskId === 'security-reviewer-round-0') throw new Error('boom: no JSON');
+      return makeCleanResult(dimensionOfProfileId(opts.profileId));
+    });
+
+    const result = await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5, undefined, onStatus);
+
+    expect(result).toBe(false);
+    // Exactly one error audit event, attributed to the failing reviewer.
+    const failures = append.mock.calls.map((c) => c[0]).filter((e) => e.type === 'error');
+    expect(failures).toHaveLength(1);
+    expect(failures[0].agentId).toBe('security-reviewer');
+    expect(failures[0].error).toContain('boom: no JSON');
+    // onError fired once for the failing lane.
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][0].agentId).toBe('security-reviewer');
+    expect(onError.mock.calls[0][0].phaseId).toBe('review');
   });
 });

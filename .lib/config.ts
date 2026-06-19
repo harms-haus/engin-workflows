@@ -1,4 +1,4 @@
-import type { StepDefinition, WorkflowRunOptions } from "@harms-haus/engin";
+import type { StepDefinition, WorkflowRunOptions } from "@harms-haus/engin-engine";
 
 // ─── Workflow Configuration ─────────────────────────────────────────────────
 //

@@ -5,8 +5,8 @@
 // `runSpir`. All phase logic lives in the sibling .lib modules; this file
 // owns only the phase ordering, the phase-transition helper, the per-phase
 // dispatcher, and the top-level orchestrator.
-import type { RendererRegistry, StatusCallbacks } from "@harms-haus/engin";
-import { WorkflowStatusTracker, resolveProfilesDirs } from "@harms-haus/engin";
+import type { RendererRegistry, StatusCallbacks } from "@harms-haus/engin-engine";
+import { WorkflowStatusTracker, resolveProfilesDirs } from "@harms-haus/engin-engine";
 import type { WorkflowConfig, SpirRunOptions } from "./config";
 import type { Plan, ScoutingGap } from "./schemas";
 import { scoutingPhase, scoutingReviewPhase } from "./scouting";

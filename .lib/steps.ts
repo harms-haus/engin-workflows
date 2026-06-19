@@ -1,4 +1,4 @@
-import type { StepDefinition } from "@harms-haus/engin";
+import type { StepDefinition } from "@harms-haus/engin-engine";
 import { ReviewResultSchema } from "./schemas";
 
 // ─── Step Definitions ───────────────────────────────────────────────────────

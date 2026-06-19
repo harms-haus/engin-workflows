@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@harms-haus/engin": "link:@harms-haus/engin",
+    "@harms-haus/engin-engine": "link:@harms-haus/engin-engine",
     "zod": "^3.25.0"
   },
   "devDependencies": {

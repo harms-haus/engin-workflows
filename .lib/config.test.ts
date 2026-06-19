@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import type { WorkflowRunOptions } from '@harms-haus/engin';
+import type { WorkflowRunOptions } from '@harms-haus/engin-engine';
 import type { WorkflowConfig, SpirRunOptions, FinalReviewerConfig } from './config';
 import { normalizeOptions } from './config';
 
@@ -121,7 +121,7 @@ describe('WorkflowConfig.finalReviewers', () => {
 // ─── WorkflowRunOptions ────────────────────────────────────────────────────
 
 describe('WorkflowRunOptions', () => {
-  it('is still exported from @harms-haus/engin', () => {
+  it('is still exported from @harms-haus/engin-engine', () => {
     // Type-level: just verify it's a valid type reference
     const opts: WorkflowRunOptions = {
       cwd: '/tmp',

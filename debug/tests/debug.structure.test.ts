@@ -14,9 +14,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 // Capture real module before mocking so we can spread it into the mock.
-const realModule = Object.assign({}, await import("@harms-haus/engin"));
+const realModule = Object.assign({}, await import("@harms-haus/engin-engine"));
 
-mock.module("@harms-haus/engin", () => ({
+mock.module("@harms-haus/engin-engine", () => ({
     ...realModule,
     createHarness: mock(() => { throw new Error("not mocked"); }),
     promptForStructured: mock(() => { throw new Error("not mocked"); }),
@@ -82,9 +82,9 @@ describe("workflowConfig", () => {
         expect(workflowConfig.defaultMaxConcurrentTasks).toBe(3);
     });
 
-    it("has fixerSteps with exactly 1 step", () => {
+    it("has fixerSteps with exactly 2 steps", () => {
         expect(Array.isArray(workflowConfig.fixerSteps)).toBe(true);
-        expect(workflowConfig.fixerSteps).toHaveLength(1);
+        expect(workflowConfig.fixerSteps).toHaveLength(2);
     });
 
     it("fixerSteps[0] has name:'fix', profileId:'fixer', isReadOnly:false", () => {
@@ -92,6 +92,13 @@ describe("workflowConfig", () => {
         expect(step.name).toBe("fix");
         expect(step.profileId).toBe("fixer");
         expect(step.isReadOnly).toBe(false);
+    });
+
+    it("fixerSteps[1] has name:'verify', profileId:'fixer-reviewer', isReadOnly:true", () => {
+        const step = workflowConfig.fixerSteps[1];
+        expect(step.name).toBe("verify");
+        expect(step.profileId).toBe("fixer-reviewer");
+        expect(step.isReadOnly).toBe(true);
     });
 
     it("has phases as an array with 4 entries (initialization excluded)", () => {

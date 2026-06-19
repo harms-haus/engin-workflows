@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { StatusCallbacks, WorkflowStatusTracker } from '@harms-haus/engin';
+import type { StatusCallbacks, WorkflowStatusTracker } from '@harms-haus/engin-engine';
 import { createEnginMock } from './engin-mock';
 
 // ─── Mock @harms-haus/engin ────────────────────────────────────────────────
@@ -87,7 +87,7 @@ mockRunMultiStepTask.mockImplementation(async (opts) => {
   return { results, approved: nextApproved };
 });
 
-mock.module('@harms-haus/engin', () => ({
+mock.module('@harms-haus/engin-engine', () => ({
   ...createEnginMock(),
   LanePool: MockLanePool,
   TaskTracker: MockTaskTracker,
