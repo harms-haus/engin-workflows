@@ -322,18 +322,19 @@ describe('finalReviewPhase — clean assessment', () => {
     expect(mockPoolRun).not.toHaveBeenCalled();
   });
 
-  it('auditLogs each reviewer result (5 events for one clean pass)', async () => {
+  it('does NOT manually append structured_output for reviewer results (the default auditor handles it)', async () => {
     const append = jest.fn().mockResolvedValue(undefined);
     const tracker = { auditLog: { append } } as never;
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-    expect(append).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT);
-    for (const call of append.mock.calls) {
-      const event = call[0];
-      expect(event.type).toBe('structured_output');
-      expect(event.output).toBeDefined();
-      expect(event.output.findings).toEqual([]);
-    }
+    // The audit migration deleted the manual
+    // `auditLog.append(structuredOutputEvent(…))` appends; reviewer results now
+    // land via the engine's default auditor (fired through the threaded
+    // hookRegistry by runStepTask). With the engine mocked here no auditor
+    // fires, so append must NOT receive a structured_output event.
+    expect(append).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'structured_output' }),
+    );
   });
 });
 
@@ -708,7 +709,7 @@ describe('finalReviewPhase — per-lane loop behavior', () => {
     expect(MockLanePool).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT * MAX_FIX_ROUNDS);
   });
 
-  it('auditLogs every reviewer result across all passes (initial + verify)', async () => {
+  it('does NOT manually append structured_output across all passes (initial + verify)', async () => {
     const append = jest.fn().mockResolvedValue(undefined);
     const tracker = { auditLog: { append } } as never;
     mockRunStepTask.mockImplementation(async (opts: any) => {
@@ -720,8 +721,12 @@ describe('finalReviewPhase — per-lane loop behavior', () => {
 
     await finalReviewPhase(tracker, ['/profiles'], '/cwd', '/work', 5);
 
-    // 5 initial reviews + 1 efficiency verify = 6 audit events.
-    expect(append).toHaveBeenCalledTimes(EXPECTED_REVIEWER_COUNT + 1);
+    // The audit migration removed the manual structured_output appends for BOTH
+    // the initial review and the review-fixes passes. With the engine mocked
+    // here no auditor fires, so append must NOT receive a structured_output event.
+    expect(append).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'structured_output' }),
+    );
   });
 });
 

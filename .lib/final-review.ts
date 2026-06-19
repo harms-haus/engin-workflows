@@ -1,10 +1,10 @@
-import type { StatusCallbacks, StepDefinition, WorkflowStatusTracker } from "@harms-haus/engin-engine";
+import type { StatusCallbacks, StepDefinition, WorkflowRunOptions, WorkflowStatusTracker } from "@harms-haus/engin-engine";
 import { LanePool, TaskTracker, runStepTask, getDiff } from "@harms-haus/engin-engine";
 import { join } from "node:path";
 import { FinalReviewResultSchema } from "./schemas";
 import type { FinalReviewResult, FinalReviewFinding, FinalReviewSeverity } from "./schemas";
 import type { FinalReviewerConfig } from "./config";
-import { structuredOutputEvent, errorEvent } from "./helpers";
+import { errorEvent } from "./helpers";
 
 // ─── Phase 6: Multi-Dimensional Final Review (per-lane loops) ───────────────
 //
@@ -213,6 +213,8 @@ interface LaneContext {
     titleFormatter: (description: string) => string;
     /** Recomputes the working-tree diff (against HEAD); called fresh before each review pass. */
     collectDiff: () => string;
+    /** Threaded so the engine's default auditor observes each reviewer's structured_output. */
+    hookRegistry?: WorkflowRunOptions["hookRegistry"];
 }
 
 /**
@@ -263,6 +265,10 @@ async function runFixersForLane(
         apiKeys: ctx.apiKeys,
         onStatus: ctx.onStatus,
         auditLog: ctx.tracker.auditLog,
+        // Thread the hook registry alongside auditLog so LanePool.run() can
+        // auto-register its own default auditor and observe each fixer step's
+        // structured_output / decision events.
+        hookRegistry: ctx.hookRegistry,
         taskTracker: fixerTracker,
         getStepsForTask: () => ctx.fixerSteps,
         signal: ctx.signal,
@@ -307,9 +313,11 @@ async function runFinalReviewLane(
         schema: FinalReviewResultSchema,
         prompt: buildReviewerPrompt(reviewer, [], ctx.collectDiff()),
         signal: ctx.signal,
+        // Thread the hook registry so the engine's default auditor observes
+        // this review's structured_output.
+        hookRegistry: ctx.hookRegistry,
     });
     history.push(result);
-    await ctx.tracker.auditLog.append(structuredOutputEvent(reviewer.profileId, result, reviewTaskId));
 
     // No fixer / review-fixes if the lane is already clean.
     let pending = actionableFindings(result);
@@ -335,9 +343,11 @@ async function runFinalReviewLane(
             schema: FinalReviewResultSchema,
             prompt: buildReviewFixesPrompt(reviewer, history, fixRound, ctx.collectDiff()),
             signal: ctx.signal,
+            // Thread the hook registry so the engine's default auditor observes
+            // this review-fixes' structured_output.
+            hookRegistry: ctx.hookRegistry,
         });
         history.push(verify);
-        await ctx.tracker.auditLog.append(structuredOutputEvent(reviewer.profileId, verify, verifyTaskId));
 
         pending = actionableFindings(verify);
         if (pending.length === 0) return true;
@@ -369,6 +379,7 @@ export async function finalReviewPhase(
     finalReviewers: readonly FinalReviewerConfig[] = DEFAULT_FINAL_REVIEWERS,
     fixerSteps: StepDefinition[] = [{ name: "fix", profileId: "fixer", isReadOnly: false }],
     titleFormatter: (description: string) => string = (d) => d.slice(0, 100),
+    hookRegistry?: WorkflowRunOptions["hookRegistry"],
 ): Promise<boolean> {
     const collectDiff = (): string => {
         try {
@@ -381,6 +392,7 @@ export async function finalReviewPhase(
     const ctx: LaneContext = {
         tracker, profilesDirs, cwd, workDir, maxConcurrentTasks, apiKeys, onStatus, signal, fixerSteps, titleFormatter,
         collectDiff,
+        hookRegistry,
     };
 
     // Run all lanes in parallel; the phase is clean iff every lane is clean.

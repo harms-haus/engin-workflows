@@ -92,6 +92,27 @@ function makeMockTracker() {
   } as never;
 }
 
+/**
+ * Extract the `beforeTask` step-substitution hook that `implementationPhase`
+ * registers on the LanePool's hookRegistry. Returns the hook function so tests
+ * can invoke it directly with a task and assert the returned `{ steps }`.
+ */
+function extractBeforeTaskHook(): (args: { task: unknown; steps: unknown[] }) => { steps: { name: string; profileId: string; isReadOnly: boolean }[] } | undefined {
+  const poolOptions = MockLanePool.mock.calls[0][0];
+  expect(poolOptions).toHaveProperty('hookRegistry');
+  const registry = poolOptions.hookRegistry as { register: { mock: { calls: unknown[][] } } };
+  for (const call of registry.register.mock.calls) {
+    const hooks = call[0] as Record<string, unknown> | undefined;
+    if (hooks && 'beforeTask' in hooks) {
+      const value = hooks.beforeTask;
+      // The hook may be registered as a single fn or fn[] (both are valid).
+      const fn = Array.isArray(value) ? value[0] : value;
+      if (typeof fn === 'function') return fn as never;
+    }
+  }
+  throw new Error('beforeTask hook was not registered on the hookRegistry');
+}
+
 // ─── PhaseId Threading ──────────────────────────────────────────────────────
 
 describe('implementationPhase — phaseId threading', () => {
@@ -299,7 +320,7 @@ describe('implementationPhase — phaseId threading', () => {
     expect(mockPoolRun).toHaveBeenCalledTimes(1);
   });
 
-  it('provides a getStepsForTask callback that uses CODE_STEPS for code tasks', async () => {
+  it('registers a beforeTask hook on the hookRegistry passed to LanePool', async () => {
     const tracker = makeMockTracker();
 
     await implementationPhase(
@@ -312,18 +333,53 @@ describe('implementationPhase — phaseId threading', () => {
     );
 
     const poolOptions = MockLanePool.mock.calls[0][0];
-    const getSteps = poolOptions.getStepsForTask;
+    // FIX C: both getStepsForTask (registration-time seed for onTaskRegister)
+    // and hookRegistry (claim-time beforeTask hook) are threaded into LanePool.
+    expect(poolOptions).toHaveProperty('hookRegistry');
+    expect(poolOptions).toHaveProperty('getStepsForTask');
+    expect(typeof poolOptions.getStepsForTask).toBe('function');
 
-    // Verify it returns an array of steps
+    // FIX C: getStepsForTask returns CODE_STEPS for a code task (registration-time seed).
     const codeTask = { id: 't1', title: '', prompt: '', profile: 'implementer', files: [], dependencies: [], isCode: true } as any;
-    const steps = getSteps(codeTask);
-    expect(Array.isArray(steps)).toBe(true);
-    expect(steps.length).toBeGreaterThan(0);
+    const stepsFromHelper = poolOptions.getStepsForTask(codeTask);
+    expect(Array.isArray(stepsFromHelper)).toBe(true);
+    expect(stepsFromHelper.length).toBeGreaterThan(0);
+    expect(stepsFromHelper[0].name).toBe('write-tests'); // first CODE_STEP
+
+    // The beforeTask step-substitution hook is registered on that registry.
+    const registry = poolOptions.hookRegistry as { register: { mock: { calls: unknown[][] } } };
+    const registerCalls = registry.register.mock.calls;
+    const hooksWithBeforeTask = registerCalls
+      .map((c: unknown[]) => c[0])
+      .filter((h: unknown): h is { beforeTask: unknown } => !!h && typeof h === 'object' && 'beforeTask' in h);
+    expect(hooksWithBeforeTask.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('beforeTask hook returns CODE_STEPS for code tasks (write-tests first)', async () => {
+    const tracker = makeMockTracker();
+
+    await implementationPhase(
+      tracker,
+      ['/profiles'],
+      SAMPLE_PLAN,
+      '/cwd',
+      5,
+      '/work',
+    );
+
+    const beforeTask = extractBeforeTaskHook();
+
+    const codeTask = { id: 't1', title: '', prompt: '', profile: 'implementer', files: [], dependencies: [], isCode: true } as any;
+    const result = beforeTask({ task: codeTask, steps: [] });
+
+    expect(result).toBeDefined();
+    expect(Array.isArray(result!.steps)).toBe(true);
+    expect(result!.steps.length).toBeGreaterThan(0);
     // Code tasks should have write-tests as first step
-    expect(steps[0].name).toBe('write-tests');
+    expect(result!.steps[0].name).toBe('write-tests');
   });
 
-  it('provides a getStepsForTask callback that uses NON_CODE_STEPS for non-code tasks', async () => {
+  it('beforeTask hook returns NON_CODE_STEPS for non-code tasks (execute + review)', async () => {
     const tracker = makeMockTracker();
 
     await implementationPhase(
@@ -335,18 +391,18 @@ describe('implementationPhase — phaseId threading', () => {
       '/work',
     );
 
-    const poolOptions = MockLanePool.mock.calls[0][0];
-    const getSteps = poolOptions.getStepsForTask;
+    const beforeTask = extractBeforeTaskHook();
 
-    // Non-code task should not have test steps
     const nonCodeTask = { id: 't2', title: '', prompt: '', profile: 'implementer', files: [], dependencies: [], isCode: false } as any;
-    const steps = getSteps(nonCodeTask);
-    expect(steps.length).toBe(2);
-    expect(steps[0].name).toBe('execute');
-    expect(steps[1].name).toBe('review');
+    const result = beforeTask({ task: nonCodeTask, steps: [] });
+
+    expect(result).toBeDefined();
+    expect(result!.steps.length).toBe(2);
+    expect(result!.steps[0].name).toBe('execute');
+    expect(result!.steps[1].name).toBe('review');
   });
 
-  it('getStepsForTask substitutes custom profile for implementer step', async () => {
+  it('beforeTask hook substitutes a custom implementer profile into the execute step', async () => {
     const tracker = makeMockTracker();
 
     await implementationPhase(
@@ -358,17 +414,18 @@ describe('implementationPhase — phaseId threading', () => {
       '/work',
     );
 
-    const poolOptions = MockLanePool.mock.calls[0][0];
-    const getSteps = poolOptions.getStepsForTask;
+    const beforeTask = extractBeforeTaskHook();
 
     const customProfileTask = { id: 't3', title: '', prompt: '', profile: 'implementer-lite', files: [], dependencies: [], isCode: true } as any;
-    const steps = getSteps(customProfileTask);
-    const executeStep = steps.find((s: { name: string }) => s.name === 'execute');
+    const result = beforeTask({ task: customProfileTask, steps: [] });
+
+    expect(result).toBeDefined();
+    const executeStep = result!.steps.find((s: { name: string }) => s.name === 'execute');
     expect(executeStep).toBeDefined();
     expect(executeStep!.profileId).toBe('implementer-lite');
   });
 
-  it('getStepsForTask preserves other step profiles when substituting', async () => {
+  it('beforeTask hook preserves reviewer/test-writer profiles when substituting the implementer', async () => {
     const tracker = makeMockTracker();
 
     await implementationPhase(
@@ -380,21 +437,55 @@ describe('implementationPhase — phaseId threading', () => {
       '/work',
     );
 
-    const poolOptions = MockLanePool.mock.calls[0][0];
-    const getSteps = poolOptions.getStepsForTask;
+    const beforeTask = extractBeforeTaskHook();
 
     const customProfileTask2 = { id: 't4', title: '', prompt: '', profile: 'implementer-lite', files: [], dependencies: [], isCode: true } as any;
-    const steps2 = getSteps(customProfileTask2);
+    const result = beforeTask({ task: customProfileTask2, steps: [] });
 
+    expect(result).toBeDefined();
     // write-tests should still use 'test-writer'
-    const writeTestsStep = steps2.find((s: { name: string }) => s.name === 'write-tests');
+    const writeTestsStep = result!.steps.find((s: { name: string }) => s.name === 'write-tests');
     expect(writeTestsStep).toBeDefined();
     expect(writeTestsStep!.profileId).toBe('test-writer');
 
     // review step should still use 'implement-reviewer'
-    const reviewStep = steps2.find((s: { name: string }) => s.name === 'review');
+    const reviewStep = result!.steps.find((s: { name: string }) => s.name === 'review');
     expect(reviewStep).toBeDefined();
     expect(reviewStep!.profileId).toBe('implement-reviewer');
+  });
+
+  it('forwards a provided hookRegistry into LanePool and registers beforeTask on it', async () => {
+    const tracker = makeMockTracker();
+    const customRegistry = {
+      register: jest.fn(),
+      hasSubscribers: jest.fn().mockReturnValue(false),
+      invokeObserve: jest.fn().mockResolvedValue(undefined),
+      invokePipeline: jest.fn().mockResolvedValue(undefined),
+      invokeFirstWins: jest.fn().mockResolvedValue(undefined),
+      invokeAllRun: jest.fn().mockResolvedValue(undefined),
+    };
+
+    await implementationPhase(
+      tracker,
+      ['/profiles'],
+      SAMPLE_PLAN,
+      '/cwd',
+      5,
+      '/work',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      customRegistry as never,
+    );
+
+    const poolOptions = MockLanePool.mock.calls[0][0];
+    // The PROVIDED registry is forwarded (not a freshly-created one).
+    expect(poolOptions.hookRegistry).toBe(customRegistry);
+    // The beforeTask hook is registered on the provided registry.
+    expect(customRegistry.register).toHaveBeenCalledWith(
+      expect.objectContaining({ beforeTask: expect.any(Function) }),
+    );
   });
 });
 

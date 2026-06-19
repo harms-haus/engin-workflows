@@ -1,51 +1,103 @@
 // ─── SPIR Backbone Orchestrator Tests ───────────────────────────────────────
 //
-// Tests for spir.ts: phase registration, config.phases usage, abort handling,
-// sidebar updates, and core helper functions.
+// Tests for spir.ts after the PhaseRunner migration. The hand-written
+// `executePhase` switch + `runSpir` phase loop are replaced by the engine's
+// `PhaseRunner` (task-20):
+//
+//   - Phases are declared as a `PhaseDefinition[]` (`{ id, label, icon, run }`).
+//   - `runSpir` builds the `PhaseDefinition[]`, constructs
+//     `new PhaseRunner({ phases, tracker, hookRegistry, cwd, workDir, signal })`,
+//     and calls `.run()`.
+//   - SPIR-specific orchestration moves into phase-level hooks registered on
+//     the hookRegistry:
+//       • `shouldRetryPhase` — scouting ≤3 rounds
+//       • `onPhaseSettled`   — scouting collect-loop (task-38)
+//       • `afterPhase`       — sidebar indicator update
+//   - `options.hookRegistry` is threaded through `SpirRunOptions` to the
+//     PhaseRunner.
+//   - `executePhase`, `completePhase`, and the inline phase loop are DELETED.
+//
+// The phase BODIES (scoutingPhase, planningPhase, …) stay in their sibling
+// `.lib/*.ts` files; only the orchestration moved. These tests mock the
+// engine's `PhaseRunner` (its constructor captures the options it receives) so
+// we can assert exactly what `runSpir` wires into it, and invoke the captured
+// phase `run()` functions + hooks directly.
 // ────────────────────────────────────────────────────────────────────────────
 
-import { describe, expect, it, jest, mock, beforeEach, afterEach } from 'bun:test';
+import { describe, expect, it, jest, mock, beforeEach } from 'bun:test';
 import { createEnginMock } from './engin-mock';
 
 // ─── Mock the engin module BEFORE any static imports ────────────────────────
 // We provide a complete mock for all value imports that spir.ts and its
-// re-exported modules need, so the TUI tree is never actually loaded.
+// re-exported modules need, plus a constructor-spied `PhaseRunner` whose
+// options we capture for the migration assertions.
 
 const mockCancelTask = jest.fn<(id: string) => void>();
-const mockGetAllTasks = jest.fn<() => { id: string; status: string }[]>();
+const mockGetAllTasks = jest.fn<() => { id: string; status: string; phaseId?: string }[]>().mockReturnValue([]);
 const mockTaskTracker = {
   cancelTask: mockCancelTask,
   getAllTasks: mockGetAllTasks,
 };
 
-const MockWorkflowStatusTracker = jest.fn<() => Record<string, unknown>>().mockImplementation(() => ({
-  setPhase: jest.fn(),
-  setCurrentPhase: jest.fn(),
-  save: jest.fn().mockResolvedValue(undefined),
-  setWorkflowData: jest.fn(),
-  setTaskPrompt: jest.fn(),
-  setWorktree: jest.fn(),
-  get workflowData() {
-    return {};
-  },
-  get currentPhase() {
-    return '';
-  },
-  get completedPhases() {
-    return [];
-  },
-  get taskTracker() {
-    return mockTaskTracker;
-  },
-  get stats() {
-    return { totalTokens: 0, totalCost: 0, agentCount: 0 };
-  },
-  setScoutingReports: jest.fn(),
-  setPlan: jest.fn(),
-  setResearch: jest.fn(),
-  setPlanReviewFeedback: jest.fn(),
-  clearPlanReviewFeedback: jest.fn(),
-}));
+/** Build a rich no-op tracker instance (the value returned by the mocked
+ *  `WorkflowStatusTracker` constructor and by `.load` for resume tests). */
+function makeTrackerInstance(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    setPhase: jest.fn(),
+    setCurrentPhase: jest.fn(),
+    registerPhase: jest.fn(),
+    setTaskPrompt: jest.fn(),
+    setWorktree: jest.fn(),
+    setWorkflowData: jest.fn(),
+    save: jest.fn().mockResolvedValue(undefined),
+    recordAgentSpawn: jest.fn(),
+    incrementAgentCount: jest.fn(),
+    // `auditLog` is needed when the delegating `finalReviewPhase` spy forwards
+    // to the real implementation under spir's mocked engine (the lane-isolation
+    // catch path appends an error event on `runStepTask` failure).
+    auditLog: { append: jest.fn().mockResolvedValue(undefined) },
+    get workflowData() {
+      return {};
+    },
+    get currentPhase() {
+      return '';
+    },
+    get currentPhaseId() {
+      return '';
+    },
+    get completedPhases() {
+      return [];
+    },
+    get completedPhaseIds() {
+      return [];
+    },
+    get taskTracker() {
+      return mockTaskTracker;
+    },
+    get stats() {
+      return { agentCount: 0, totalTokens: 0, totalCost: 0 };
+    },
+    setScoutingReports: jest.fn(),
+    setPlan: jest.fn(),
+    setResearch: jest.fn(),
+    setPlanReviewFeedback: jest.fn(),
+    clearPlanReviewFeedback: jest.fn(),
+    ...overrides,
+  };
+}
+
+const MockWorkflowStatusTracker = jest.fn<() => Record<string, unknown>>().mockImplementation(() =>
+  makeTrackerInstance(),
+);
+
+// Default `.load` rejects with the "state file not found" error so a fresh
+// `runSpir` run constructs a new tracker via `new WorkflowStatusTracker(...)`.
+// Resume tests override this with `mockResolvedValueOnce`.
+const TrackerCtor = MockWorkflowStatusTracker as unknown as {
+  load: ReturnType<typeof jest.fn>;
+  mockClear: () => void;
+};
+TrackerCtor.load = jest.fn().mockRejectedValue(new Error('Workflow state file not found: .engin-state.json'));
 
 const MockLanePool = jest.fn().mockImplementation(() => ({
   run: jest.fn().mockResolvedValue({ completedTasks: 0, failedTasks: 0 }),
@@ -64,20 +116,105 @@ const MockTaskTracker = jest.fn().mockImplementation(() => ({
   submitForReview: jest.fn(),
 }));
 
+// ─── PhaseRunner constructor spy (captures the options runSpir wires in) ────
+//
+// `capturedRunnerOptions` holds the options object passed to the last
+// `new PhaseRunner(...)` call inside `runSpir`. The mock's `run` is a no-op so
+// we can drive the captured phase `run()` functions / hooks ourselves.
+
+interface PhaseRunCtxLike {
+  tracker: unknown;
+  hookRegistry?: unknown;
+  state: Record<string, unknown>;
+  cwd: string;
+  workDir: string;
+  signal?: AbortSignal;
+}
+
+interface PhaseDefLike {
+  id: string;
+  label: string;
+  icon: string;
+  run: (ctx: PhaseRunCtxLike) => Promise<unknown>;
+}
+
+interface CapturedRunnerOptions {
+  phases: PhaseDefLike[];
+  tracker: unknown;
+  hookRegistry?: unknown;
+  cwd: string;
+  workDir: string;
+  signal?: AbortSignal;
+  maxRounds?: number;
+}
+
+let capturedRunnerOptions: CapturedRunnerOptions | undefined;
+const mockRunnerRun = jest.fn<() => Promise<void>>().mockResolvedValue(undefined);
+const MockPhaseRunner = jest.fn<(options: unknown) => { run: typeof mockRunnerRun }>().mockImplementation((options) => {
+  capturedRunnerOptions = options as CapturedRunnerOptions;
+  return { run: mockRunnerRun };
+});
+
+// ─── hookRegistry spy: records every hook object passed to `register` ──────
+//
+// When `runSpir` is given `options.hookRegistry`, it registers its SPIR hooks
+// onto THAT registry; tests pass their own spy and then read
+// `spy.registeredHooks` / `spy.hasSubscribers(...)`. `createHookRegistry` is
+// also mocked for the "options omit hookRegistry" path.
+
+interface RegistrySpy {
+  registeredHooks: Record<string, unknown>;
+  register: ReturnType<typeof jest.fn>;
+  hasSubscribers: ReturnType<typeof jest.fn>;
+  invokeObserve: ReturnType<typeof jest.fn>;
+  invokeFirstWins: ReturnType<typeof jest.fn>;
+  invokeAllRun: ReturnType<typeof jest.fn>;
+  invokePipeline: ReturnType<typeof jest.fn>;
+}
+
+function makeRegistrySpy(): RegistrySpy {
+  const spy: RegistrySpy = {
+    registeredHooks: {},
+    register: jest.fn((hooks: Record<string, unknown>) => {
+      Object.assign(spy.registeredHooks, hooks);
+    }),
+    hasSubscribers: jest.fn((name: string) => name in spy.registeredHooks),
+    invokeObserve: jest.fn(),
+    invokeFirstWins: jest.fn(),
+    invokeAllRun: jest.fn(),
+    invokePipeline: jest.fn(),
+  };
+  return spy;
+}
+
+const mockCreateHookRegistry = jest.fn<() => RegistrySpy>().mockImplementation(() => makeRegistrySpy());
+
 mock.module('@harms-haus/engin-engine', () => ({
   ...createEnginMock(),
   // Types are compile-time only; these are the runtime values
   WorkflowStatusTracker: MockWorkflowStatusTracker,
   LanePool: MockLanePool,
   TaskTracker: MockTaskTracker,
+  PhaseRunner: MockPhaseRunner,
+  createHookRegistry: mockCreateHookRegistry,
 }));
 
-// ─── Mock sibling phase modules (for executePhase dispatch tests) ─────────
+// ─── Mock sibling phase modules (the phase BODIES stay here; only the
+//     orchestration moved to PhaseRunner) ──────────────────────────────────
 const mockImplementationPhase = jest.fn().mockResolvedValue(undefined);
 const mockPlanningPhase = jest.fn().mockResolvedValue({ tasks: [], strategy: '' });
 const mockScoutingPhase = jest.fn().mockResolvedValue([]);
 const mockScoutingReviewPhase = jest.fn().mockResolvedValue({ research: '', gaps: [], ready: true, files: [] });
-const mockFinalReviewPhase = jest.fn().mockResolvedValue(undefined);
+// `mock.module` is process-global, so the `./final-review` stub registered
+// here wins for the WHOLE test process. Another file (final-review.test.ts)
+// imports the REAL `./final-review` to run its behavioral tests against the
+// genuine implementation + the `DEFAULT_FINAL_REVIEWERS` / `isActionableSeverity`
+// named exports. Re-export those verbatim and wrap `finalReviewPhase` in a
+// delegating spy (records the call, then forwards to the real function) so
+// spir's call-count assertions keep working WITHOUT poisoning the sibling
+// test file's real-implementation assertions.
+const realFinalReview = await import('./final-review');
+const mockFinalReviewPhase = jest.fn(realFinalReview.finalReviewPhase);
 const mockInitializationPhase = jest.fn().mockResolvedValue('Test Title');
 
 mock.module('./implementation', () => ({
@@ -95,6 +232,8 @@ mock.module('./scouting', () => ({
 
 mock.module('./final-review', () => ({
   finalReviewPhase: mockFinalReviewPhase,
+  DEFAULT_FINAL_REVIEWERS: realFinalReview.DEFAULT_FINAL_REVIEWERS,
+  isActionableSeverity: realFinalReview.isActionableSeverity,
 }));
 
 mock.module('./initialization', () => ({
@@ -105,14 +244,10 @@ mock.module('./initialization', () => ({
 const spir = await import('./spir');
 
 // Type-level re-exports for TypeScript's benefit.
-// `import type` is fully erased at runtime so it doesn't cascade into broken imports.
+// `import type` is fully erased at runtime so it doesn't cascade into broken
+// imports. Only symbols that SURVIVE the migration are referenced here.
 import type { WorkflowConfig, SpirRunOptions } from './config';
-import type {
-  Phase,
-  RunState,
-  PhaseContext,
-  SpirWorkflowData,
-} from './spir';
+import type { Phase, SpirWorkflowData } from './spir';
 
 // ─── Test Fixtures ──────────────────────────────────────────────────────────
 
@@ -120,7 +255,6 @@ const MINIMAL_CONFIG: WorkflowConfig = {
   name: 'test-workflow',
   defaultMaxConcurrentTasks: 3,
   fixerSteps: [],
-  // NEW: config.phases replaces config.sidebarPhases
   phases: [
     { id: 'scouting', label: 'Scouting', icon: '🔍' },
     { id: 'planning', label: 'Planning', icon: '📋' },
@@ -136,6 +270,46 @@ const MINIMAL_OPTIONS: SpirRunOptions = {
   profilesDirs: ['/tmp/profiles'],
 };
 
+/** Minimal PhaseRunContext handed to a captured phase `run()` in tests. */
+function makePhaseCtx(state: Record<string, unknown> = {}): PhaseRunCtxLike {
+  return {
+    tracker: makeTrackerInstance(),
+    state,
+    cwd: '/tmp/test-cwd',
+    workDir: '/tmp/test-workdir',
+  };
+}
+
+/** Run `runSpir` (fresh) and return the options wired into the PhaseRunner. */
+async function runSpirAndCapture(overrides: Partial<SpirRunOptions> = {}): Promise<CapturedRunnerOptions> {
+  await spir.runSpir(MINIMAL_CONFIG, 'Build a feature', {
+    ...MINIMAL_OPTIONS,
+    ...overrides,
+  });
+  if (!capturedRunnerOptions) {
+    throw new Error('runSpir did not construct a PhaseRunner');
+  }
+  return capturedRunnerOptions;
+}
+
+beforeEach(() => {
+  capturedRunnerOptions = undefined;
+  MockPhaseRunner.mockClear();
+  mockRunnerRun.mockClear();
+  mockCreateHookRegistry.mockClear();
+  MockWorkflowStatusTracker.mockClear();
+  TrackerCtor.load.mockClear();
+  TrackerCtor.load.mockRejectedValue(new Error('Workflow state file not found: .engin-state.json'));
+  mockImplementationPhase.mockClear();
+  mockPlanningPhase.mockClear();
+  mockScoutingPhase.mockClear();
+  mockScoutingReviewPhase.mockClear();
+  mockFinalReviewPhase.mockClear();
+  mockInitializationPhase.mockClear();
+  mockCancelTask.mockClear();
+  mockGetAllTasks.mockClear();
+});
+
 // ─── PHASES export ──────────────────────────────────────────────────────────
 
 describe('PHASES constant', () => {
@@ -144,18 +318,10 @@ describe('PHASES constant', () => {
   });
 
   it('contains the expected phase order', () => {
-    expect(spir.PHASES).toEqual([
-      'scouting',
-      'planning',
-      'implementing',
-      'review',
-      'done',
-    ]);
+    expect(spir.PHASES).toEqual(['scouting', 'planning', 'implementing', 'review', 'done']);
   });
 
   it('is declared as readonly (compile-time check)', () => {
-    // The PHASES array is typed as readonly Phase[], which prevents
-    // mutation at compile time. At runtime the array is mutable (not frozen).
     const readonlyCheck: readonly string[] = spir.PHASES;
     expect(readonlyCheck).toBe(spir.PHASES);
   });
@@ -182,66 +348,6 @@ describe('Phase type', () => {
   });
 });
 
-// ─── RunState ───────────────────────────────────────────────────────────────
-
-describe('RunState interface', () => {
-  it('creates a valid RunState object', () => {
-    const state: RunState = {
-      research: '',
-      plan: undefined,
-      scoutingReports: [],
-      scoutingRounds: 0,
-      scoutingGaps: [],
-    };
-    expect(state.research).toBe('');
-    expect(state.plan).toBeUndefined();
-    expect(state.scoutingReports).toEqual([]);
-    expect(state.scoutingRounds).toBe(0);
-    expect(state.scoutingGaps).toEqual([]);
-  });
-});
-
-// ─── PhaseContext ───────────────────────────────────────────────────────────
-
-describe('PhaseContext interface', () => {
-  it('holds all required fields for phase execution', () => {
-    const ctx: PhaseContext = {
-      tracker: {} as never,
-      profilesDirs: ['/profiles'],
-      taskPrompt: 'Build a feature',
-      cwd: '/cwd',
-      workDir: '/work',
-      maxConcurrentTasks: 5,
-      config: MINIMAL_CONFIG,
-    };
-    expect(ctx.tracker).toBeDefined();
-    expect(ctx.profilesDirs).toEqual(['/profiles']);
-    expect(ctx.taskPrompt).toBe('Build a feature');
-    expect(ctx.cwd).toBe('/cwd');
-    expect(ctx.workDir).toBe('/work');
-    expect(ctx.maxConcurrentTasks).toBe(5);
-    expect(ctx.config).toBe(MINIMAL_CONFIG);
-  });
-
-  it('accepts optional onStatus, signal, and apiKeys', () => {
-    const ctx: PhaseContext = {
-      tracker: {} as never,
-      profilesDirs: [],
-      taskPrompt: 'test',
-      cwd: '/',
-      workDir: '/',
-      maxConcurrentTasks: undefined,
-      config: MINIMAL_CONFIG,
-      apiKeys: { ANTHROPIC: 'sk-test' },
-      onStatus: { onPhaseStart: jest.fn() } as never,
-      signal: new AbortController().signal,
-    };
-    expect(ctx.apiKeys).toEqual({ ANTHROPIC: 'sk-test' });
-    expect(ctx.onStatus).toBeDefined();
-    expect(ctx.signal).toBeDefined();
-  });
-});
-
 // ─── getPhaseIndicator ──────────────────────────────────────────────────────
 
 describe('getPhaseIndicator', () => {
@@ -265,12 +371,6 @@ describe('getPhaseIndicator', () => {
     expect(spir.getPhaseIndicator('scouting', [])).toBe('⏳');
   });
 
-  it('accepts phases array as second parameter (renamed from sidebarPhases)', () => {
-    const phases = [{ id: 'scouting', label: 'Scouting', icon: '🔍' }];
-    const result = spir.getPhaseIndicator('scouting', phases);
-    expect(result).toBe('🔍');
-  });
-
   it('works with the Phase type as the first argument', () => {
     const phases = [{ id: 'done', label: 'Done', icon: '✅' }];
     const phase: Phase = 'done';
@@ -283,234 +383,6 @@ describe('getPhaseIndicator', () => {
       { id: 'scouting', label: 'Scouting Dup', icon: '📋' },
     ];
     expect(spir.getPhaseIndicator('scouting', phases)).toBe('🔍');
-  });
-
-  it('handles case with many phases', () => {
-    const phases = [
-      { id: 'scouting', label: 'Scouting', icon: '1' },
-      { id: 'planning', label: 'Planning', icon: '2' },
-      { id: 'implementing', label: 'Implementing', icon: '3' },
-      { id: 'review', label: 'Review', icon: '4' },
-      { id: 'done', label: 'Done', icon: '5' },
-    ];
-    expect(spir.getPhaseIndicator('implementing' as Phase, phases)).toBe('3');
-  });
-});
-
-// ─── completePhase ──────────────────────────────────────────────────────────
-
-describe('completePhase', () => {
-  it('advances to the next phase in PHASES when no nextPhase given', async () => {
-    const setPhase = jest.fn();
-    const save = jest.fn().mockResolvedValue(undefined);
-    const onPhaseComplete = jest.fn();
-    const tracker = { setPhase, save, completedPhases: [] } as never;
-
-    const startTime = Date.now();
-    await spir.completePhase(
-      'scouting' as Phase,
-      tracker,
-      { onPhaseComplete } as never,
-      startTime,
-    );
-
-    // Should advance to planning (next in PHASES after scouting)
-    expect(setPhase).toHaveBeenCalledWith('planning');
-    expect(save).toHaveBeenCalled();
-    expect(onPhaseComplete).toHaveBeenCalledWith({
-      phase: 'scouting',
-      durationMs: expect.any(Number),
-    });
-  });
-
-  it('jumps to specified nextPhase when provided', async () => {
-    const setPhase = jest.fn();
-    const save = jest.fn().mockResolvedValue(undefined);
-    const tracker = { setPhase, save, completedPhases: [] } as never;
-
-    await spir.completePhase(
-      'scouting' as Phase,
-      tracker,
-      undefined,
-      Date.now(),
-      'scouting', // loop back to scouting
-    );
-
-    expect(setPhase).toHaveBeenCalledWith('scouting');
-  });
-
-  it('does not advance when there is no next phase', async () => {
-    const setPhase = jest.fn();
-    const save = jest.fn().mockResolvedValue(undefined);
-    const tracker = { setPhase, save, completedPhases: [] } as never;
-
-    await spir.completePhase(
-      'done' as Phase,
-      tracker,
-      undefined,
-      Date.now(),
-    );
-
-    // 'done' is last in PHASES, so no advancement
-    expect(setPhase).not.toHaveBeenCalled();
-    expect(save).toHaveBeenCalled();
-  });
-
-  it('works when onStatus is undefined', async () => {
-    const setPhase = jest.fn();
-    const save = jest.fn().mockResolvedValue(undefined);
-    const tracker = { setPhase, save, completedPhases: [] } as never;
-
-    await expect(
-      spir.completePhase('scouting' as Phase, tracker, undefined, Date.now()),
-    ).resolves.toBeUndefined();
-  });
-});
-
-// ─── executePhase ───────────────────────────────────────────────────────────
-
-describe('executePhase', () => {
-  it('calls onPhaseStart and onSidebarUpdate for any phase', async () => {
-    const onPhaseStart = jest.fn();
-    const onSidebarUpdate = jest.fn();
-    const tracker = {
-      setPhase: jest.fn(),
-      save: jest.fn().mockResolvedValue(undefined),
-      setWorkflowData: jest.fn(),
-      get workflowData() {
-        return {};
-      },
-      get currentPhase() {
-        return '';
-      },
-      get completedPhases() {
-        return [];
-      },
-      taskTracker: mockTaskTracker,
-    } as never;
-
-    const ctx: PhaseContext = {
-      tracker,
-      profilesDirs: [],
-      taskPrompt: 'test',
-      cwd: '/',
-      workDir: '/',
-      maxConcurrentTasks: undefined,
-      config: {
-        ...MINIMAL_CONFIG,
-        phases: [
-          { id: 'scouting', label: 'Scouting', icon: '🔍' },
-          { id: 'planning', label: 'Planning', icon: '📋' },
-          { id: 'implementing', label: 'Implementing', icon: '🔨' },
-          { id: 'review', label: 'Review', icon: '🔎' },
-        ],
-      },
-      onStatus: { onPhaseStart, onSidebarUpdate } as never,
-    };
-
-    // "done" phase simply breaks — still triggers callbacks
-    await spir.executePhase('done' as Phase, {
-      research: '',
-      plan: undefined,
-      scoutingReports: [],
-      scoutingRounds: 0,
-      scoutingGaps: [],
-    }, ctx);
-
-    expect(onPhaseStart).toHaveBeenCalledWith({
-      phase: 'done',
-      round: 0,
-    });
-    // onSidebarUpdate is called with indicator only
-    expect(onSidebarUpdate).toHaveBeenCalledWith({
-      indicator: expect.any(String),
-    });
-    // Verify the phases field is NOT present in the call
-    const callArg = onSidebarUpdate.mock.calls[0][0];
-    expect(callArg).not.toHaveProperty('phases');
-  });
-
-  it('does not crash when onStatus is undefined', async () => {
-    const tracker = {
-      setPhase: jest.fn(),
-      save: jest.fn().mockResolvedValue(undefined),
-      setWorkflowData: jest.fn(),
-      get workflowData() {
-        return {};
-      },
-      get currentPhase() {
-        return '';
-      },
-      get completedPhases() {
-        return [];
-      },
-      taskTracker: mockTaskTracker,
-    } as never;
-
-    const ctx: PhaseContext = {
-      tracker,
-      profilesDirs: [],
-      taskPrompt: 'test',
-      cwd: '/',
-      workDir: '/',
-      maxConcurrentTasks: undefined,
-      config: MINIMAL_CONFIG,
-    };
-
-    await expect(
-      spir.executePhase('done' as Phase, {
-        research: '',
-        plan: undefined,
-        scoutingReports: [],
-        scoutingRounds: 0,
-        scoutingGaps: [],
-      }, ctx),
-    ).resolves.toBeUndefined();
-  });
-
-  it('passes round number for scouting and planning phases', async () => {
-    const onPhaseStart = jest.fn();
-    const tracker = {
-      setPhase: jest.fn(),
-      save: jest.fn().mockResolvedValue(undefined),
-      setWorkflowData: jest.fn(),
-      get workflowData() {
-        return {};
-      },
-      get currentPhase() {
-        return '';
-      },
-      get completedPhases() {
-        return [];
-      },
-      taskTracker: mockTaskTracker,
-    } as never;
-
-    const ctx: PhaseContext = {
-      tracker,
-      profilesDirs: [],
-      taskPrompt: 'test',
-      cwd: '/',
-      workDir: '/',
-      maxConcurrentTasks: undefined,
-      config: MINIMAL_CONFIG,
-      onStatus: { onPhaseStart } as never,
-    };
-
-    // Execute done phase with some round counters set
-    await spir.executePhase('done' as Phase, {
-      research: '',
-      plan: undefined,
-      scoutingReports: [],
-      scoutingRounds: 2,
-      scoutingGaps: [],
-    }, ctx);
-
-    // For "done", round is 0 (only scouting/planning use their respective round counters)
-    expect(onPhaseStart).toHaveBeenCalledWith({
-      phase: 'done',
-      round: 0,
-    });
   });
 });
 
@@ -536,17 +408,486 @@ describe('SpirWorkflowData', () => {
   });
 });
 
-// ─── Phase Registration (NEW behavior) ──────────────────────────────────────
-//
-// The updated runSpir emits onPhaseRegister for each phase from config.phases
-// AFTER onWorkflowStart and BEFORE the phase loop.
+// ─── WorkflowConfig — phases field ─────────────────────────────────────────
 
-describe('runSpir — phase registration', () => {
-  it('config.phases is accessible and has correct shape for onPhaseRegister', () => {
+describe('WorkflowConfig — phases field', () => {
+  it('config uses phases', () => {
+    const config: WorkflowConfig = {
+      name: 'test',
+      defaultMaxConcurrentTasks: 3,
+      fixerSteps: [],
+      phases: [{ id: 'scouting', label: 'Scouting', icon: '🔍' }],
+      titleFormatter: (d: string) => d,
+    };
+    expect(config.phases).toHaveLength(1);
+  });
+
+  it('phases entries have id, label, icon strings', () => {
+    const config: WorkflowConfig = {
+      name: 'test',
+      defaultMaxConcurrentTasks: 1,
+      fixerSteps: [],
+      phases: [{ id: 'a', label: 'A', icon: '🅰' }],
+      titleFormatter: (d: string) => d,
+    };
+    expect(typeof config.phases[0].id).toBe('string');
+    expect(typeof config.phases[0].label).toBe('string');
+    expect(typeof config.phases[0].icon).toBe('string');
+  });
+});
+
+// ─── runSpir now drives a PhaseRunner ───────────────────────────────────────
+//
+// The migration replaces the hand-written `while (currentIndex < PHASES.length)`
+// loop + `executePhase` dispatch with `new PhaseRunner({ phases, tracker,
+// hookRegistry, cwd, workDir, signal }).run()`. These tests assert that wiring.
+
+describe('runSpir — PhaseRunner construction', () => {
+  it('constructs exactly one PhaseRunner and calls .run() once', async () => {
+    await runSpirAndCapture();
+
+    expect(MockPhaseRunner).toHaveBeenCalledTimes(1);
+    expect(mockRunnerRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes the tracker, cwd, workDir, and signal into the PhaseRunner', async () => {
+    const ac = new AbortController();
+    const opts = await runSpirAndCapture({ signal: ac.signal });
+
+    expect(opts.tracker).toBeDefined();
+    expect(opts.cwd).toBe('/tmp/test-cwd');
+    expect(opts.workDir).toBe('/tmp/test-workdir');
+    expect(opts.signal).toBe(ac.signal);
+  });
+
+  it('threads options.hookRegistry into the PhaseRunner when provided', async () => {
+    const registry = makeRegistrySpy();
+    const opts = await runSpirAndCapture({ hookRegistry: registry });
+
+    expect(opts.hookRegistry).toBe(registry);
+  });
+
+  it('creates a hookRegistry via createHookRegistry when options omit one', async () => {
+    const opts = await runSpirAndCapture();
+
+    expect(mockCreateHookRegistry).toHaveBeenCalledTimes(1);
+    expect(opts.hookRegistry).toBeDefined();
+  });
+});
+
+// ─── Phases are declared as PhaseDefinition[] ───────────────────────────────
+//
+// Each phase becomes a `{ id, label, icon, run }` entry. The id/label/icon come
+// from `config.phases`; the `run` callback closes over the `runSpir`-local
+// values (tracker, profilesDirs, taskPrompt, cwd, …) and calls the existing
+// sibling phase body. The phase BODIES stay in their `.lib/*.ts` files.
+
+describe('runSpir — phases declared as PhaseDefinition[]', () => {
+  it('declares the SPIR phases in order with id/label/icon/run', async () => {
+    const opts = await runSpirAndCapture();
+    const phases = opts.phases;
+
+    // scouting → planning → implementing → review (→ done) in declared order.
+    expect(phases.map((p) => p.id)).toEqual([
+      'scouting',
+      'planning',
+      'implementing',
+      'review',
+      'done',
+    ]);
+
+    for (const p of phases) {
+      expect(typeof p.id).toBe('string');
+      expect(typeof p.label).toBe('string');
+      expect(typeof p.icon).toBe('string');
+      expect(typeof p.run).toBe('function');
+    }
+  });
+
+  it('uses config.phases metadata (label/icon) for the declared phases', async () => {
+    const opts = await runSpirAndCapture();
+    const byId = new Map(opts.phases.map((p) => [p.id, p]));
+
+    expect(byId.get('scouting')?.label).toBe('Scouting');
+    expect(byId.get('scouting')?.icon).toBe('🔍');
+    expect(byId.get('planning')?.icon).toBe('📋');
+    expect(byId.get('implementing')?.icon).toBe('🔨');
+    expect(byId.get('review')?.icon).toBe('🔎');
+  });
+});
+
+// ─── PhaseDefinition run bodies invoke the sibling phase functions ─────────
+//
+// The orchestration moved to PhaseRunner, but each phase's `run()` must still
+// call the SAME sibling phase body the old `executePhase` switch did. These
+// tests invoke the captured `run()` directly and assert the right sibling
+// function fires (and ONLY that one).
+
+describe('PhaseDefinition run bodies', () => {
+  let phases: Map<string, PhaseDefLike>;
+
+  beforeEach(async () => {
+    const opts = await runSpirAndCapture();
+    phases = new Map(opts.phases.map((p) => [p.id, p]));
+  });
+
+  it('scouting run calls scoutingPhase then scoutingReviewPhase', async () => {
+    const scouting = phases.get('scouting')!;
+    await scouting.run(makePhaseCtx({}));
+
+    expect(mockScoutingPhase).toHaveBeenCalledTimes(1);
+    expect(mockScoutingReviewPhase).toHaveBeenCalledTimes(1);
+    // scouting must run before the review of its reports.
+    const scoutCall = mockScoutingPhase.mock.invocationCallOrder[0];
+    const reviewCall = mockScoutingReviewPhase.mock.invocationCallOrder[0];
+    expect(scoutCall).toBeLessThan(reviewCall);
+    // no other phase body fires.
+    expect(mockPlanningPhase).not.toHaveBeenCalled();
+    expect(mockImplementationPhase).not.toHaveBeenCalled();
+    expect(mockFinalReviewPhase).not.toHaveBeenCalled();
+  });
+
+  it('planning run calls planningPhase', async () => {
+    const planning = phases.get('planning')!;
+    await planning.run(makePhaseCtx({ research: 'Research done', scoutingFiles: [] }));
+
+    expect(mockPlanningPhase).toHaveBeenCalledTimes(1);
+    expect(mockScoutingPhase).not.toHaveBeenCalled();
+    expect(mockImplementationPhase).not.toHaveBeenCalled();
+  });
+
+  it('implementing run calls implementationPhase when a plan is present', async () => {
+    const implementing = phases.get('implementing')!;
+    await implementing.run(makePhaseCtx({ plan: { tasks: [], strategy: 'test' } as never }));
+
+    expect(mockImplementationPhase).toHaveBeenCalledTimes(1);
+    expect(mockPlanningPhase).not.toHaveBeenCalled();
+  });
+
+  it('review run calls finalReviewPhase', async () => {
+    const review = phases.get('review')!;
+    await review.run(makePhaseCtx({}));
+
+    expect(mockFinalReviewPhase).toHaveBeenCalledTimes(1);
+    expect(mockImplementationPhase).not.toHaveBeenCalled();
+  });
+
+  it('done run is a no-op (no phase body fires)', async () => {
+    const done = phases.get('done')!;
+    await expect(done.run(makePhaseCtx({}))).resolves.toBeUndefined();
+
+    expect(mockScoutingPhase).not.toHaveBeenCalled();
+    expect(mockPlanningPhase).not.toHaveBeenCalled();
+    expect(mockImplementationPhase).not.toHaveBeenCalled();
+    expect(mockFinalReviewPhase).not.toHaveBeenCalled();
+  });
+});
+
+// ─── rendererRegistry threading through the phase run closures ─────────────
+//
+// `options.rendererRegistry` is closed over by the phase `run()` callbacks so
+// it reaches the sibling phase bodies that consume it (planningPhase,
+// implementationPhase). Previously threaded via PhaseContext; now via the
+// PhaseDefinition run closure.
+
+describe('runSpir — rendererRegistry → phase run closures', () => {
+  function fakeRendererRegistry() {
+    return {
+      renderers: new Map(),
+      register: jest.fn(),
+      get: jest.fn(),
+      render: jest.fn(),
+    } as never;
+  }
+
+  it('threads options.rendererRegistry into planningPhase via the planning run', async () => {
+    const fake = fakeRendererRegistry();
+    const opts = await runSpirAndCapture({ rendererRegistry: fake });
+    const planning = opts.phases.find((p) => p.id === 'planning')!;
+
+    await planning.run(makePhaseCtx({ research: 'Research done', scoutingFiles: [] }));
+
+    expect(mockPlanningPhase).toHaveBeenCalledTimes(1);
+    expect(mockPlanningPhase.mock.calls[0]).toContain(fake);
+  });
+
+  it('threads options.rendererRegistry into implementationPhase via the implementing run', async () => {
+    const fake = fakeRendererRegistry();
+    const opts = await runSpirAndCapture({ rendererRegistry: fake });
+    const implementing = opts.phases.find((p) => p.id === 'implementing')!;
+
+    await implementing.run(makePhaseCtx({ plan: { tasks: [], strategy: 'test' } as never }));
+
+    expect(mockImplementationPhase).toHaveBeenCalledTimes(1);
+    expect(mockImplementationPhase.mock.calls[0]).toContain(fake);
+  });
+
+  it('omits rendererRegistry from phase body args when options do not supply one', async () => {
+    const opts = await runSpirAndCapture();
+    const implementing = opts.phases.find((p) => p.id === 'implementing')!;
+
+    await implementing.run(makePhaseCtx({ plan: { tasks: [], strategy: 'test' } as never }));
+
+    expect(mockImplementationPhase).toHaveBeenCalledTimes(1);
+    const args = mockImplementationPhase.mock.calls[0] as unknown[];
+    // No fake-style renderer object should leak into the args.
+    expect(args.every((a) => !(a != null && typeof a === 'object' && 'renderers' in (a as object)))).toBe(true);
+  });
+});
+
+// ─── SPIR phase hooks registered on the hookRegistry ───────────────────────
+//
+// runSpir registers its SPIR-specific orchestration as phase-level hooks:
+//   • shouldRetryPhase — scouting ≤3 rounds
+//   • onPhaseSettled   — scouting collect-loop (task-38)
+//   • afterPhase       — sidebar indicator update
+// These tests pass a registry spy as options.hookRegistry (so runSpir
+// registers onto OUR registry) and then inspect / invoke the subscribers.
+
+describe('runSpir — SPIR phase hooks registered', () => {
+  it('registers shouldRetryPhase, onPhaseSettled, and afterPhase', async () => {
+    const registry = makeRegistrySpy();
+    await runSpirAndCapture({ hookRegistry: registry });
+
+    expect(registry.hasSubscribers('shouldRetryPhase')).toBe(true);
+    expect(registry.hasSubscribers('onPhaseSettled')).toBe(true);
+    expect(registry.hasSubscribers('afterPhase')).toBe(true);
+  });
+
+  it('registers the hooks even when it created the registry itself', async () => {
+    // No options.hookRegistry → runSpir calls createHookRegistry(). Read the
+    // registry it built from the mock's results.
+    await runSpirAndCapture();
+    const created = mockCreateHookRegistry.mock.results[0]?.value as RegistrySpy | undefined;
+
+    expect(created).toBeDefined();
+    expect(created!.hasSubscribers('shouldRetryPhase')).toBe(true);
+    expect(created!.hasSubscribers('onPhaseSettled')).toBe(true);
+    expect(created!.hasSubscribers('afterPhase')).toBe(true);
+  });
+});
+
+// ─── shouldRetryPhase hook — scouting ≤3 rounds ────────────────────────────
+//
+// Reproduces the historical scouting retry policy that previously lived inside
+// `executePhase`'s scouting case:
+//   - scouting not ready AND rounds < 3  → retry (return true)
+//   - scouting ready                      → no retry (abstain)
+//   - 3 rounds exhausted                  → no retry (proceed anyway)
+//   - any non-scouting phase              → abstain (let other logic decide)
+
+describe('shouldRetryPhase hook — scouting ≤3 rounds', () => {
+  let hook: (args: unknown, ctx: unknown) => unknown;
+  const hookCtx = { registry: {}, cwd: '/', workDir: '/' };
+
+  beforeEach(async () => {
+    const registry = makeRegistrySpy();
+    await runSpirAndCapture({ hookRegistry: registry });
+    const candidate = registry.registeredHooks.shouldRetryPhase;
+    expect(typeof candidate).toBe('function');
+    hook = candidate as (args: unknown, ctx: unknown) => unknown;
+  });
+
+  it('retries scouting when not ready and rounds < 3', async () => {
+    const decision = await hook(
+      { phaseId: 'scouting', result: undefined, round: 1, state: { scoutingReady: false, scoutingRounds: 1 } },
+      hookCtx,
+    );
+    expect(decision).toBe(true);
+  });
+
+  it('does not retry scouting when the review is ready', async () => {
+    const decision = await hook(
+      { phaseId: 'scouting', result: undefined, round: 1, state: { scoutingReady: true, scoutingRounds: 1 } },
+      hookCtx,
+    );
+    expect(decision).not.toBe(true);
+  });
+
+  it('does not retry scouting once 3 rounds are exhausted (proceeds with current research)', async () => {
+    const decision = await hook(
+      { phaseId: 'scouting', result: undefined, round: 3, state: { scoutingReady: false, scoutingRounds: 3 } },
+      hookCtx,
+    );
+    expect(decision).not.toBe(true);
+  });
+
+  it('abstains (returns undefined) for non-scouting phases', async () => {
+    const decision = await hook(
+      { phaseId: 'planning', result: undefined, round: 1, state: {} },
+      hookCtx,
+    );
+    expect(decision).toBeUndefined();
+  });
+});
+
+// ─── onPhaseSettled hook — scouting collect-loop ───────────────────────────
+//
+// The scouting collect-loop (accumulate scout reports across rounds) moves to
+// `onPhaseSettled` (task-38). The hook reads the tracker's settled scout tasks
+// and folds their results into the shared state bag so the next scouting round
+// (and the planning phase) can read them.
+
+describe('onPhaseSettled hook — scouting collect-loop', () => {
+  let hook: (args: unknown, ctx: unknown) => unknown;
+  const hookCtx = { registry: {}, cwd: '/', workDir: '/' };
+
+  beforeEach(async () => {
+    const registry = makeRegistrySpy();
+    await runSpirAndCapture({ hookRegistry: registry });
+    const candidate = registry.registeredHooks.onPhaseSettled;
+    expect(typeof candidate).toBe('function');
+    hook = candidate as (args: unknown, ctx: unknown) => unknown;
+  });
+
+  it('collects complete scouting task results into state.scoutingReports', async () => {
+    const tasks = [
+      { id: 's1', phaseId: 'scouting', status: 'complete', result: { topic: 'api' } },
+      { id: 's2', phaseId: 'scouting', status: 'complete', result: { topic: 'db' } },
+      { id: 's3', phaseId: 'scouting', status: 'failed', result: undefined },
+      { id: 's4', phaseId: 'scouting', status: 'active', result: undefined },
+    ];
+    const state: Record<string, unknown> = {};
+
+    await hook({ phaseId: 'scouting', tasks, state }, hookCtx);
+
+    const collected = state.scoutingReports as unknown[];
+    expect(collected).toEqual([{ topic: 'api' }, { topic: 'db' }]);
+  });
+
+  it('does not collect for non-scouting phases', async () => {
+    const state: Record<string, unknown> = {};
+    await hook({ phaseId: 'planning', tasks: [], state }, hookCtx);
+
+    expect(state.scoutingReports).toBeUndefined();
+  });
+
+  it('produces an empty collection when there are no complete scout tasks', async () => {
+    const state: Record<string, unknown> = {};
+    await hook({ phaseId: 'scouting', tasks: [], state }, hookCtx);
+
+    expect(state.scoutingReports).toEqual([]);
+  });
+
+  it('persists scoutingReports to workflowData so the planning resume path works', async () => {
+    // The PhaseRunner persists only its setPhase transitions, not the shared
+    // state bag, so the hook must explicitly write scoutingReports to
+    // workflowData — otherwise planning's resume path (which reads
+    // data.scoutingReports) finds nothing.
+    const registry = makeRegistrySpy();
+    const opts = await runSpirAndCapture({ hookRegistry: registry });
+    const tracker = opts.tracker as { setWorkflowData: ReturnType<typeof jest.fn> };
+    const onPhaseSettled = registry.registeredHooks.onPhaseSettled as (
+      args: unknown,
+      ctx: unknown,
+    ) => unknown;
+
+    const tasks = [
+      { id: 's1', phaseId: 'scouting', status: 'complete', result: { topic: 'api' } },
+      { id: 's2', phaseId: 'scouting', status: 'failed', result: undefined },
+    ];
+
+    await onPhaseSettled({ phaseId: 'scouting', tasks, state: {} }, hookCtx);
+
+    expect(tracker.setWorkflowData).toHaveBeenCalledWith({
+      scoutingReports: [{ topic: 'api' }],
+    });
+  });
+});
+
+// ─── afterPhase hook — sidebar indicator update ────────────────────────────
+//
+// The sidebar indicator update (previously inlined in `completePhase`) moves to
+// the `afterPhase` observe hook. It closes over `onStatus.onSidebarUpdate` and
+// `config.phases`, and fires the indicator for the just-completed phase.
+//
+// (The engine's default `createDefaultAfterPhase` has no access to
+// `onStatus.onSidebarUpdate`, so runSpir must register its OWN afterPhase to
+// keep the sidebar updating.)
+
+describe('afterPhase hook — sidebar indicator update', () => {
+  const hookCtx = { registry: {}, cwd: '/', workDir: '/' };
+
+  it('fires onSidebarUpdate with the indicator for the completed phase', async () => {
+    const onSidebarUpdate = jest.fn();
+    const registry = makeRegistrySpy();
+    await runSpirAndCapture({ hookRegistry: registry, onStatus: { onSidebarUpdate } as never });
+    // runSpir's own initialization fires onSidebarUpdate (⚙ / startPhase / ✅);
+    // clear it so we observe ONLY the afterPhase hook's calls below.
+    onSidebarUpdate.mockClear();
+
+    const afterPhase = registry.registeredHooks.afterPhase as (args: unknown, ctx: unknown) => unknown;
+    expect(typeof afterPhase).toBe('function');
+
+    await afterPhase({ phaseId: 'scouting', result: undefined, durationMs: 42 }, hookCtx);
+
+    expect(onSidebarUpdate).toHaveBeenCalledWith(expect.objectContaining({ indicator: '🔍' }));
+  });
+
+  it('maps each phase id to its config icon', async () => {
+    const onSidebarUpdate = jest.fn();
+    const registry = makeRegistrySpy();
+    await runSpirAndCapture({ hookRegistry: registry, onStatus: { onSidebarUpdate } as never });
+    // runSpir's own initialization fires onSidebarUpdate (⚙ / startPhase / ✅);
+    // clear it so we observe ONLY the afterPhase hook's calls below.
+    onSidebarUpdate.mockClear();
+
+    const afterPhase = registry.registeredHooks.afterPhase as (args: unknown, ctx: unknown) => unknown;
+
+    await afterPhase({ phaseId: 'planning', result: undefined, durationMs: 1 }, hookCtx);
+    await afterPhase({ phaseId: 'implementing', result: undefined, durationMs: 1 }, hookCtx);
+    await afterPhase({ phaseId: 'review', result: undefined, durationMs: 1 }, hookCtx);
+
+    const indicators = onSidebarUpdate.mock.calls.map((c) => (c[0] as { indicator?: string }).indicator);
+    expect(indicators).toEqual(['📋', '🔨', '🔎']);
+  });
+
+  it('does not throw when onStatus.onSidebarUpdate is absent', async () => {
+    const registry = makeRegistrySpy();
+    await runSpirAndCapture({ hookRegistry: registry });
+
+    const afterPhase = registry.registeredHooks.afterPhase as (args: unknown, ctx: unknown) => unknown;
+    await expect(
+      afterPhase({ phaseId: 'scouting', result: undefined, durationMs: 1 }, hookCtx),
+    ).resolves.toBeUndefined();
+  });
+});
+
+// ─── Deleted exports: executePhase / completePhase ──────────────────────────
+//
+// The migration DELETES `executePhase`, `completePhase`, and the inline
+// `runSpir` phase loop. Their orchestration now lives in the engine's
+// PhaseRunner.
+
+describe('deleted orchestration helpers', () => {
+  it('no longer exports executePhase', () => {
+    expect((spir as Record<string, unknown>).executePhase).toBeUndefined();
+  });
+
+  it('no longer exports completePhase', () => {
+    expect((spir as Record<string, unknown>).completePhase).toBeUndefined();
+  });
+
+  it('still exports runSpir (the orchestrator)', () => {
+    expect(typeof spir.runSpir).toBe('function');
+  });
+
+  it('still exports PHASES and getPhaseIndicator', () => {
+    expect(spir.PHASES).toBeDefined();
+    expect(typeof spir.getPhaseIndicator).toBe('function');
+  });
+});
+
+// ─── Phase Registration ─────────────────────────────────────────────────────
+//
+// config.phases metadata has the correct shape for the PhaseDefinition[]
+// declaration (id/label/icon strings).
+
+describe('runSpir — phase registration shape', () => {
+  it('config.phases is accessible and has correct shape', () => {
     expect(MINIMAL_CONFIG.phases).toBeDefined();
     expect(MINIMAL_CONFIG.phases).toHaveLength(4);
 
-    // Each phase entry has the correct shape for onPhaseRegister
     for (const phase of MINIMAL_CONFIG.phases) {
       expect(phase).toHaveProperty('id');
       expect(phase).toHaveProperty('label');
@@ -556,49 +897,17 @@ describe('runSpir — phase registration', () => {
       expect(typeof phase.icon).toBe('string');
     }
   });
-
-  it('onPhaseRegister would receive id, label, icon for each phase', () => {
-    const onPhaseRegister = jest.fn<({ id, label, icon }: { id: string; label: string; icon: string }) => void>();
-
-    // Simulate the registration loop that runSpir should perform
-    for (const phase of MINIMAL_CONFIG.phases) {
-      onPhaseRegister({ id: phase.id, label: phase.label, icon: phase.icon });
-    }
-
-    expect(onPhaseRegister).toHaveBeenCalledTimes(4);
-    expect(onPhaseRegister).toHaveBeenNthCalledWith(1, {
-      id: 'scouting',
-      label: 'Scouting',
-      icon: '🔍',
-    });
-    expect(onPhaseRegister).toHaveBeenNthCalledWith(2, {
-      id: 'planning',
-      label: 'Planning',
-      icon: '📋',
-    });
-    expect(onPhaseRegister).toHaveBeenNthCalledWith(3, {
-      id: 'implementing',
-      label: 'Implementing',
-      icon: '🔨',
-    });
-    expect(onPhaseRegister).toHaveBeenNthCalledWith(4, {
-      id: 'review',
-      label: 'Review',
-      icon: '🔎',
-    });
-  });
 });
 
 // ─── onSidebarUpdate — no phases field ──────────────────────────────────────
 //
-// After the update, onSidebarUpdate should only carry title and indicator,
-// never a phases field. Phase metadata is now sent via onPhaseRegister.
+// onSidebarUpdate carries only title/indicator; phase metadata is declared via
+// the PhaseDefinition[] / config.phases.
 
 describe('runSpir — sidebar updates', () => {
   it('onSidebarUpdate calls carry indicator but not phases', () => {
     const onSidebarUpdate = jest.fn();
 
-    // Simulate the updated call pattern
     onSidebarUpdate({ title: 'Test', indicator: '🔍' });
     onSidebarUpdate({ indicator: '✅' });
 
@@ -607,28 +916,17 @@ describe('runSpir — sidebar updates', () => {
       expect(arg).not.toHaveProperty('phases');
     }
   });
-
-  it('onSidebarUpdate still accepts title and indicator', () => {
-    const onSidebarUpdate = jest.fn();
-    onSidebarUpdate({ title: 'My Title', indicator: '🔍' });
-    expect(onSidebarUpdate).toHaveBeenCalledWith({ title: 'My Title', indicator: '🔍' });
-  });
 });
 
 // ─── Abort Handling: cancelTask ─────────────────────────────────────────────
 //
-// On Workflow cancelled (signal abort), the catch block should cancel all
-// active tasks via tracker.taskTracker.cancelTask before calling
-// onWorkflowFailed.
+// On "Workflow cancelled" (signal abort), runSpir's try/catch around
+// PhaseRunner.run() cancels all active tasks via tracker.taskTracker.cancelTask
+// before calling onWorkflowFailed. The behaviour is preserved from the
+// pre-migration catch block.
 
 describe('runSpir — abort handling', () => {
-  beforeEach(() => {
-    mockCancelTask.mockClear();
-    mockGetAllTasks.mockClear();
-  });
-
   it('cancels all active tasks on abort before calling onWorkflowFailed', () => {
-    // Simulate the abort handling logic from the updated runSpir
     const activeTasks = [
       { id: 'task-1', status: 'active' },
       { id: 'task-2', status: 'active' },
@@ -636,7 +934,6 @@ describe('runSpir — abort handling', () => {
     ];
     mockGetAllTasks.mockReturnValue(activeTasks);
 
-    // The cancel loop from the updated catch block:
     for (const task of mockTaskTracker.getAllTasks()) {
       if (task.status === 'active') {
         try {
@@ -655,16 +952,11 @@ describe('runSpir — abort handling', () => {
   });
 
   it('does not throw if cancelTask throws for already-settled tasks', () => {
-    mockGetAllTasks.mockReturnValue([
-      { id: 'task-done', status: 'active' },
-    ]);
-
-    // Simulate cancelTask throwing (e.g., task already settled)
+    mockGetAllTasks.mockReturnValue([{ id: 'task-done', status: 'active' }]);
     mockCancelTask.mockImplementationOnce(() => {
       throw new Error('Task is already settled');
     });
 
-    // Should not throw — errors are caught
     expect(() => {
       for (const task of mockTaskTracker.getAllTasks()) {
         if (task.status === 'active') {
@@ -701,98 +993,9 @@ describe('runSpir — abort handling', () => {
 
     expect(mockCancelTask).not.toHaveBeenCalled();
   });
-
-  it('cancels tasks before calling onWorkflowFailed', () => {
-    const onWorkflowFailed = jest.fn();
-    const callOrder: string[] = [];
-
-    mockGetAllTasks.mockReturnValue([
-      { id: 'active-task', status: 'active' },
-    ]);
-
-    mockCancelTask.mockImplementation(() => {
-      callOrder.push('cancel');
-    });
-
-    // Simulate the abort sequence
-    for (const task of mockTaskTracker.getAllTasks()) {
-      if (task.status === 'active') {
-        try {
-          mockTaskTracker.cancelTask(task.id);
-        } catch {
-          // ignore
-        }
-      }
-    }
-
-    onWorkflowFailed({ error: new Error('Workflow cancelled'), phase: 'implementing' });
-    callOrder.push('failed');
-
-    // cancelTask should be called before onWorkflowFailed
-    expect(callOrder).toEqual(['cancel', 'failed']);
-  });
 });
 
-// ─── tracker.setPhase stays ─────────────────────────────────────────────────
-//
-// The updated spir.ts keeps tracker.setPhase(...) calls for phase transitions.
-// No changes needed — just verify they exist and work.
-
-describe('tracker.setPhase', () => {
-  it('is called for phase transitions in completePhase', async () => {
-    const setPhase = jest.fn();
-    const save = jest.fn().mockResolvedValue(undefined);
-    const tracker = { setPhase, save, completedPhases: [] } as never;
-
-    await spir.completePhase('scouting' as Phase, tracker, undefined, Date.now());
-
-    expect(setPhase).toHaveBeenCalled();
-  });
-
-  it('is called with the correct next phase name', async () => {
-    const setPhase = jest.fn();
-    const save = jest.fn().mockResolvedValue(undefined);
-    const tracker = { setPhase, save, completedPhases: [] } as never;
-
-    await spir.completePhase('planning' as Phase, tracker, undefined, Date.now());
-
-    // Should advance to implementing (next in PHASES after planning)
-    expect(setPhase).toHaveBeenCalledWith('implementing');
-  });
-});
-
-// ─── onPhaseStart ───────────────────────────────────────────────────────────
-//
-// onPhaseStart calls stay the same — phase is the id string, round is numeric.
-
-describe('onPhaseStart', () => {
-  it('receives phase as string id and round as number', () => {
-    const onPhaseStart = jest.fn();
-    onPhaseStart({ phase: 'scouting', round: 0 });
-
-    expect(onPhaseStart).toHaveBeenCalledWith({
-      phase: 'scouting',
-      round: 0,
-    });
-    expect(typeof onPhaseStart.mock.calls[0][0].phase).toBe('string');
-    expect(typeof onPhaseStart.mock.calls[0][0].round).toBe('number');
-  });
-
-  it('the phase value matches the Phase type', () => {
-    const validPhases: Phase[] = ['scouting', 'planning', 'implementing', 'review', 'done'];
-    const onPhaseStart = jest.fn();
-
-    for (const phase of validPhases) {
-      onPhaseStart({ phase, round: 0 });
-    }
-
-    expect(onPhaseStart).toHaveBeenCalledTimes(5);
-  });
-});
-
-// ─── Exports ────────────────────────────────────────────────────────────────
-//
-// Verify that all expected modules re-export correctly.
+// ─── Module re-exports ──────────────────────────────────────────────────────
 
 describe('module re-exports', () => {
   it('exports PHASES array', () => {
@@ -805,317 +1008,8 @@ describe('module re-exports', () => {
     expect(phase).toBe('scouting');
   });
 
-  it('exports RunState interface (type level)', () => {
-    // Type-level: verify the required fields exist
-    const _check: Required<RunState> = {
-      research: '',
-      plan: { tasks: [], strategy: '' } as never,
-      scoutingReports: [],
-      scoutingRounds: 0,
-      scoutingGaps: [],
-      scoutingFiles: [],
-    };
-    expect(_check.research).toBe('');
-  });
-
-  it('exports PhaseContext interface (type level)', () => {
-    const _check: Required<PhaseContext> = {
-      tracker: {} as never,
-      profilesDirs: [],
-      taskPrompt: '',
-      cwd: '',
-      workDir: '',
-      maxConcurrentTasks: 5,
-      config: MINIMAL_CONFIG,
-      apiKeys: {},
-      onStatus: {} as never,
-      signal: new AbortController().signal,
-    };
-    expect(_check.cwd).toBe('');
-  });
-
-  it('exports completePhase helper', () => {
-    expect(spir.completePhase).toBeDefined();
-    expect(typeof spir.completePhase).toBe('function');
-  });
-
-  it('exports executePhase helper', () => {
-    expect(spir.executePhase).toBeDefined();
-    expect(typeof spir.executePhase).toBe('function');
-  });
-
   it('exports getPhaseIndicator helper', () => {
     expect(spir.getPhaseIndicator).toBeDefined();
     expect(typeof spir.getPhaseIndicator).toBe('function');
-  });
-});
-
-// ─── WorkflowConfig — phases field replaces sidebarPhases ──────────────────
-
-describe('WorkflowConfig — phases field', () => {
-  it('config uses phases instead of sidebarPhases', () => {
-    // After the config interface is updated, sidebarPhases will be removed.
-    // Until then, we test that the new `phases` field is the primary one.
-    const config: WorkflowConfig = {
-      name: 'test',
-      defaultMaxConcurrentTasks: 3,
-      fixerSteps: [],
-      phases: [
-        { id: 'scouting', label: 'Scouting', icon: '🔍' },
-      ],
-      titleFormatter: (d: string) => d,
-    };
-
-    expect(config.phases).toHaveLength(1);
-  });
-
-  it('phases entries have id, label, icon strings', () => {
-    const config: WorkflowConfig = {
-      name: 'test',
-      defaultMaxConcurrentTasks: 1,
-      fixerSteps: [],
-      phases: [
-        { id: 'a', label: 'A', icon: '🅰' },
-      ],
-      titleFormatter: (d: string) => d,
-    };
-    expect(typeof config.phases[0].id).toBe('string');
-    expect(typeof config.phases[0].label).toBe('string');
-    expect(typeof config.phases[0].icon).toBe('string');
-  });
-});
-
-// ─── rendererRegistry threading ────────────────────────────────────────────
-//
-// The rendererRegistry must flow from SpirRunOptions through runSpir into
-// PhaseContext, and from PhaseContext through executePhase into every phase
-// function that receives it (implementationPhase, planningPhase).
-
-describe('PhaseContext — rendererRegistry field', () => {
-  it('PhaseContext accepts rendererRegistry (compile-time + runtime)', () => {
-    const ctx: PhaseContext = {
-      tracker: {} as never,
-      profilesDirs: [],
-      taskPrompt: 'test',
-      cwd: '/',
-      workDir: '/',
-      maxConcurrentTasks: undefined,
-      config: MINIMAL_CONFIG,
-      rendererRegistry: { renderers: new Map(), register: jest.fn(), get: jest.fn(), render: jest.fn() } as never,
-    };
-    expect(ctx).toHaveProperty('rendererRegistry');
-  });
-
-  it('PhaseContext is valid without rendererRegistry (optional)', () => {
-    const ctx: PhaseContext = {
-      tracker: {} as never,
-      profilesDirs: [],
-      taskPrompt: 'test',
-      cwd: '/',
-      workDir: '/',
-      maxConcurrentTasks: undefined,
-      config: MINIMAL_CONFIG,
-    };
-    expect(ctx.rendererRegistry).toBeUndefined();
-  });
-});
-
-describe('executePhase — rendererRegistry passthrough', () => {
-  beforeEach(() => {
-    mockImplementationPhase.mockClear();
-    mockPlanningPhase.mockClear();
-    mockScoutingPhase.mockClear();
-    mockScoutingReviewPhase.mockClear();
-    mockFinalReviewPhase.mockClear();
-  });
-
-  function makeTracker() {
-    return {
-      setPhase: jest.fn(),
-      save: jest.fn().mockResolvedValue(undefined),
-      setWorkflowData: jest.fn(),
-      get workflowData() {
-        return {};
-      },
-      get currentPhase() {
-        return '';
-      },
-      get completedPhases() {
-        return [];
-      },
-      taskTracker: mockTaskTracker,
-    } as never;
-  }
-
-  it('passes rendererRegistry to implementationPhase for the implementing phase', async () => {
-    const fakeRegistry = { renderers: new Map(), register: jest.fn(), get: jest.fn(), render: jest.fn() };
-    const ctx: PhaseContext = {
-      tracker: makeTracker(),
-      profilesDirs: ['/profiles'],
-      taskPrompt: 'test',
-      cwd: '/cwd',
-      workDir: '/work',
-      maxConcurrentTasks: 5,
-      config: MINIMAL_CONFIG,
-      rendererRegistry: fakeRegistry as never,
-    };
-    const state: RunState = {
-      research: 'done',
-      plan: { tasks: [], strategy: 'test' },
-      scoutingReports: [],
-      scoutingRounds: 0,
-      scoutingGaps: [],
-    };
-
-    await spir.executePhase('implementing' as Phase, state, ctx);
-
-    // implementationPhase should have been called with rendererRegistry as trailing arg
-    expect(mockImplementationPhase).toHaveBeenCalledTimes(1);
-    const args = mockImplementationPhase.mock.calls[0];
-    // rendererRegistry is the last positional arg (after signal)
-    expect(args).toContain(fakeRegistry);
-  });
-
-  it('passes rendererRegistry to planningPhase for the planning phase', async () => {
-    const fakeRegistry = { renderers: new Map(), register: jest.fn(), get: jest.fn(), render: jest.fn() };
-    const ctx: PhaseContext = {
-      tracker: makeTracker(),
-      profilesDirs: ['/profiles'],
-      taskPrompt: 'test',
-      cwd: '/cwd',
-      workDir: '/work',
-      maxConcurrentTasks: 5,
-      config: MINIMAL_CONFIG,
-      rendererRegistry: fakeRegistry as never,
-    };
-    const state: RunState = {
-      research: 'Research done',
-      plan: undefined,
-      scoutingReports: [],
-      scoutingRounds: 0,
-      scoutingGaps: [],
-      scoutingFiles: [],
-    };
-
-    await spir.executePhase('planning' as Phase, state, ctx);
-
-    // planningPhase owns plan + review now, so it should have been called
-    // once with rendererRegistry as the trailing arg.
-    expect(mockPlanningPhase).toHaveBeenCalledTimes(1);
-    const args = mockPlanningPhase.mock.calls[0];
-    expect(args).toContain(fakeRegistry);
-  });
-
-  it('passes undefined rendererRegistry when ctx has none (implementing)', async () => {
-    const ctx: PhaseContext = {
-      tracker: makeTracker(),
-      profilesDirs: ['/profiles'],
-      taskPrompt: 'test',
-      cwd: '/cwd',
-      workDir: '/work',
-      maxConcurrentTasks: 5,
-      config: MINIMAL_CONFIG,
-      // No rendererRegistry
-    };
-    const state: RunState = {
-      research: 'done',
-      plan: { tasks: [], strategy: 'test' },
-      scoutingReports: [],
-      scoutingRounds: 0,
-      scoutingGaps: [],
-    };
-
-    await spir.executePhase('implementing' as Phase, state, ctx);
-
-    expect(mockImplementationPhase).toHaveBeenCalledTimes(1);
-    const args = mockImplementationPhase.mock.calls[0];
-    // rendererRegistry should be the trailing arg (undefined)
-    expect(args[args.length - 1]).toBeUndefined();
-  });
-});
-
-// ─── runSpir → ctx wiring for rendererRegistry ────────────────────────────
-//
-// The first link of the threading chain: runSpir must copy
-// options.rendererRegistry into the PhaseContext it builds, so that
-// executePhase (and ultimately every phase function) can read it.
-// We test via the observable effect: the mocked phase functions should
-// receive rendererRegistry when runSpir is given one.
-
-describe('runSpir — rendererRegistry → ctx wiring', () => {
-  let savedLoad: typeof MockWorkflowStatusTracker.load | undefined;
-
-  beforeEach(() => {
-    mockImplementationPhase.mockClear();
-    mockPlanningPhase.mockClear();
-    mockScoutingPhase.mockClear();
-    mockScoutingReviewPhase.mockClear();
-    mockFinalReviewPhase.mockClear();
-
-    // Mock the static .load method so runSpir can create a tracker
-    // without touching disk.  We return a tracker whose currentPhaseId
-    // is 'implementing' so the loop skips scouting/planning and calls
-    // implementationPhase directly.
-    savedLoad = (MockWorkflowStatusTracker as Record<string, unknown>).load as typeof MockWorkflowStatusTracker.load | undefined;
-    (MockWorkflowStatusTracker as Record<string, unknown>).load = jest.fn().mockResolvedValue({
-      setPhase: jest.fn(),
-      setCurrentPhase: jest.fn(),
-      save: jest.fn().mockResolvedValue(undefined),
-      setWorkflowData: jest.fn(),
-      setTaskPrompt: jest.fn(),
-      setWorktree: jest.fn(),
-      get workflowData() {
-        return { plan: { tasks: [], strategy: 'test' }, research: 'done' };
-      },
-      get currentPhase() { return 'implementing'; },
-      get completedPhases() { return ['scouting', 'planning']; },
-      get taskTracker() { return mockTaskTracker; },
-      get stats() { return { totalTokens: 0, totalCost: 0, agentCount: 0 }; },
-      setScoutingReports: jest.fn(),
-      setPlan: jest.fn(),
-      setResearch: jest.fn(),
-      setPlanReviewFeedback: jest.fn(),
-      clearPlanReviewFeedback: jest.fn(),
-      completedPhaseIds: ['scouting', 'planning'],
-      currentPhaseId: 'implementing',
-    });
-  });
-
-  afterEach(() => {
-    // Restore original .load so later tests are unaffected
-    if (savedLoad !== undefined) {
-      (MockWorkflowStatusTracker as Record<string, unknown>).load = savedLoad;
-    } else {
-      delete (MockWorkflowStatusTracker as Record<string, unknown>).load;
-    }
-  });
-
-  it('copies options.rendererRegistry into ctx so phase functions receive it', async () => {
-    const fakeRegistry = { renderers: new Map(), register: jest.fn(), get: jest.fn(), render: jest.fn() };
-
-    await spir.runSpir(MINIMAL_CONFIG, 'Build a feature', {
-      ...MINIMAL_OPTIONS,
-      rendererRegistry: fakeRegistry,
-    } as never);
-
-    // implementationPhase should have been called because the tracker's
-    // workflowData includes a plan.  Its args come from executePhase,
-    // which builds them from ctx — so rendererRegistry appearing here
-    // proves runSpir threaded it into ctx.
-    expect(mockImplementationPhase).toHaveBeenCalled();
-    const args = mockImplementationPhase.mock.calls[0] as unknown[];
-    expect(args).toContain(fakeRegistry);
-  });
-
-  it('does not pass rendererRegistry when options omit it', async () => {
-    await spir.runSpir(MINIMAL_CONFIG, 'Build a feature', {
-      ...MINIMAL_OPTIONS,
-      // no rendererRegistry
-    } as never);
-
-    expect(mockImplementationPhase).toHaveBeenCalled();
-    const args = mockImplementationPhase.mock.calls[0] as unknown[];
-    // The registry should NOT appear in the args at all
-    expect(args).not.toContain(expect.objectContaining({ renderers: expect.anything() }));
   });
 });

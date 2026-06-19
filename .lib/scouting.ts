@@ -1,9 +1,8 @@
-import type { StatusCallbacks, StepDefinition, WorkflowStatusTracker } from "@harms-haus/engin-engine";
-import { LanePool, TaskTracker, runStepTask } from "@harms-haus/engin-engine";
+import type { StatusCallbacks, StepDefinition, WorkflowRunOptions, WorkflowStatusTracker } from "@harms-haus/engin-engine";
+import { LanePool, runStepTask } from "@harms-haus/engin-engine";
 import { join } from "node:path";
 import { ScoutingTopicSchema, ScoutingReviewSchema } from "./schemas";
 import type { ScoutingTopics, ScoutingReview } from "./schemas";
-import { structuredOutputEvent, decisionEvent } from "./helpers";
 
 // ─── Phase 1: Scouting ──────────────────────────────────────────────────────
 
@@ -16,8 +15,6 @@ interface ScoutingTopic {
 interface ScoutingPhaseOptions {
     /** Pre-defined topics (e.g. from a review's gaps). When provided, the scout-coordinator is skipped. */
     topics?: ScoutingTopic[];
-    /** Previous scouting reports to accumulate into (new reports are appended). */
-    existingReports?: unknown[];
     /** Round number for session directory naming (0-based). */
     round: number;
 }
@@ -32,8 +29,18 @@ interface ScoutingPhaseOptions {
  * When `options.topics` is omitted, runs the scout-coordinator first to
  * determine the topics, then runs the LanePool (first round).
  *
- * New reports are appended to `options.existingReports` when provided.
- * Returns the complete accumulated list of reports.
+ * Scout tasks are added to the SHARED tracker (`tracker.taskTracker`) and the
+ * LanePool runs against it — mirroring `implementationPhase`. Because the
+ * shared tracker persists across the ≤3 scouting rounds, complete scout-task
+ * results accumulate naturally, so the `onPhaseSettled` hook registered in
+ * spir.ts can collect the cumulative set into `state.scoutingReports` (and
+ * persist it to workflowData) once the phase settles.
+ *
+ * This function does NOT collect reports, call `setWorkflowData`, or fire
+ * `onAgentComplete` itself — collection/persistence is the hook's job, and
+ * per-scout completion is already surfaced by the LanePool's own status
+ * callbacks (`runStep` → `handle.complete()` → `onAgentComplete`), the same
+ * path `implementationPhase` relies on.
  */
 export async function scoutingPhase(
     tracker: WorkflowStatusTracker,
@@ -46,7 +53,8 @@ export async function scoutingPhase(
     onStatus?: StatusCallbacks,
     signal?: AbortSignal,
     phaseOptions: ScoutingPhaseOptions = { round: 0 },
-): Promise<unknown[]> {
+    hookRegistry?: WorkflowRunOptions["hookRegistry"],
+): Promise<void> {
     let topics: ScoutingTopic[];
 
     if (phaseOptions.topics && phaseOptions.topics.length > 0) {
@@ -74,26 +82,28 @@ export async function scoutingPhase(
             schema: ScoutingTopicSchema,
             prompt: topicPrompt,
             signal,
+            // Thread the hook registry so the engine's default auditor
+            // (registered in runSpir) observes this step's structured_output.
+            hookRegistry,
         });
 
         topics = coordinatorTopics.topics;
-
-        await tracker.auditLog.append(
-            structuredOutputEvent("scout-coordinator", coordinatorTopics),
-        );
     }
 
-    // Run LanePool with the determined topics
-    const reports: unknown[] = phaseOptions.existingReports
-        ? [...phaseOptions.existingReports]
-        : [];
+    if (topics.length === 0) return;
 
-    if (topics.length > 0) {
-        const scoutingTracker = new TaskTracker();
+    const SCOUTING_STEPS: StepDefinition[] = [
+        { name: 'scouting', profileId: 'scout', isReadOnly: true },
+    ];
 
-        for (const topic of topics) {
-            const taskId = `scout-${topic.topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}`;
-            scoutingTracker.addTask({
+    // Add scout tasks to the SHARED tracker (mirrors implementationPhase). The
+    // `getTask` guard prevents a duplicate-add when a follow-up round's gap
+    // repeats a prior topic slug — the shared tracker accumulates scout tasks
+    // across rounds, so a re-encountered id would otherwise throw.
+    for (const topic of topics) {
+        const taskId = `scout-${topic.topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}`;
+        if (!tracker.taskTracker.getTask(taskId)) {
+            tracker.taskTracker.addTask({
                 id: taskId,
                 title: topic.topic,
                 prompt: [
@@ -116,40 +126,27 @@ export async function scoutingPhase(
                 phaseId: "scouting",
             });
         }
-
-        const SCOUTING_STEPS: StepDefinition[] = [
-            { name: 'scouting', profileId: 'scout', isReadOnly: true },
-        ];
-
-        const pool = new LanePool({
-            maxConcurrentLanes: maxConcurrentTasks,
-            profilesDirs,
-            phaseId: "scouting",
-            sessionBaseDir: join(workDir, 'sessions', `scouting-round-${phaseOptions.round}`),
-            cwd,
-            apiKeys,
-            onStatus,
-            auditLog: tracker.auditLog,
-            taskTracker: scoutingTracker,
-            getStepsForTask: () => SCOUTING_STEPS,
-            signal,
-        });
-
-        await pool.run();
-
-        // Collect results from completed tasks and APPEND to existing reports
-        for (const task of scoutingTracker.getAllTasks()) {
-            if (task.status === 'complete') {
-                reports.push(task.result);
-                onStatus?.onAgentComplete?.({ agentId: task.id, profile: "scout", phaseId: "scouting" });
-            }
-        }
     }
 
-    // Update tracker with the full accumulated reports
-    tracker.setWorkflowData({ scoutingReports: reports });
+    const pool = new LanePool({
+        maxConcurrentLanes: maxConcurrentTasks,
+        profilesDirs,
+        phaseId: "scouting",
+        sessionBaseDir: join(workDir, 'sessions', `scouting-round-${phaseOptions.round}`),
+        cwd,
+        apiKeys,
+        onStatus,
+        auditLog: tracker.auditLog,
+        // Thread the hook registry alongside auditLog so LanePool.run() can
+        // auto-register its own default auditor and observe each scout step's
+        // structured_output / decision events.
+        hookRegistry,
+        taskTracker: tracker.taskTracker,
+        getStepsForTask: () => SCOUTING_STEPS,
+        signal,
+    });
 
-    return reports;
+    await pool.run();
 }
 
 // ─── Phase 2: Scouting Review ───────────────────────────────────────────────
@@ -176,6 +173,7 @@ export async function scoutingReviewPhase(
     apiKeys?: Record<string, string>,
     onStatus?: StatusCallbacks,
     signal?: AbortSignal,
+    hookRegistry?: WorkflowRunOptions["hookRegistry"],
 ): Promise<ScoutingReview> {
     const prompt = [
         "You are reviewing scouting reports to determine if we have enough information to create an implementation plan FOR THE TASK BELOW.",
@@ -209,6 +207,9 @@ export async function scoutingReviewPhase(
         schema: ScoutingReviewSchema,
         prompt,
         signal,
+        // Thread the hook registry so the engine's default auditor (registered
+        // in runSpir) observes this review's structured_output.
+        hookRegistry,
     });
 
     onStatus?.onDecision?.({
@@ -216,14 +217,6 @@ export async function scoutingReviewPhase(
         decision: review.ready ? "proceed_to_planning" : "more_scouting_needed",
         reasoning: review.research,
     });
-
-    await tracker.auditLog.append(
-        decisionEvent(
-            "scouting-reviewer",
-            review.ready ? "proceed_to_planning" : "more_scouting_needed",
-            review.research,
-        ),
-    );
 
     return review;
 }

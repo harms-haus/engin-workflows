@@ -1,6 +1,6 @@
 // ─── Planning Phase Tests ────────────────────────────────────────────────────
 //
-// Planning is now ONE task with TWO steps (plan → review-plan), run via the
+// Planning is ONE task with TWO steps (plan → review-plan), run via the
 // engine's runMultiStepTask. The plan step writes plan.json (validated by a
 // `validateOutput` gate); the review step reads it back (its prompt is a lazy
 // function so the file exists by the time it runs) and gates approval via
@@ -8,13 +8,30 @@
 // is covered by the engine's phase-tasks tests; here we assert that planningPhase
 // wires the two steps correctly.
 //
+// These tests are written TEST-FIRST for the "delete duplicate prompt-inlining"
+// refactor (§5 item #4). They assert the POST-REFACTOR contract:
+//
+//   1. The duplicated file-inlining code (CONTEXT_FILE_MAX_BYTES, LANG_BY_EXT,
+//      BINARY_EXTS, readContextFile, formatScoutingFilesSection) is GONE from
+//      planning.ts.
+//   2. The scouting files are handed to runMultiStepTask as `files` (so the
+//      engine's default `beforeStepPrompt` / `collectContext` hooks inline them),
+//      NOT inlined into the prompt locally.
+//   3. A `hookRegistry` is threaded into runMultiStepTask so the engine's
+//      default prompt-context hook fires.
+//   4. The `structuredOutputEvent` / `decisionEvent` helper imports are REMOVED
+//      and the manual `auditLog.append(…)` calls deleted — the engine's default
+//      auditor (registered in runSpir, task-17) now produces those events.
+//
 // The mock runMultiStepTask mimics just enough of the real behaviour to let us
-// assert prompt contents and the plan read-back: it resolves each step's (lazy)
-// prompt, invokes `validateOutput`, and returns a controllable review result.
+// assert prompt contents, the plan read-back, the `files`/`hookRegistry` wiring,
+// AND the engine-default inlining effect (it invokes a threaded `beforeStepPrompt`
+// hook when one is present, exactly like the engine).
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { isAbsolute, join } from 'node:path';
 import type { StatusCallbacks, WorkflowStatusTracker } from '@harms-haus/engin-engine';
 import { createEnginMock } from './engin-mock';
 
@@ -40,10 +57,30 @@ class MockLanePool {
   async run() {}
 }
 
+/**
+ * Shape of a step as it arrives in `opts.steps` (BEFORE the mock resolves its
+ * lazy prompt). Distinct from `CapturedStep` (which stores the resolved
+ * prompt text) so the mock can read `step.prompt` without a type error.
+ */
+interface RawStep {
+  stepName: string;
+  profileId: string;
+  prompt: string | ((priorResults: unknown[], ctx: { attempt: number }) => Promise<string> | string);
+  isReadOnly?: boolean;
+  allowedWriteDirs?: string[];
+  schema?: unknown;
+  isApproved?: (r: unknown) => boolean;
+  getFeedback?: (r: unknown) => string;
+  validateOutput?: () => Promise<{ error?: string } | undefined>;
+}
+
 interface CapturedStep {
   stepName: string;
   profileId: string;
+  /** Prompt text built by planningPhase (BEFORE any engine hook runs). */
   promptText: string;
+  /** Prompt actually sent to the agent (AFTER the `beforeStepPrompt` hook, when one is threaded). */
+  effectivePrompt: string;
   isReadOnly?: boolean;
   allowedWriteDirs?: string[];
   schema?: unknown;
@@ -62,17 +99,52 @@ let nextReviewResult: { ready: boolean; feedback: string; suggestions: string[] 
 };
 let nextApproved = true;
 let lastCapturedSteps: CapturedStep[] = [];
+/** The full options object handed to runMultiStepTask on the last call. */
+let lastCapturedOpts: Record<string, unknown> = {};
+/** Per-step effective prompt (post-`beforeStepPrompt`-hook) from the last call. */
+let lastEffectivePrompts: Record<string, string> = {};
 
 mockRunMultiStepTask.mockImplementation(async (opts) => {
-  const steps = opts.steps as CapturedStep[];
+  const steps = opts.steps as RawStep[];
   lastCapturedSteps = [];
+  lastCapturedOpts = opts;
+  lastEffectivePrompts = {};
   const results: unknown[] = [];
+
+  // The engine resolves each step's (possibly lazy) prompt, then — when a
+  // hookRegistry with `beforeStepPrompt` subscribers is threaded in — passes
+  // the resolved prompt through the pipeline hook and uses the return value.
+  // We mirror that here so tests can assert on the EFFECTIVE prompt.
+  const hookRegistry = opts.hookRegistry as
+    | {
+        hasSubscribers?: (name: string) => boolean;
+        invokePipeline?: (name: string, value: unknown, args: unknown, ctx: unknown) => Promise<unknown>;
+      }
+    | undefined;
+  const taskFiles = (opts.files as string[] | undefined) ?? [];
+
   for (const step of steps) {
-    const promptText = typeof step.prompt === 'function' ? await step.prompt(results) : (step.prompt as string);
+    const promptText = typeof step.prompt === 'function' ? await step.prompt([...results], { attempt: 0 }) : step.prompt;
+
+    const hasHook = !!hookRegistry?.hasSubscribers?.('beforeStepPrompt');
+    const effectivePrompt = hasHook
+      ? String(
+          await hookRegistry!.invokePipeline!(
+            'beforeStepPrompt',
+            promptText,
+            // The engine synthesizes a Task carrying `files` and passes it to the hook.
+            { task: { files: taskFiles }, step: { name: step.stepName }, prompt: promptText, cwd: opts.cwd },
+            { cwd: opts.cwd },
+          ),
+        )
+      : promptText;
+    lastEffectivePrompts[step.stepName] = effectivePrompt;
+
     lastCapturedSteps.push({
       stepName: step.stepName,
       profileId: step.profileId,
       promptText,
+      effectivePrompt,
       isReadOnly: step.isReadOnly,
       allowedWriteDirs: step.allowedWriteDirs,
       schema: step.schema,
@@ -142,18 +214,66 @@ function makeWorkDir(plan?: Plan): string {
   return workDir;
 }
 
+/** Read the live planning.ts source text (for deletion / import assertions). */
+function planningSource(): string {
+  return readFileSync(fileURLToPath(new URL('./planning.ts', import.meta.url)), 'utf-8');
+}
+
+/**
+ * Minimal fake `HookRegistry` whose `beforeStepPrompt` (pipeline) subscriber
+ * inlines `args.task.files` read against `ctx.cwd` — mirroring the engine's
+ * `defaultCollectContext` / `defaultBeforeStepPrompt` contract. Lets tests
+ * prove the planner STILL receives file context, now via the engine path.
+ */
+function makeInliningHookRegistry(): unknown {
+  return {
+    register() {},
+    hasSubscribers(name: string) {
+      return name === 'beforeStepPrompt';
+    },
+    async invokeObserve() {},
+    async invokeFirstWins() {
+      return undefined;
+    },
+    async invokeAllRun() {
+      return undefined;
+    },
+    async invokePipeline(name: string, value: unknown, args: unknown, ctx: unknown) {
+      if (name !== 'beforeStepPrompt') return value as string;
+      const files = ((args as { task?: { files?: string[] } })?.task?.files) ?? [];
+      const cwd = (ctx as { cwd?: string } | null)?.cwd ?? '.';
+      const blocks: string[] = [];
+      for (const fp of files) {
+        let content: string | null = null;
+        try {
+          content = readFileSync(isAbsolute(fp) ? fp : join(cwd, fp), 'utf-8');
+        } catch {
+          /* unreadable — skip, mirroring the engine default */
+        }
+        if (content != null) blocks.push(`### ${fp}\n\`\`\`typescript\n${content}\n\`\`\``);
+      }
+      if (blocks.length === 0) return value as string;
+      return `${value}\n\n${blocks.join('\n\n')}`;
+    },
+  };
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 describe('planningPhase', () => {
   beforeEach(() => {
     mockRunMultiStepTask.mockClear();
     lastCapturedSteps = [];
+    lastCapturedOpts = {};
+    lastEffectivePrompts = {};
     nextReviewResult = { ready: true, feedback: 'Approved', suggestions: [] };
     nextApproved = true;
   });
 
   const planStep = () => lastCapturedSteps.find((s) => s.stepName === 'plan')!;
   const reviewStep = () => lastCapturedSteps.find((s) => s.stepName === 'review-plan')!;
+  const capturedOpts = () => lastCapturedOpts;
+  const effectivePrompt = (stepName: string) => lastEffectivePrompts[stepName];
 
   // ── runMultiStepTask wiring ─────────────────────────────────────────────
 
@@ -163,12 +283,12 @@ describe('planningPhase', () => {
       await planningPhase(makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
 
       expect(mockRunMultiStepTask).toHaveBeenCalledTimes(1);
-      const opts = mockRunMultiStepTask.mock.calls[0]![0] as Record<string, unknown>;
+      const opts = capturedOpts();
       expect(opts.taskId).toBe('planning');
       expect(opts.phaseId).toBe('planning');
       expect(opts.title).toBe('Plan & Review');
       expect(Array.isArray(opts.steps)).toBe(true);
-      expect((opts.steps as CapturedStep[]).map((s) => s.stepName)).toEqual(['plan', 'review-plan']);
+      expect((opts.steps as RawStep[]).map((s) => s.stepName)).toEqual(['plan', 'review-plan']);
     } finally {
       rmSync(workDir, { recursive: true, force: true });
     }
@@ -224,7 +344,7 @@ describe('planningPhase', () => {
         apiKeys, onStatus, abortController.signal, fakeRegistry as never,
       );
 
-      const opts = mockRunMultiStepTask.mock.calls[0]![0] as Record<string, unknown>;
+      const opts = capturedOpts();
       expect(opts.apiKeys).toBe(apiKeys);
       expect(opts.onStatus).toBe(onStatus);
       expect(opts.signal).toBe(abortController.signal);
@@ -253,9 +373,48 @@ describe('planningPhase', () => {
     }
   });
 
-  // ── Scouting file-context inlining (plan step) ─────────────────────────
+  // ── DELETED duplicate inlining code ──────────────────────────────────────
+  //
+  // §5 item #4: the planner/plan-reviewer must NOT carry their own copy of the
+  // engine's buildPrompt file-inlining logic. These assertions guard against
+  // the duplication creeping back in.
 
-  describe('scouting file-context inlining', () => {
+  describe('duplicate prompt-inlining code is removed', () => {
+    it('no longer defines the duplicated inlining constants / helpers', () => {
+      const src = planningSource();
+      expect(src).not.toContain('CONTEXT_FILE_MAX_BYTES');
+      expect(src).not.toContain('LANG_BY_EXT');
+      expect(src).not.toContain('BINARY_EXTS');
+      expect(src).not.toContain('readContextFile');
+      expect(src).not.toContain('formatScoutingFilesSection');
+      expect(src).not.toContain('inlineScoutingContext');
+    });
+
+    it('drops the fs/path imports that were only used by the deleted code', () => {
+      const src = planningSource();
+      // `open` (node:fs/promises) was only used by readContextFile.
+      expect(src).not.toMatch(/import\s*\{[^}]*\bopen\b[^}]*\}\s*from\s*["']node:fs\/promises["']/);
+      // `extname` / `isAbsolute` (node:path) were only used by readContextFile.
+      expect(src).not.toMatch(/import\s*\{[^}]*\bextname\b[^}]*\}\s*from\s*["']node:path["']/);
+      expect(src).not.toMatch(/import\s*\{[^}]*\bisAbsolute\b[^}]*\}\s*from\s*["']node:path["']/);
+    });
+
+    it('still keeps readFile / join (used by the surviving plan read-back helpers)', () => {
+      const src = planningSource();
+      expect(src).toMatch(/readFile/);
+      expect(src).toMatch(/\bjoin\b/);
+    });
+  });
+
+  // ── Scouting file context is DELEGATED to the engine ────────────────────
+  //
+  // Previously planning.ts inlined scouting-file contents into the prompt
+  // itself (formatScoutingFilesSection). Now it must hand the files to
+  // runMultiStepTask (`files` on the task) so the engine's default
+  // beforeStepPrompt / collectContext hooks inline them — eliminating the
+  // duplicated inlining logic.
+
+  describe('scouting file context is delegated to the engine (no local inlining)', () => {
     let cwd: string;
 
     beforeEach(() => {
@@ -267,29 +426,109 @@ describe('planningPhase', () => {
       rmSync(cwd, { recursive: true, force: true });
     });
 
-    it('inlines the contents of the scouting files into the planner prompt', async () => {
+    it('hands the scouting files to runMultiStepTask as opts.files', async () => {
       const workDir = makeWorkDir(SAMPLE_PLAN);
       try {
         await planningPhase(makeMockTracker(), ['/profiles'], 'Research', ['src/api.ts'], 'Task', cwd, workDir);
 
-        const prompt = planStep().promptText;
-        expect(prompt).toContain('Key files from scouting');
-        expect(prompt).toContain('### src/api.ts');
-        expect(prompt).toContain('export const API = "v1";');
+        const opts = capturedOpts();
+        expect(opts.files).toEqual(['src/api.ts']);
       } finally {
         rmSync(workDir, { recursive: true, force: true });
       }
     });
 
-    it('omits the files section entirely when no files are provided', async () => {
+    it('hands an empty files array when no scouting files were provided', async () => {
       const workDir = makeWorkDir(SAMPLE_PLAN);
       try {
         await planningPhase(makeMockTracker(), ['/profiles'], 'Research', [], 'Task', cwd, workDir);
 
-        expect(planStep().promptText).not.toContain('Key files from scouting');
+        expect(capturedOpts().files).toEqual([]);
       } finally {
         rmSync(workDir, { recursive: true, force: true });
       }
+    });
+
+    it('does NOT inline file contents into the locally-built planner prompt', async () => {
+      const workDir = makeWorkDir(SAMPLE_PLAN);
+      try {
+        await planningPhase(makeMockTracker(), ['/profiles'], 'Research', ['src/api.ts'], 'Task', cwd, workDir);
+
+        // The prompt built by planningPhase itself must be free of inlined
+        // file contents — that is now the engine's job.
+        const prompt = planStep().promptText;
+        expect(prompt).not.toContain('Key files from scouting');
+        expect(prompt).not.toContain('### src/api.ts');
+        expect(prompt).not.toContain('export const API = "v1";');
+      } finally {
+        rmSync(workDir, { recursive: true, force: true });
+      }
+    });
+
+    it('the engine default beforeStepPrompt hook inlines task.files into the effective prompt', async () => {
+      // With `files` threaded onto the task AND a `hookRegistry` carrying a
+      // beforeStepPrompt subscriber, the EFFECTIVE prompt (post-hook) must
+      // contain the inlined file contents — proving the planner still gets
+      // file context, now via the engine path rather than the local duplicate.
+      const workDir = makeWorkDir(SAMPLE_PLAN);
+      try {
+        await planningPhase(
+          makeMockTracker(), ['/profiles'], 'Research', ['src/api.ts'], 'Task', cwd, workDir,
+          undefined, undefined, undefined, undefined, makeInliningHookRegistry() as never,
+        );
+
+        const effective = effectivePrompt('plan');
+        expect(effective).toContain('src/api.ts');
+        expect(effective).toContain('export const API = "v1";');
+      } finally {
+        rmSync(workDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ── hookRegistry threading ──────────────────────────────────────────────
+
+  describe('hookRegistry threading (enables the engine beforeStepPrompt default)', () => {
+    it('forwards the hookRegistry to runMultiStepTask', async () => {
+      const workDir = makeWorkDir(SAMPLE_PLAN);
+      const fakeHookRegistry = { hasSubscribers: () => false } as never;
+      try {
+        await planningPhase(
+          makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir,
+          undefined, undefined, undefined, undefined, fakeHookRegistry,
+        );
+
+        expect(capturedOpts().hookRegistry).toBe(fakeHookRegistry);
+      } finally {
+        rmSync(workDir, { recursive: true, force: true });
+      }
+    });
+
+    it('omits hookRegistry from runMultiStepTask when none is provided', async () => {
+      const workDir = makeWorkDir(SAMPLE_PLAN);
+      try {
+        await planningPhase(makeMockTracker(), ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
+
+        expect(capturedOpts().hookRegistry).toBeUndefined();
+      } finally {
+        rmSync(workDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ── helper imports removed (auditor migration done) ───────────────────
+
+  describe('structuredOutputEvent / decisionEvent imports are removed (the engine auditor now handles it)', () => {
+    it('no longer imports structuredOutputEvent or decisionEvent from ./helpers', () => {
+      const src = planningSource();
+      expect(src).not.toMatch(/from\s+["']\.\/helpers["']/);
+      expect(src).not.toContain('structuredOutputEvent');
+      expect(src).not.toContain('decisionEvent');
+    });
+
+    it('drops the resolved task-17 TODO', () => {
+      const src = planningSource();
+      expect(src).not.toContain('TODO(task-17)');
     });
   });
 
@@ -335,14 +574,19 @@ describe('planningPhase', () => {
     }
   });
 
-  it('appends a structured_output event with the read-back plan', async () => {
+  it('does NOT manually append a structured_output event for the plan (the default auditor handles it)', async () => {
     const workDir = makeWorkDir(SAMPLE_PLAN);
     try {
       const tracker = makeMockTracker();
       await planningPhase(tracker, ['/profiles'], 'Research', [], 'Task', '/cwd', workDir);
 
-      expect(tracker.auditLog.append).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'structured_output', agentId: 'planner', output: SAMPLE_PLAN }),
+      // The audit migration deleted the manual
+      // `auditLog.append(structuredOutputEvent("planner", …))`; the plan's
+      // structured_output event now lands via the engine's default auditor.
+      // With the engine mocked here no auditor fires, so append must NOT
+      // receive a structured_output event.
+      expect(tracker.auditLog.append).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'structured_output' }),
       );
     } finally {
       rmSync(workDir, { recursive: true, force: true });
@@ -351,7 +595,7 @@ describe('planningPhase', () => {
 
   // ── Decision / audit (final review outcome) ────────────────────────────
 
-  it('fires onDecision + audit with plan_approved when the review approves', async () => {
+  it('fires onDecision with plan_approved (and no longer manually audits it) when the review approves', async () => {
     const workDir = makeWorkDir(SAMPLE_PLAN);
     try {
       nextReviewResult = { ready: true, feedback: 'Looks good', suggestions: [] };
@@ -361,20 +605,24 @@ describe('planningPhase', () => {
 
       await planningPhase(tracker, ['/profiles'], 'Research', [], 'Task', '/cwd', workDir, undefined, onStatus);
 
+      // The onStatus.onDecision STORE callback (TUI) still fires …
       expect(onStatus.onDecision).toHaveBeenCalledWith({
         agentId: 'plan-reviewer',
         decision: 'plan_approved',
         reasoning: 'Looks good',
       });
-      expect(tracker.auditLog.append).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'decision', agentId: 'plan-reviewer', decision: 'plan_approved', reasoning: 'Looks good' }),
+      // … but the manual `auditLog.append(decisionEvent(…))` is gone: the
+      // decision now lands via the engine's default auditor. With the engine
+      // mocked here no auditor fires, so append must NOT receive a decision event.
+      expect(tracker.auditLog.append).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'decision' }),
       );
     } finally {
       rmSync(workDir, { recursive: true, force: true });
     }
   });
 
-  it('fires onDecision + audit with plan_rejected when the review exhausts retries', async () => {
+  it('fires onDecision with plan_rejected when the review exhausts retries (audit handled by the engine auditor)', async () => {
     const workDir = makeWorkDir(SAMPLE_PLAN);
     try {
       nextReviewResult = { ready: false, feedback: 'Missing details', suggestions: ['add more'] };

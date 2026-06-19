@@ -22,13 +22,23 @@ class MockTaskTracker {
     this.tasks.set(task.id as string, { ...task, status: task.status ?? 'ready' });
   }
 
+  getTask(id: string) {
+    return this.tasks.get(id);
+  }
+
   getAllTasks() {
     return Array.from(this.tasks.values());
   }
 }
 
+/** Captures the options handed to the most recent `new LanePool(...)` so tests
+ *  can assert on the wiring (e.g. the shared taskTracker). */
+let lastLanePoolOpts: Record<string, unknown> | undefined;
+
 class MockLanePool {
-  constructor(_opts: Record<string, unknown>) {}
+  constructor(opts: Record<string, unknown>) {
+    lastLanePoolOpts = opts;
+  }
   async run() {}
 }
 
@@ -63,6 +73,7 @@ function makeMockTracker(): WorkflowStatusTracker {
     setWorkflowData: mock(() => {}),
     recordAgentSpawn: mock(() => {}),
     incrementAgentCount: mock(() => {}),
+    taskTracker: new MockTaskTracker(),
   } as unknown as WorkflowStatusTracker;
 }
 
@@ -84,15 +95,17 @@ function makeStatusCallbacksSpy() {
 describe('scoutingPhase', () => {
   beforeEach(() => {
     mockRunStepTask.mockClear();
+    lastLanePoolOpts = undefined;
   });
 
-  // ─── Pre-defined topics path (follow-up round) ────────────────────────────
+  // ─── Pre-defined topics path (follow-up round) ────────────────────────
 
   describe('when topics are pre-defined (follow-up round)', () => {
-    it('skips the scout-coordinator and uses the provided topics directly', async () => {
+    it('skips the scout-coordinator and adds one scout task per topic to the SHARED tracker', async () => {
       const tracker = makeMockTracker();
       const topics = [
         { topic: 'API Design', rationale: 'Need to understand API endpoints', files: ['src/api/'] },
+        { topic: 'Database', rationale: 'Inspect schema', files: ['src/db/'] },
       ];
 
       const result = await scoutingPhase(
@@ -110,14 +123,55 @@ describe('scoutingPhase', () => {
 
       // Coordinator should NOT have been called
       expect(mockRunStepTask).not.toHaveBeenCalled();
-      expect(result).toBeInstanceOf(Array);
+      // scoutingPhase no longer returns reports — collection is the hook's job
+      expect(result).toBeUndefined();
+      // One scout task per topic lands on the SHARED tracker (phaseId 'scouting')
+      // so the onPhaseSettled hook can collect them.
+      const tasks = tracker.taskTracker.getAllTasks();
+      expect(tasks).toHaveLength(2);
+      expect(tasks[0].id).toBe('scout-api-design');
+      expect(tasks[0].phaseId).toBe('scouting');
+      expect(tasks[0].profile).toBe('scout');
+      expect(tasks[1].id).toBe('scout-database');
     });
 
-    it('delegates to coordinator when topics array is empty (treated as no pre-defined topics)', async () => {
+    it('does not re-add a task whose slug already exists on the shared tracker', async () => {
+      const tracker = makeMockTracker();
+      // Two topics that slug down to the same id — the shared-tracker guard
+      // must skip the duplicate rather than throw (a follow-up round can
+      // legitimately re-encounter a prior topic slug).
+      const topics = [
+        { topic: 'API Design', rationale: 'x', files: ['a'] },
+        { topic: 'API-Design', rationale: 'y', files: ['b'] },
+      ];
+
+      await expect(
+        scoutingPhase(
+          tracker,
+          ['/profiles'],
+          'Task',
+          '/cwd',
+          5,
+          '/workdir',
+          undefined,
+          undefined,
+          undefined,
+          { topics, round: 0 },
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(tracker.taskTracker.getAllTasks()).toHaveLength(1);
+    });
+  });
+
+  // ─── Scout-coordinator path (first round) ─────────────────────────────────
+
+  describe('when no topics are provided (first round)', () => {
+    it('delegates to the scout-coordinator when topics array is empty (treated as no pre-defined topics)', async () => {
       const tracker = makeMockTracker();
       mockRunStepTask.mockResolvedValueOnce({ topics: [] });
 
-      const result = await scoutingPhase(
+      await scoutingPhase(
         tracker,
         ['/profiles'],
         'Task',
@@ -130,38 +184,12 @@ describe('scoutingPhase', () => {
         { topics: [], round: 0 },
       );
 
-      // Empty topics array is not > 0 length, so coordinator is called
+      // Empty topics array is not > 0 length, so the coordinator is called.
       expect(mockRunStepTask).toHaveBeenCalledTimes(1);
-      expect(result).toEqual([]);
+      const callOpts = mockRunStepTask.mock.calls[0]![0] as Record<string, unknown>;
+      expect(callOpts.taskId).toBe('scout-coordinator');
     });
 
-    it('preserves existing reports when no new results from LanePool', async () => {
-      const tracker = makeMockTracker();
-      const existing = [{ report: 'first' }];
-      const topics = [{ topic: 'API', rationale: 'Check API', files: ['api.ts'] }];
-
-      // With a topic but the LanePool returns nothing (no completed tasks),
-      // the result should still include existingReports.
-      const result = await scoutingPhase(
-        tracker,
-        ['/profiles'],
-        'Task',
-        '/cwd',
-        5,
-        '/workdir',
-        undefined,
-        undefined,
-        undefined,
-        { topics, existingReports: existing, round: 0 },
-      );
-
-      expect(result).toEqual(existing);
-    });
-  });
-
-  // ─── Scout-coordinator path (first round) ─────────────────────────────────
-
-  describe('when no topics are provided (first round)', () => {
     it('calls runStepTask for the scout-coordinator with correct options', async () => {
       const tracker = makeMockTracker();
       const mockTopics: ScoutingTopics = {
@@ -215,7 +243,7 @@ describe('scoutingPhase', () => {
       expect(callOpts.signal).toBe(abortController.signal);
     });
 
-    it('appends structured output to audit log from coordinator', async () => {
+    it('does NOT manually append structured_output for the coordinator (the default auditor handles it)', async () => {
       const tracker = makeMockTracker();
       const mockTopics: ScoutingTopics = {
         topics: [{ topic: 'Auth', rationale: 'Auth logic', files: ['auth.ts'] }],
@@ -235,12 +263,13 @@ describe('scoutingPhase', () => {
         { round: 0 },
       );
 
-      expect(tracker.auditLog.append).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'structured_output',
-          agentId: 'scout-coordinator',
-          output: mockTopics,
-        }),
+      // The audit migration deleted the manual
+      // `auditLog.append(structuredOutputEvent(…))`; structured_output events
+      // now land via the engine's default auditor (fired through the threaded
+      // hookRegistry). With the engine mocked here no auditor fires, so append
+      // must NOT receive a structured_output event.
+      expect(tracker.auditLog.append).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'structured_output' }),
       );
     });
 
@@ -268,7 +297,7 @@ describe('scoutingPhase', () => {
       expect(callOpts.onStatus).toBe(onStatus);
     });
 
-    it('returns empty array when coordinator returns no topics', async () => {
+    it('returns void and adds no tasks when the coordinator returns no topics', async () => {
       const tracker = makeMockTracker();
       mockRunStepTask.mockResolvedValueOnce({ topics: [] });
 
@@ -285,15 +314,68 @@ describe('scoutingPhase', () => {
         { round: 0 },
       );
 
-      expect(result).toEqual([]);
+      expect(result).toBeUndefined();
+      expect(tracker.taskTracker.getAllTasks()).toHaveLength(0);
     });
   });
 
-  // ─── WorkflowData ─────────────────────────────────────────────────────────
+  // ─── LanePool wiring (shared tracker) ─────────────────────────────────────
 
-  it('calls setWorkflowData with the accumulated scoutingReports', async () => {
+  describe('LanePool wiring', () => {
+    it('constructs the LanePool against the SHARED tracker', async () => {
+      const tracker = makeMockTracker();
+      const topics = [{ topic: 'Auth', rationale: 'x', files: ['auth.ts'] }];
+
+      await scoutingPhase(
+        tracker,
+        ['/profiles'],
+        'Task',
+        '/cwd',
+        5,
+        '/workdir',
+        undefined,
+        undefined,
+        undefined,
+        { topics, round: 0 },
+      );
+
+      expect(lastLanePoolOpts).toBeDefined();
+      // The LanePool must run against the SAME tracker the phase writes to, so
+      // scout completions settle on the shared surface the onPhaseSettled hook
+      // reads from (the latent bug this refactor fixes).
+      expect(lastLanePoolOpts!.taskTracker).toBe(tracker.taskTracker);
+      expect(lastLanePoolOpts!.phaseId).toBe('scouting');
+    });
+
+    it('threads the scouting step via getStepsForTask', async () => {
+      const tracker = makeMockTracker();
+      const topics = [{ topic: 'Auth', rationale: 'x', files: ['auth.ts'] }];
+
+      await scoutingPhase(
+        tracker,
+        ['/profiles'],
+        'Task',
+        '/cwd',
+        5,
+        '/workdir',
+        undefined,
+        undefined,
+        undefined,
+        { topics, round: 0 },
+      );
+
+      const getStepsForTask = lastLanePoolOpts!.getStepsForTask as () => unknown[];
+      const steps = getStepsForTask();
+      expect(steps).toHaveLength(1);
+      expect(steps[0]).toMatchObject({ profileId: 'scout', isReadOnly: true });
+    });
+  });
+
+  // ─── Contract: collection is the onPhaseSettled hook's job ────────────────
+
+  it('does NOT call setWorkflowData (the onPhaseSettled hook persists scoutingReports)', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValueOnce({ topics: [] });
+    const topics = [{ topic: 'API', rationale: 'x', files: ['api.ts'] }];
 
     await scoutingPhase(
       tracker,
@@ -305,12 +387,56 @@ describe('scoutingPhase', () => {
       undefined,
       undefined,
       undefined,
-      { round: 0 },
+      { topics, round: 0 },
     );
 
-    expect(tracker.setWorkflowData).toHaveBeenCalledWith({
-      scoutingReports: [],
-    });
+    // scoutingPhase no longer persists reports itself — that moved to the
+    // onPhaseSettled hook (tested in spir.test.ts).
+    expect(tracker.setWorkflowData).not.toHaveBeenCalled();
+  });
+
+  it('does NOT fire onAgentComplete (the LanePool owns per-scout completion)', async () => {
+    const tracker = makeMockTracker();
+    const onStatus = makeStatusCallbacksSpy();
+    const topics = [{ topic: 'API', rationale: 'x', files: ['api.ts'] }];
+
+    await scoutingPhase(
+      tracker,
+      ['/profiles'],
+      'Task',
+      '/cwd',
+      5,
+      '/workdir',
+      undefined,
+      onStatus,
+      undefined,
+      { topics, round: 0 },
+    );
+
+    // The LanePool fires onAgentComplete for each scout step via its own
+    // runStep → handle.complete() path, so scoutingPhase must not fire a
+    // second (less-complete) one itself.
+    expect(onStatus.onAgentComplete).not.toHaveBeenCalled();
+  });
+
+  it('returns void (reports are collected by the hook, not returned)', async () => {
+    const tracker = makeMockTracker();
+    const topics = [{ topic: 'API', rationale: 'x', files: ['api.ts'] }];
+
+    const result = await scoutingPhase(
+      tracker,
+      ['/profiles'],
+      'Task',
+      '/cwd',
+      5,
+      '/workdir',
+      undefined,
+      undefined,
+      undefined,
+      { topics, round: 0 },
+    );
+
+    expect(result).toBeUndefined();
   });
 });
 
@@ -426,7 +552,7 @@ describe('scoutingReviewPhase', () => {
   });
 
   describe('audit log', () => {
-    it('appends a decision event to the audit log', async () => {
+    it('does NOT manually append a decision event (the default auditor handles it)', async () => {
       const tracker = makeMockTracker();
       mockRunStepTask.mockResolvedValueOnce({
         ready: false,
@@ -436,13 +562,13 @@ describe('scoutingReviewPhase', () => {
 
       await scoutingReviewPhase(tracker, ['/profiles'], 'Task', [], '/cwd');
 
-      expect(tracker.auditLog.append).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: 'decision',
-          agentId: 'scouting-reviewer',
-          decision: 'more_scouting_needed',
-          reasoning: 'Need more data',
-        }),
+      // The audit migration deleted the manual
+      // `auditLog.append(decisionEvent(…))`; the scouting-reviewer decision
+      // now lands via the engine's default auditor. With the engine mocked
+      // here, append must NOT receive a decision event. (The onStatus.onDecision
+      // store callback for the TUI is still asserted separately above.)
+      expect(tracker.auditLog.append).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'decision' }),
       );
     });
   });

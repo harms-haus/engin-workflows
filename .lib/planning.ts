@@ -1,10 +1,9 @@
-import type { RendererRegistry, StatusCallbacks, WorkflowStatusTracker } from "@harms-haus/engin-engine";
+import type { RendererRegistry, StatusCallbacks, WorkflowRunOptions, WorkflowStatusTracker } from "@harms-haus/engin-engine";
 import { ensureDir, parseJsonWithRepair, runMultiStepTask, schemaToString } from "@harms-haus/engin-engine";
-import { open, readFile } from "node:fs/promises";
-import { extname, isAbsolute, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { PlanSchema, PlanReviewSchema } from "./schemas";
 import type { Plan, PlanReview } from "./schemas";
-import { structuredOutputEvent, decisionEvent } from "./helpers";
 
 // ─── Plan artifact paths ───────────────────────────────────────────────────
 //
@@ -21,87 +20,6 @@ export function getArtifactsDir(workDir: string): string {
 /** Absolute path to the plan JSON artifact for a run. */
 export function getPlanPath(workDir: string): string {
     return join(getArtifactsDir(workDir), "plan.json");
-}
-
-// ─── Scouting file-context inlining ────────────────────────────────────────
-//
-// The planner and plan-reviewer are run via runStepTask, which (unlike the
-// LanePool path) does NOT auto-inject `task.files`. So that these agents can
-// read the key files surfaced by the scouting review WITHOUT spending tool
-// calls on `read`, we inline the file contents directly into their prompts.
-// This mirrors the engine's pool/prompt-builder.ts behaviour (per-file byte
-// cap, binary-skip, graceful failure) so the two paths stay consistent.
-
-/** Per-file byte cap for inlined scouting context (matches the engine's prompt-builder). */
-const CONTEXT_FILE_MAX_BYTES = 10_000;
-
-const LANG_BY_EXT: Record<string, string> = {
-    ".ts": "typescript", ".tsx": "typescript",
-    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
-    ".py": "python", ".json": "json", ".yaml": "yaml", ".yml": "yaml", ".md": "markdown",
-    ".css": "css", ".scss": "scss", ".html": "html", ".sh": "bash", ".bash": "bash",
-    ".sql": "sql", ".toml": "toml", ".rs": "rust", ".go": "go", ".java": "java",
-    ".c": "c", ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
-};
-
-const BINARY_EXTS = new Set([
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp",
-    ".woff", ".woff2", ".ttf", ".eot", ".otf",
-    ".zip", ".gz", ".tar", ".rar", ".7z",
-    ".mp3", ".mp4", ".avi", ".mov", ".wav", ".ogg", ".flac",
-    ".pdf", ".exe", ".dll", ".so", ".dylib", ".bin", ".dat",
-]);
-
-/** Read one file (relative to `cwd`), capped at CONTEXT_FILE_MAX_BYTES. Returns null on any failure. */
-async function readContextFile(fp: string, cwd: string): Promise<string | null> {
-    if (BINARY_EXTS.has(extname(fp))) return null;
-    const abs = isAbsolute(fp) ? fp : join(cwd, fp);
-    try {
-        const fh = await open(abs, "r");
-        try {
-            const { size } = await fh.stat();
-            const readLen = Math.min(size, CONTEXT_FILE_MAX_BYTES);
-            const buf = Buffer.alloc(readLen);
-            await fh.read(buf, 0, readLen, 0);
-            const text = buf.toString("utf-8");
-            return size > CONTEXT_FILE_MAX_BYTES ? `${text}\n... (truncated)` : text;
-        } finally {
-            await fh.close();
-        }
-    } catch {
-        return null;
-    }
-}
-
-/**
- * Build a prompt section inlining the contents of the scouting-review files.
- * Returns "" when there is nothing to inline (no files / all unreadable is
- * still surfaced as a header + path list so the agent at least knows what was
- * flagged).
- */
-async function formatScoutingFilesSection(files: string[] | undefined, cwd: string): Promise<string> {
-    const unique = [...new Set((files ?? []).filter(Boolean))];
-    if (unique.length === 0) return "";
-
-    const blocks: string[] = [];
-    for (const fp of unique) {
-        const content = await readContextFile(fp, cwd);
-        if (content == null) continue;
-        const lang = LANG_BY_EXT[extname(fp)] ?? "";
-        blocks.push(`### ${fp}\n\`\`\`${lang}\n${content}\n\`\`\``);
-    }
-
-    if (blocks.length === 0) {
-        return [
-            "## Key files flagged by scouting",
-            "(These files were flagged by the scouting review but could not be read at the given paths — verify them relative to the repo root.)",
-            unique.map((f) => `- ${f}`).join("\n"),
-        ].join("\n");
-    }
-    return [
-        "## Key files from scouting (contents inlined — do NOT spend tool calls re-reading these)",
-        ...blocks,
-    ].join("\n\n");
 }
 
 // ─── Phase 3: Planning ──────────────────────────────────────────────────────
@@ -169,9 +87,12 @@ async function readAndValidatePlan(planPath: string): Promise<{ plan: Plan } | {
  * directory. This function runs the planner, then reads and validates that
  * artifact back into a typed `Plan`.
  *
- * `files` is the list of key files the scouting review surfaced for this task;
- * their contents are inlined into the planner prompt so the planner can ground
- * its tasks in the real code without re-reading them.
+ * `files` is the list of key files the scouting review surfaced for this task.
+ * Rather than inlining their contents locally (the old duplicated
+ * per-file inlining path), they are handed to `runMultiStepTask` as
+ * `files` on the task object so the ENGINE's default `beforeStepPrompt` /
+ * `collectContext` hooks inline them — eliminating the duplicated inlining
+ * logic. `hookRegistry` must be threaded for that default to actually fire.
  */
 export async function planningPhase(
     tracker: WorkflowStatusTracker,
@@ -185,12 +106,11 @@ export async function planningPhase(
     onStatus?: StatusCallbacks,
     signal?: AbortSignal,
     rendererRegistry?: RendererRegistry,
+    hookRegistry?: WorkflowRunOptions["hookRegistry"],
 ): Promise<Plan> {
     const artifactsDir = getArtifactsDir(workDir);
     const planPath = getPlanPath(workDir);
     await ensureDir(artifactsDir);
-
-    const filesSection = await formatScoutingFilesSection(files, cwd);
 
     const promptLines: string[] = [
         "You are a planning agent. Based on the research below, create a detailed implementation plan.",
@@ -200,10 +120,6 @@ export async function planningPhase(
         "Research findings:",
         research,
     ];
-
-    if (filesSection) {
-        promptLines.push("", filesSection);
-    }
 
     promptLines.push(
         "",
@@ -262,7 +178,7 @@ export async function planningPhase(
         stepName: "review-plan",
         profileId: "plan-reviewer",
         prompt: async () =>
-            buildPlanReviewPrompt({ taskPrompt, research, filesSection, planPath }),
+            buildPlanReviewPrompt({ taskPrompt, research, planPath }),
         isReadOnly: true,
         schema: PlanReviewSchema,
         isApproved: (r: unknown) => (r as PlanReview).ready === true,
@@ -287,6 +203,12 @@ export async function planningPhase(
         onStatus,
         signal,
         rendererRegistry,
+        // Thread the scouting files onto the task so the engine's default
+        // `beforeStepPrompt` / `collectContext` hooks inline them into BOTH the
+        // planner and plan-reviewer prompts (no local inlining duplication).
+        // `hookRegistry` carries the default subscribers that actually fire it.
+        files,
+        hookRegistry,
         maxStepRetries: 3,
     });
 
@@ -298,15 +220,16 @@ export async function planningPhase(
         plan ?? (() => { throw new Error("Planning completed without a validated plan"); })();
 
     tracker.setWorkflowData({ plan: validatedPlan });
-    await tracker.auditLog.append(structuredOutputEvent("planner", validatedPlan));
 
-    // Surface the final review outcome for the TUI + audit. (Per-rejection
-    // "step rejected" decisions are already fired by runMultiStepTask.)
+    // Surface the final review outcome for the TUI store. (Per-rejection
+    // "step rejected" decisions are already fired by runMultiStepTask.) The
+    // durable AuditLog equivalent is produced by the engine's default auditor
+    // (registered in runSpir against the threaded hookRegistry), so no manual
+    // audit append lives here.
     const finalReview = results[1] as PlanReview | undefined;
     const decision = approved ? "plan_approved" : "plan_rejected";
     const reasoning = finalReview?.feedback ?? "";
     onStatus?.onDecision?.({ agentId: "plan-reviewer", decision, reasoning });
-    await tracker.auditLog.append(decisionEvent("plan-reviewer", decision, reasoning));
 
     return validatedPlan;
 }
@@ -325,7 +248,6 @@ export async function planningPhase(
 async function buildPlanReviewPrompt(opts: {
     taskPrompt: string;
     research: string;
-    filesSection: string;
     planPath: string;
 }): Promise<string> {
     let planText: string;
@@ -347,9 +269,9 @@ async function buildPlanReviewPrompt(opts: {
         opts.research,
     ];
 
-    if (opts.filesSection) {
-        prompt.push("", opts.filesSection);
-    }
+    // NOTE: scouting file context is NOT inlined here. It is threaded onto the
+    // task's `files` and inlined by the engine's default `beforeStepPrompt`
+    // hook (same path as the planner prompt), so there is no local duplication.
 
     prompt.push(
         "",

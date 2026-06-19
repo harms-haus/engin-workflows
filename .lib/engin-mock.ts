@@ -23,6 +23,17 @@ export function createEnginMock(): Record<string, unknown> {
     LanePool: jest.fn(),
     TaskTracker: jest.fn(),
 
+    // ── Phase orchestration + hook registry (spir.ts imports these as values) ──
+    PhaseRunner: jest.fn().mockImplementation(() => ({ run: jest.fn().mockResolvedValue(undefined) })),
+    createHookRegistry: jest.fn().mockImplementation(() => ({
+      register: jest.fn(),
+      hasSubscribers: jest.fn().mockReturnValue(false),
+      invokeObserve: jest.fn().mockResolvedValue(undefined),
+      invokePipeline: jest.fn().mockResolvedValue(undefined),
+      invokeFirstWins: jest.fn().mockResolvedValue(undefined),
+      invokeAllRun: jest.fn().mockResolvedValue(undefined),
+    })),
+
     // ── Value exports used across .lib source files ─────────────────────
     clearTaskSessions: jest.fn(),
     assignSequentialTaskIds: jest.fn(<T extends { id: string; dependencies: string[] }>(tasks: T[]) => tasks),
@@ -36,6 +47,11 @@ export function createEnginMock(): Record<string, unknown> {
     ensureDir: async (_dir: string) => {},
     parseJsonWithRepair: (s: string) => JSON.parse(s),
     schemaToString: (_schema: unknown) => '<schema>',
+    // ── Default auditor (spir.ts registers this once against the resolved hookRegistry) ──
+    createDefaultAuditor: jest.fn().mockReturnValue({
+      onStructuredOutput: jest.fn().mockResolvedValue(undefined),
+      onDecision: jest.fn().mockResolvedValue(undefined),
+    }),
     createHarness: jest.fn().mockResolvedValue({
       prompt: jest.fn().mockResolvedValue(undefined),
       getLastAssistantText: jest.fn().mockReturnValue(''),
