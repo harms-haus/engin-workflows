@@ -312,7 +312,7 @@ async function runFixersForLane(
       profile: ctx.fixerSteps[0]?.profileId ?? "fixer",
       files: [filePathOnly(finding.file)],
       dependencies: [],
-      isCode: true,
+      worktree: "none",
       phaseId: "review",
     });
 

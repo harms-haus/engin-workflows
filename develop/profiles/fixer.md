@@ -1,7 +1,7 @@
 ---
 name: fixer
 provider: zai
-model: glm-5.2
+model: glm-5.1
 thinkingLevel: low
 excludeTools:
   - ask_user_question

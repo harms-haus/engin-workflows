@@ -489,14 +489,16 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
     );
 
     const getRunnerForTask = extractGetRunnerForTask();
+    // task-2 (is_code: false) is renumbered to t-02 by assignSequentialTaskIds.
+    // Runner resolution reads is_code from the sidecar map keyed by task id,
+    // NOT from a field on the engine Task (is_code is a planner concern).
     const nonCodeTask = {
-      id: "t2",
+      id: "t-02",
       title: "",
       prompt: "",
       profile: "implementer",
       files: [],
       dependencies: [],
-      isCode: false,
     } as never;
     const runner = getRunnerForTask!(nonCodeTask);
 
@@ -1069,7 +1071,7 @@ describe("implementationPhase — phaseId threading", () => {
       profile: "implementer",
       files: ["src/x.ts"],
       dependencies: [],
-      isCode: true,
+      worktree: "code",
       phaseId: "implementing",
     });
 
@@ -1080,7 +1082,7 @@ describe("implementationPhase — phaseId threading", () => {
       profile: "implementer",
       files: ["README.md"],
       dependencies: ["t-01"],
-      isCode: false,
+      worktree: "code",
       phaseId: "implementing",
     });
   });

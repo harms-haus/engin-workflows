@@ -73,13 +73,16 @@ function resolveImplProfile(task: { profile?: string }): string {
  * `reviewRunner` drives the execute→review loop (approve / reject + feedback,
  * up to `DEFAULT_MAX_ROUNDS` rounds). The test-writer session only runs for
  * code tasks, ahead of the implement→review loop, via `linearRunner`.
+ *
+ * `isCode` is the planner-derived `is_code` signal (test-first vs
+ * execute→review). It is deliberately passed in explicitly rather than read
+ * off the engine `Task` — `is_code` is a workflow concern unrelated to
+ * worktree creation (every implementation task gets a worktree regardless).
  */
-function resolveImplementationRunner(task: {
-  isCode?: boolean;
-  profile?: string;
-  prompt: string;
-}): Runner {
-  const isCode = task.isCode !== false;
+function resolveImplementationRunner(
+  task: { profile?: string; prompt: string },
+  isCode: boolean,
+): Runner {
   const implProfile = resolveImplProfile(task);
 
   const testSpec: SessionRoleSpec = {
@@ -160,9 +163,18 @@ export async function implementationPhase(
   worktreeManager?: WorkflowRunOptions["worktreeManager"],
   modelConcurrency: Record<string, number> = {},
 ): Promise<void> {
-  // 1. Load plan tasks into the tracker (renumber IDs to sequential t-0N form)
+  // 1. Load plan tasks into the tracker (renumber IDs to sequential t-0N form).
+  //
+  // `is_code` is a planner/workflow signal that controls runner flow
+  // (test-first vs execute→review). It is NOT threaded onto the engine Task —
+  // it is unrelated to worktree creation. It is carried in a sidecar map so
+  // runner resolution can read it without polluting the engine Task shape.
+  // ALL implementation tasks get a worktree (`worktree: 'code'`) regardless
+  // of whether they touch code, docs, or config.
   const renumberedTasks = assignSequentialTaskIds(plan.tasks);
+  const taskIsCode = new Map<string, boolean>();
   for (const task of renumberedTasks) {
+    taskIsCode.set(task.id, task.is_code);
     if (!tracker.taskTracker.getTask(task.id)) {
       tracker.taskTracker.addTask({
         id: task.id,
@@ -171,7 +183,7 @@ export async function implementationPhase(
         profile: task.profile,
         files: task.files,
         dependencies: task.dependencies,
-        isCode: task.is_code,
+        worktree: "code",
         phaseId: "implementing",
       });
     }
@@ -200,13 +212,19 @@ export async function implementationPhase(
   // Cast: the engine's `BeforeTaskResult` type doesn't yet include a `runner`
   // field (transitional gap — the runner-pool handles it at runtime by casting
   // the hook result to `Record<string, unknown>` and checking `result.runner`).
+  // Resolve the runner for a task via the shared helper + sidecar map.
+  // Falls back to test-first (is_code=true) when the task id isn't in the
+  // sidecar (defensive — the map is populated for every plan task above).
+  const resolveRunner = (task: { id: string; profile?: string; prompt: string }): Runner =>
+    resolveImplementationRunner(task, taskIsCode.get(task.id) ?? true);
+
   resolvedRegistry.register({
     beforeTask: ({
       task,
     }: {
-      task: Parameters<typeof resolveImplementationRunner>[0];
+      task: { id: string; profile?: string; prompt: string };
     }) => ({
-      runner: resolveImplementationRunner(task),
+      runner: resolveRunner(task),
     }),
   } as never);
 
@@ -225,7 +243,7 @@ export async function implementationPhase(
     rendererRegistry,
     // Runner tree source: returns the composed runner (test → implement →
     // review) for each task. Replaces the old getStepsForTask seam.
-    getRunnerForTask: resolveImplementationRunner,
+    getRunnerForTask: resolveRunner,
     // Thread the resolved hook registry so the pool fires the `beforeTask`
     // hook registered above (runner substitution) AND so the engine's
     // default auditor / prompt hooks fire for this pool.

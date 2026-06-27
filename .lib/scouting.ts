@@ -157,8 +157,8 @@ export async function scoutingPhase(
         profile: "scout",
         files: topic.files,
         dependencies: [],
-        isCode: false,
         phaseId: "scouting",
+        worktree: "none",
       });
     }
   }

@@ -268,6 +268,10 @@ describe("scoutingPhase", () => {
       );
 
       expect(result).toBeUndefined();
+      // No scout tasks are registered when the coordinator returns no topics.
+      // (The coordinator task itself is announced via status callbacks only —
+      // it is NOT inserted into the shared tracker, so it can't pollute the
+      // later RunnerPool claim loop.)
       expect(tracker.taskTracker.getAllTasks()).toHaveLength(0);
     });
 
