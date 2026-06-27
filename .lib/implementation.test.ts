@@ -324,98 +324,28 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
     expect(typeof runner).toBe("function");
   });
 
-  // ── 3. Runner tree: singleSession, linearRunner, reviewRunner ──────────
-
-  it("builds the runner tree using singleSession + linearRunner + reviewRunner for code tasks", async () => {
-    const tracker = makeMockTracker();
-
-    // Arrange: make the runner factories return identifiable mock runners
-    const mockTestRunner = jest.fn();
-    const mockImplRunner = jest.fn();
-    const mockReviewRunnerInner = jest.fn();
-    const mockLinearRunnerInner = jest.fn();
-    const mockCodeReviewRunner = jest.fn();
-
-    mockSingleSession
-      .mockReturnValueOnce(mockTestRunner) // test-writer
-      .mockReturnValueOnce(mockImplRunner) // implementer
-      .mockReturnValueOnce(mockReviewRunnerInner); // implement-reviewer
-    mockLinearRunner.mockReturnValue(mockLinearRunnerInner);
-    mockReviewRunner.mockReturnValue(mockCodeReviewRunner);
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    );
-
-    const getRunnerForTask = extractGetRunnerForTask();
-    const codeTask = {
-      id: "t1",
-      title: "",
-      prompt: "",
-      profile: "implementer",
-      files: [],
-      dependencies: [],
-      isCode: true,
-    } as never;
-    const runner = getRunnerForTask!(codeTask);
-
-    // The returned runner should be the linearRunner result composing
-    // [singleSession(testSpec), reviewRunner(implSpec, reviewSpec)] — NOT
-    // the reviewRunner result directly (which would omit the test-writer).
-    expect(runner).toBe(mockLinearRunnerInner);
-
-    // singleSession should have been called for test-writer (NOT implementer
-    // or review — those specs go into reviewRunner which handles them internally)
-    expect(mockSingleSession).toHaveBeenCalledTimes(1);
-    expect(mockSingleSession.mock.calls[0][0]).toMatchObject({
-      role: "write-tests",
-      outputMode: "text",
-      profile: "test-writer",
-    });
-
-    // linearRunner should have been called with [testRunner, reviewRunnerResult]
-    expect(mockLinearRunner).toHaveBeenCalledWith([
-      mockTestRunner,
-      mockCodeReviewRunner,
-    ]);
-
-    // reviewRunner should have been called with (implSpec, reviewSpec)
-    expect(mockReviewRunner).toHaveBeenCalledWith(
-      expect.objectContaining({ role: "execute" }),
-      expect.objectContaining({ role: "review" }),
-    );
-  });
-
-  // ── kb-15 REGRESSION: runner tree OMITS test-writer session ────────────
+  // ── 3. Runner tree: linearRunner + reviewRunner (restored CODE_STEPS) ──
   //
-  // The bug: resolveImplementationRunner builds but DISCARDs the linearRunner
-  // (test-writer → implementer) and returns reviewRunner(implSpec, reviewSpec)
-  // directly — the test-writer is never wired into the runner tree.
-  //
-  // Expected tree for code tasks:
+  // Code-task pipeline mirrors the pre-session-first CODE_STEPS:
   //   linearRunner([
-  //     singleSession(testSpec),           // test-writer (runs first)
-  //     reviewRunner(implSpec, reviewSpec)  // implement → review loop (behind test-writer)
+  //     reviewRunner(write-tests, review-tests),  // test review loop
+  //     reviewRunner(execute, review),            // code review loop
   //   ])
-  //
-  // These tests WILL FAIL until the implement worker fixes the composition.
+  // singleSession is NOT used directly; both stages are review loops so a
+  // rejection feeds feedback back and retries. A 4-session plan is declared.
 
-  it("returns linearRunner for code tasks with test-writer as first child and reviewRunner as second child (REGRESSION kb-15)", async () => {
+  it("builds the code-task tree as linearRunner([reviewRunner(write-tests, review-tests), reviewRunner(execute, review)])", async () => {
     const tracker = makeMockTracker();
 
-    // Tagged runners for tree-shape inspection
-    const testSessionRunner = jest.fn();
     const linearRunnerResult = jest.fn();
-    const reviewRunnerResult = jest.fn();
+    const testReviewLoop = jest.fn();
+    const codeReviewLoop = jest.fn();
 
-    mockSingleSession.mockReturnValueOnce(testSessionRunner); // 1st: testSpec (test-writer)
     mockLinearRunner.mockReturnValue(linearRunnerResult);
-    mockReviewRunner.mockReturnValue(reviewRunnerResult);
+    // reviewRunner is called twice: test loop, then code loop.
+    mockReviewRunner
+      .mockReturnValueOnce(testReviewLoop)
+      .mockReturnValueOnce(codeReviewLoop);
 
     await implementationPhase(
       tracker,
@@ -428,49 +358,47 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
 
     const getRunnerForTask = extractGetRunnerForTask();
     const codeTask = {
-      id: "t1",
+      id: "t-01",
       title: "",
       prompt: "",
       profile: "implementer",
       files: [],
       dependencies: [],
-      isCode: true,
     } as never;
     const runner = getRunnerForTask!(codeTask);
 
-    // ── 1. Final returned runner MUST be the linearRunner result ────
+    // ── 1. Final returned runner is the linearRunner result ─────────
     expect(runner).toBe(linearRunnerResult);
 
-    // ── 2. linearRunner called exactly once with 2 children ─────────
+    // ── 2. linearRunner called once with the two review-loop children ──
     expect(mockLinearRunner).toHaveBeenCalledTimes(1);
-    // Use deep equality (matching the pattern of the passing test above)
-    // to verify tree shape — reference identity can vary across mock boundaries.
     expect(mockLinearRunner).toHaveBeenCalledWith([
-      testSessionRunner,
-      reviewRunnerResult,
+      testReviewLoop,
+      codeReviewLoop,
     ]);
 
-    // ── 3. Dead code assertions ────────────────────────────────────
-    // singleSession called exactly ONCE: test-writer (testSpec)
-    expect(mockSingleSession).toHaveBeenCalledTimes(1);
-    const sessionCallArgs = mockSingleSession.mock.calls.map(
-      (c) => c[0] as Record<string, unknown>,
-    );
-    expect(sessionCallArgs[0]).toMatchObject({
+    // ── 3. singleSession is NOT used directly ───────────────────────
+    expect(mockSingleSession).toHaveBeenCalledTimes(0);
+
+    // ── 4. reviewRunner called twice: test loop then code loop ──────
+    expect(mockReviewRunner).toHaveBeenCalledTimes(2);
+    expect(mockReviewRunner.mock.calls[0][0]).toMatchObject({
       role: "write-tests",
       profile: "test-writer",
     });
-
-    // ── 4. reviewRunner called exactly once with (implSpec, reviewSpec) ─
-    expect(mockReviewRunner).toHaveBeenCalledTimes(1);
-    const reviewArgs = mockReviewRunner.mock.calls[0];
-    expect(reviewArgs[0] as Record<string, unknown>).toMatchObject({
+    expect(mockReviewRunner.mock.calls[0][1]).toMatchObject({
+      role: "review-tests",
+      profile: "test-reviewer",
+    });
+    expect(mockReviewRunner.mock.calls[1][0]).toMatchObject({
       role: "execute",
     });
-    expect(reviewArgs[1] as Record<string, unknown>).toMatchObject({
+    expect(mockReviewRunner.mock.calls[1][1]).toMatchObject({
       role: "review",
+      profile: "implement-reviewer",
     });
   });
+
 
   it("builds the runner tree with only implement+review for non-code tasks (no test-writer)", async () => {
     const tracker = makeMockTracker();
@@ -547,10 +475,13 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
     } as never;
     getRunnerForTask!(customProfileTask);
 
-    // The implementer (execute role) is passed to reviewRunner (not singleSession).
-    // Check reviewRunner was called with the custom profile.
-    expect(mockReviewRunner).toHaveBeenCalledTimes(1);
-    const implSpec = mockReviewRunner.mock.calls[0][0] as Record<
+    // singleSession is NOT used directly (both stages are review loops).
+    expect(mockSingleSession).toHaveBeenCalledTimes(0);
+
+    // The custom task.profile substitutes ONLY the execute (implementer)
+    // session — the second reviewRunner call's first arg.
+    expect(mockReviewRunner).toHaveBeenCalledTimes(2);
+    const implSpec = mockReviewRunner.mock.calls[1][0] as Record<
       string,
       unknown
     >;
@@ -586,18 +517,29 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
     } as never;
     getRunnerForTask!(customProfileTask);
 
-    // test-writer must remain 'test-writer' (passed to singleSession)
-    expect(mockSingleSession).toHaveBeenCalledTimes(1);
-    const testWriterSpec = mockSingleSession.mock.calls[0][0] as Record<
+    // singleSession is NOT used directly (both stages are review loops).
+    expect(mockSingleSession).toHaveBeenCalledTimes(0);
+
+    // reviewRunner is called twice: (write-tests, review-tests) then (execute, review).
+    // The test-writer / test-reviewer profiles are fixed.
+    expect(mockReviewRunner).toHaveBeenCalledTimes(2);
+    const testLoopSpec = mockReviewRunner.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    expect(testWriterSpec.role).toBe("write-tests");
-    expect(testWriterSpec.profile).toBe("test-writer");
+    expect(testLoopSpec.role).toBe("write-tests");
+    expect(testLoopSpec.profile).toBe("test-writer");
 
-    // implement-reviewer must remain 'implement-reviewer' (passed to reviewRunner)
-    expect(mockReviewRunner).toHaveBeenCalledTimes(1);
-    const reviewSpec = mockReviewRunner.mock.calls[0][1] as Record<
+    // The custom task.profile substitutes ONLY the execute (implementer) session.
+    const codeLoopSpec = mockReviewRunner.mock.calls[1][0] as Record<
+      string,
+      unknown
+    >;
+    expect(codeLoopSpec.role).toBe("execute");
+    expect(codeLoopSpec.profile).toBe("implementer-lite");
+
+    // implement-reviewer must remain 'implement-reviewer' (second arg of code loop)
+    const reviewSpec = mockReviewRunner.mock.calls[1][1] as Record<
       string,
       unknown
     >;

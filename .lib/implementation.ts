@@ -28,6 +28,15 @@ import { join } from "node:path";
  */
 type SessionRoleSpec = Omit<SessionSpec, "id"> & { role: string };
 
+/** One entry in a task's declared session plan — the ordered list of sessions
+ *  a task's runner tree will produce (e.g. write-tests → review-tests →
+ *  execute → review). Declared upfront so the TUI can show all planned
+ *  sessions (including not-yet-started ones) and a progress counter (●N/M). */
+interface SessionPlanEntry {
+  role: string;
+  profile: string;
+}
+
 /**
  * Prompt used by the implement-reviewer session. The reviewer evaluates the
  * implementation against the task prompt and returns a structured
@@ -82,16 +91,26 @@ function resolveImplProfile(task: { profile?: string }): string {
 function resolveImplementationRunner(
   task: { profile?: string; prompt: string },
   isCode: boolean,
-): Runner {
+): { runner: Runner; plan: SessionPlanEntry[] } {
   const implProfile = resolveImplProfile(task);
 
-  const testSpec: SessionRoleSpec = {
+  const writeTestsSpec: SessionRoleSpec = {
     role: "write-tests",
     runnerRole: "write-tests",
     profile: "test-writer",
     prompt: task.prompt,
     outputMode: "text",
     isReadOnly: false,
+    attempt: 1,
+  };
+  const reviewTestsSpec: SessionRoleSpec = {
+    role: "review-tests",
+    runnerRole: "review-tests",
+    profile: "test-reviewer",
+    prompt: REVIEW_PROMPT,
+    schema: ReviewResultSchema,
+    outputMode: "structured",
+    isReadOnly: true,
     attempt: 1,
   };
   const implSpec: SessionRoleSpec = {
@@ -115,16 +134,31 @@ function resolveImplementationRunner(
   };
 
   if (isCode) {
-    // Test-first: write tests, then run the implement→review loop,
-    // composed as a linear pipeline (test-writer runs, then the
-    // reviewRunner drives execute↔review).
-    const testRunner = singleSession(testSpec);
-    const reviewLoop = reviewRunner(implSpec, reviewSpec);
-
-    return linearRunner([testRunner, reviewLoop]);
+    // Test-first pipeline mirroring the pre-session-first CODE_STEPS:
+    //   write-tests → review-tests  (test review loop)
+    //   execute     → review        (code review loop)
+    // composed linearly. Both loops are reviewRunners so a rejection feeds
+    // feedback back and retries (bounded by DEFAULT_MAX_ROUNDS).
+    const testReviewLoop = reviewRunner(writeTestsSpec, reviewTestsSpec);
+    const codeReviewLoop = reviewRunner(implSpec, reviewSpec);
+    return {
+      runner: linearRunner([testReviewLoop, codeReviewLoop]),
+      plan: [
+        { role: "write-tests", profile: "test-writer" },
+        { role: "review-tests", profile: "test-reviewer" },
+        { role: "execute", profile: implProfile },
+        { role: "review", profile: "implement-reviewer" },
+      ],
+    };
   }
 
-  return reviewRunner(implSpec, reviewSpec);
+  return {
+    runner: reviewRunner(implSpec, reviewSpec),
+    plan: [
+      { role: "execute", profile: implProfile },
+      { role: "review", profile: "implement-reviewer" },
+    ],
+  };
 }
 
 // ─── Phase 5: Implementation ────────────────────────────────────────────────
@@ -212,10 +246,13 @@ export async function implementationPhase(
   // Cast: the engine's `BeforeTaskResult` type doesn't yet include a `runner`
   // field (transitional gap — the runner-pool handles it at runtime by casting
   // the hook result to `Record<string, unknown>` and checking `result.runner`).
-  // Resolve the runner for a task via the shared helper + sidecar map.
-  // Falls back to test-first (is_code=true) when the task id isn't in the
-  // sidecar (defensive — the map is populated for every plan task above).
-  const resolveRunner = (task: { id: string; profile?: string; prompt: string }): Runner =>
+  // Resolve the runner + declared session plan for a task via the shared
+  // helper + sidecar map. Falls back to test-first (is_code=true) when the
+  // task id isn't in the sidecar (defensive — the map is populated for every
+  // plan task above).
+  const resolveRunner = (
+    task: { id: string; profile?: string; prompt: string },
+  ): { runner: Runner; plan: SessionPlanEntry[] } =>
     resolveImplementationRunner(task, taskIsCode.get(task.id) ?? true);
 
   resolvedRegistry.register({
@@ -223,9 +260,12 @@ export async function implementationPhase(
       task,
     }: {
       task: { id: string; profile?: string; prompt: string };
-    }) => ({
-      runner: resolveRunner(task),
-    }),
+    }) => {
+      const { runner, plan } = resolveRunner(task);
+      // `sessionPlan` is read by the RunnerPool and threaded into onTaskStart
+      // so the TUI can render all planned sessions + a ●N/M progress counter.
+      return { runner, sessionPlan: plan };
+    },
   } as never);
 
   // 4. Create and run the runner pool
@@ -243,7 +283,7 @@ export async function implementationPhase(
     rendererRegistry,
     // Runner tree source: returns the composed runner (test → implement →
     // review) for each task. Replaces the old getStepsForTask seam.
-    getRunnerForTask: resolveRunner,
+    getRunnerForTask: (task) => resolveRunner(task).runner,
     // Thread the resolved hook registry so the pool fires the `beforeTask`
     // hook registered above (runner substitution) AND so the engine's
     // default auditor / prompt hooks fire for this pool.
