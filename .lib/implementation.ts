@@ -1,31 +1,127 @@
-import type { RendererRegistry, StatusCallbacks, StepDefinition, WorkflowRunOptions, WorkflowStatusTracker } from "@harms-haus/engin-engine";
-import { LanePool, assignSequentialTaskIds, clearTaskSessions, createHookRegistry } from "@harms-haus/engin-engine";
+import type {
+  RendererRegistry,
+  Runner,
+  SessionSpec,
+  StatusCallbacks,
+  WorkflowRunOptions,
+  WorkflowStatusTracker,
+} from "@harms-haus/engin-engine";
+import {
+  RunnerPool,
+  assignSequentialTaskIds,
+  createHookRegistry,
+  linearRunner,
+  reviewRunner,
+  singleSession,
+} from "@harms-haus/engin-engine";
 import type { Plan } from "./schemas";
-import { CODE_STEPS, NON_CODE_STEPS } from "./steps";
+import { ReviewResultSchema } from "./schemas";
 import { join } from "node:path";
 
-// ─── Step resolution helper ───────────────────────────────────────────────
+// ─── Runner-tree resolution ───────────────────────────────────────────────
 
 /**
- * Synchronous step resolver shared by BOTH the `getStepsForTask` option (used
- * at registration time to populate `onTaskRegister` step definitions for the
- * TUI/web AgentLog + step-progress) and the `beforeTask` hook (used at claim
- * time to decide which steps a lane actually runs). Keeping both in sync via a
- * single source of truth avoids the divergence where `onTaskRegister` fires
- * with an empty step list.
+ * A session-spec shaped value passed to the runner factories
+ * (`singleSession`, `reviewRunner`). It is a {@link SessionSpec} minus the
+ * deterministic `id` (assigned at run time from the task id) plus a `role`
+ * label that drives session-id derivation and status callbacks.
  */
-function resolveImplementationSteps(task: { isCode?: boolean; profile?: string }): StepDefinition[] {
-    const baseSteps: readonly StepDefinition[] =
-        task.isCode !== false ? CODE_STEPS : NON_CODE_STEPS;
-    let steps: StepDefinition[] = [...baseSteps];
-    if (task.profile && task.profile !== 'implementer') {
-        steps = steps.map(step =>
-            step.profileId === 'implementer'
-                ? { ...step, profileId: task.profile }
-                : step,
-        );
-    }
-    return steps;
+type SessionRoleSpec = Omit<SessionSpec, "id"> & { role: string };
+
+/**
+ * Prompt used by the implement-reviewer session. The reviewer evaluates the
+ * implementation against the task prompt and returns a structured
+ * {@link ReviewResultSchema} verdict.
+ */
+const REVIEW_PROMPT = [
+  "Review the implementation for this task.",
+  "Check correctness, completeness, and adherence to the task prompt.",
+  "Respond with a structured review: approved flag, feedback, and any issues",
+  "(file, description, severity).",
+].join(" ");
+
+/**
+ * Resolve the implementation task shape consumed by the runner factories.
+ *
+ * `profile` defaults to `'implementer'`; a task that carries a different
+ * profile id substitutes it for the implementer session while the test-writer
+ * and implement-reviewer profiles are preserved.
+ */
+function resolveImplProfile(task: { profile?: string }): string {
+  return task.profile && task.profile !== "implementer"
+    ? task.profile
+    : "implementer";
+}
+
+/**
+ * Build the runner tree for a single implementation task.
+ *
+ * The tree mirrors the old step pipeline (`CODE_STEPS` / `NON_CODE_STEPS`) but
+ * expressed as composed runners instead of {@link StepDefinition}s:
+ *
+ *   • Code tasks →
+ *       linearRunner([
+ *         singleSession(write-tests),
+ *         reviewRunner(execute, review),
+ *       ])
+ *   • Non-code tasks →
+ *       reviewRunner(
+ *         execute = singleSession(execute),
+ *         review  = singleSession(review),
+ *       )
+ *
+ * `reviewRunner` drives the execute→review loop (approve / reject + feedback,
+ * up to `DEFAULT_MAX_ROUNDS` rounds). The test-writer session only runs for
+ * code tasks, ahead of the implement→review loop, via `linearRunner`.
+ */
+function resolveImplementationRunner(task: {
+  isCode?: boolean;
+  profile?: string;
+  prompt: string;
+}): Runner {
+  const isCode = task.isCode !== false;
+  const implProfile = resolveImplProfile(task);
+
+  const testSpec: SessionRoleSpec = {
+    role: "write-tests",
+    runnerRole: "write-tests",
+    profile: "test-writer",
+    prompt: task.prompt,
+    outputMode: "text",
+    isReadOnly: false,
+    attempt: 1,
+  };
+  const implSpec: SessionRoleSpec = {
+    role: "execute",
+    runnerRole: "execute",
+    profile: implProfile,
+    prompt: task.prompt,
+    outputMode: "text",
+    isReadOnly: false,
+    attempt: 1,
+  };
+  const reviewSpec: SessionRoleSpec = {
+    role: "review",
+    runnerRole: "review",
+    profile: "implement-reviewer",
+    prompt: REVIEW_PROMPT,
+    schema: ReviewResultSchema,
+    outputMode: "structured",
+    isReadOnly: true,
+    attempt: 1,
+  };
+
+  if (isCode) {
+    // Test-first: write tests, then run the implement→review loop,
+    // composed as a linear pipeline (test-writer runs, then the
+    // reviewRunner drives execute↔review).
+    const testRunner = singleSession(testSpec);
+    const reviewLoop = reviewRunner(implSpec, reviewSpec);
+
+    return linearRunner([testRunner, reviewLoop]);
+  }
+
+  return reviewRunner(implSpec, reviewSpec);
 }
 
 // ─── Phase 5: Implementation ────────────────────────────────────────────────
@@ -33,118 +129,124 @@ function resolveImplementationSteps(task: { isCode?: boolean; profile?: string }
 /**
  * Execute the implementation plan by:
  * 1. Loading tasks into the tracker
- * 2. Claiming and dispatching tasks to implementers
- * 3. Reviewing completed tasks
- * 4. Accepting or rejecting based on review
+ * 2. Dispatching tasks to a {@link RunnerPool} where each task runs its
+ *    resolved runner tree (test → implement → review)
  *
- * Step resolution is provided via TWO seams that share a single helper
- * (`resolveImplementationSteps`):
- *   1. `getStepsForTask` — synchronous, invoked at registration time so the
- *      engine fires `onTaskRegister` with the correct step definitions for
- *      the TUI/web AgentLog + step-progress.
- *   2. `beforeTask` hook — async, invoked at claim time in
- *      `LanePool.resolveRunner`. This lets a workflow that supplies its OWN
- *      `beforeTask` subscriber run ALONGSIDE this one (first-wins: the first
- *      non-`undefined` result decides).
- * Both are seeded from the same helper so they always agree.
+ * Runner resolution is provided via TWO seams that share a single helper
+ * (`resolveImplementationRunner`):
+ *   1. `getRunnerForTask` — the {@link RunnerPool} option that returns the
+ *      runner tree for a task.
+ *   2. `beforeTask` hook — invoked at claim time; returns `{ runner }` so a
+ *      workflow that supplies its OWN `beforeTask` subscriber can override the
+ *      runner (first-wins: the first non-`undefined` result decides).
+ *
+ * Resume: the explicit session-wipe for non-complete tasks was removed. Replay
+ * idempotency (`runSession` skips cached sessions) handles resume, and the
+ * pool's internal retry valve (`clearTaskSessions` in `maybeRetry`) handles
+ * retry-wipes. The workflow no longer touches persisted sessions on resume.
  */
 export async function implementationPhase(
-    tracker: WorkflowStatusTracker,
-    profilesDirs: string[],
-    plan: Plan,
-    cwd: string,
-    maxConcurrentTasks: number = 5,
-    workDir: string,
-    apiKeys?: Record<string, string>,
-    onStatus?: StatusCallbacks,
-    signal?: AbortSignal,
-    rendererRegistry?: RendererRegistry,
-    hookRegistry?: WorkflowRunOptions["hookRegistry"],
+  tracker: WorkflowStatusTracker,
+  profilesDirs: string[],
+  plan: Plan,
+  cwd: string,
+  maxConcurrentTasks: number = 5,
+  workDir: string,
+  apiKeys?: Record<string, string>,
+  onStatus?: StatusCallbacks,
+  signal?: AbortSignal,
+  rendererRegistry?: RendererRegistry,
+  hookRegistry?: WorkflowRunOptions["hookRegistry"],
+  worktreeManager?: WorkflowRunOptions["worktreeManager"],
+  modelConcurrency: Record<string, number> = {},
 ): Promise<void> {
-    // 1. Load plan tasks into the tracker (renumber IDs to sequential t-0N form)
-    const renumberedTasks = assignSequentialTaskIds(plan.tasks);
-    for (const task of renumberedTasks) {
-        if (!tracker.taskTracker.getTask(task.id)) {
-            tracker.taskTracker.addTask({
-                id: task.id,
-                title: task.title,
-                prompt: task.prompt,
-                profile: task.profile,
-                files: task.files,
-                dependencies: task.dependencies,
-                isCode: task.is_code,
-                phaseId: 'implementing',
-            });
-        }
+  // 1. Load plan tasks into the tracker (renumber IDs to sequential t-0N form)
+  const renumberedTasks = assignSequentialTaskIds(plan.tasks);
+  for (const task of renumberedTasks) {
+    if (!tracker.taskTracker.getTask(task.id)) {
+      tracker.taskTracker.addTask({
+        id: task.id,
+        title: task.title,
+        prompt: task.prompt,
+        profile: task.profile,
+        files: task.files,
+        dependencies: task.dependencies,
+        isCode: task.is_code,
+        phaseId: "implementing",
+      });
     }
+  }
 
-    // Validate that all dependency references are valid
-    tracker.taskTracker.validateAllDependencies();
+  // Validate that all dependency references are valid
+  tracker.taskTracker.validateAllDependencies();
 
-    // 1b. On a resumed run, tasks that didn't complete (failed / interrupted /
-    // never-started) must restart from step 1 with a clean slate. Clear their
-    // persisted sessions so nothing resumes stale state. Completed tasks keep
-    // their sessions. On a fresh run this is a harmless no-op (no sessions yet).
-    const sessionBaseDir = join(workDir, 'sessions');
-    for (const task of tracker.taskTracker.getAllTasks()) {
-        if (task.status !== 'complete') {
-            clearTaskSessions(sessionBaseDir, task.id);
-        }
-    }
+  // NOTE: no explicit session-wipe on resume. Replay idempotency (runSession
+  // skips cached sessions) handles resumed tasks; the pool's retry valve
+  // clears sessions for retried tasks. See resolveImplementationRunner doc.
 
-    // 2. Resolve the hook registry. spir.ts forwards the engine-assembled (or
-    // freshly created) registry so the engine's default auditor + prompt hooks
-    // fire for this phase's lane pool. Direct callers that omit it get a fresh
-    // local registry so the `beforeTask` step-substitution hook below still has
-    // a home — without it the pool would have no step source.
-    const resolvedRegistry = hookRegistry ?? createHookRegistry();
+  const sessionBaseDir = join(workDir, "sessions");
 
-    // 3. Register the `beforeTask` step-substitution hook. This fires at
-    // claim time in `LanePool.resolveRunner` (first-wins). A workflow-provided
-    // `beforeTask` subscriber registered BEFORE this one wins; one registered
-    // AFTER is short-circuited.
-    resolvedRegistry.register({
-        beforeTask: ({ task }) => {
-            return { steps: resolveImplementationSteps(task) };
-        },
-    });
+  // 2. Resolve the hook registry. spir.ts forwards the engine-assembled (or
+  // freshly created) registry so the engine's default auditor + prompt hooks
+  // fire for this phase's runner pool. Direct callers that omit it get a
+  // fresh local registry so the `beforeTask` runner-substitution hook below
+  // still has a home.
+  const resolvedRegistry = hookRegistry ?? createHookRegistry();
 
-    // 4. Create and run the lane pool
-    const pool = new LanePool({
-        maxConcurrentLanes: maxConcurrentTasks,
-        profilesDirs,
-        phaseId: 'implementing',
-        sessionBaseDir,
-        cwd,
-        apiKeys,
-        onStatus,
-        auditLog: tracker.auditLog,
-        taskTracker: tracker.taskTracker,
-        rendererRegistry,
-        // Synchronous step seed: drives `onTaskRegister` step definitions so
-        // the TUI/web AgentLog + step-progress render correctly. The `beforeTask`
-        // hook (also wired via `resolvedRegistry`) fires at claim time and
-        // returns the same steps — both share `resolveImplementationSteps`.
-        getStepsForTask: resolveImplementationSteps,
-        // Thread the resolved hook registry so `LanePool.resolveRunner` fires
-        // the `beforeTask` hook registered above (step substitution) AND so
-        // the engine's default auditor / prompt hooks fire for this pool.
-        hookRegistry: resolvedRegistry,
-        // A failed task is reset and re-run from step 1 (sessions cleared) up to
-        // 2 extra times — 3 total attempts — before it is left failed.
-        maxTaskRetries: 2,
-        signal,
-    });
+  // 3. Register the `beforeTask` runner-substitution hook. This fires at
+  // claim time (first-wins). A workflow-provided `beforeTask` subscriber
+  // registered BEFORE this one wins; one registered AFTER is short-circuited.
+  //
+  // Cast: the engine's `BeforeTaskResult` type doesn't yet include a `runner`
+  // field (transitional gap — the runner-pool handles it at runtime by casting
+  // the hook result to `Record<string, unknown>` and checking `result.runner`).
+  resolvedRegistry.register({
+    beforeTask: ({
+      task,
+    }: {
+      task: Parameters<typeof resolveImplementationRunner>[0];
+    }) => ({
+      runner: resolveImplementationRunner(task),
+    }),
+  } as never);
 
-    const result = await pool.run();
+  // 4. Create and run the runner pool
+  const pool = new RunnerPool({
+    maxConcurrentSessions: maxConcurrentTasks,
+    modelConcurrency,
+    profilesDirs,
+    phaseId: "implementing",
+    sessionBaseDir,
+    cwd,
+    apiKeys,
+    onStatus,
+    auditLog: tracker.auditLog,
+    taskTracker: tracker.taskTracker,
+    rendererRegistry,
+    // Runner tree source: returns the composed runner (test → implement →
+    // review) for each task. Replaces the old getStepsForTask seam.
+    getRunnerForTask: resolveImplementationRunner,
+    // Thread the resolved hook registry so the pool fires the `beforeTask`
+    // hook registered above (runner substitution) AND so the engine's
+    // default auditor / prompt hooks fire for this pool.
+    hookRegistry: resolvedRegistry,
+    // Thread the worktree manager (if supplied by the workflow run) so each
+    // task runner can operate in its own isolated worktree.
+    worktreeManager,
+    // A failed task is reset and re-run (sessions cleared by the pool) up
+    // to 2 extra times — 3 total attempts — before it is left failed.
+    maxTaskRetries: 2,
+    signal,
+  });
 
-    // Defense-in-depth: check pool result against tracker state
-    const totalTasks = tracker.taskTracker.getAllTasks().length;
-    const settledTasks = result.completedTasks + result.failedTasks;
-    if (settledTasks !== totalTasks) {
-        console.warn(
-            `[implementationPhase] Pool result discrepancy: ${settledTasks} settled tasks (${result.completedTasks} completed + ${result.failedTasks} failed) vs ${totalTasks} total tasks in tracker`,
-        );
-    }
+  const result = await pool.run();
 
+  // Defense-in-depth: check pool result against tracker state
+  const totalTasks = tracker.taskTracker.getAllTasks().length;
+  const settledTasks = result.completedTasks + result.failedTasks;
+  if (settledTasks !== totalTasks) {
+    console.warn(
+      `[implementationPhase] Pool result discrepancy: ${settledTasks} settled tasks (${result.completedTasks} completed + ${result.failedTasks} failed) vs ${totalTasks} total tasks in tracker`,
+    );
+  }
 }

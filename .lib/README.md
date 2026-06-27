@@ -8,6 +8,16 @@ that supplies a [`WorkflowConfig`](#workflowconfig-parameterization) and delegat
 > **SPIR** = **S**couting → **P**lanning → **I**mplementation → **R**eview, plus a
 > terminal `done` phase.
 
+> **Session-first execution model.** Every phase dispatches work through a
+> [`RunnerPool`](https://www.npmjs.com/package/@harms-haus/engin-engine) (replacing the
+> former `LanePool`). A `RunnerPool` drains a `TaskTracker` and resolves a **runner
+> tree** — a composition of composable runners (`singleSession`, `linearRunner`,
+> `reviewRunner`, …) — for each task via `getRunnerForTask` and/or the `beforeTask`
+> hook. Each leaf in the tree calls the `runSession` session primitive for one
+> prompt turn. Concurrency is governed by `SessionGate` (two-level total + per-model
+> FIFO gate). This replaces the old step-array model (`getStepsForTask` +
+> `CODE_STEPS`/`NON_CODE_STEPS`).
+
 ---
 
 ## Contents
@@ -25,11 +35,16 @@ that supplies a [`WorkflowConfig`](#workflowconfig-parameterization) and delegat
 
 ## Overview
 
-`.lib/` implements the SPIR model as a phase pipeline. It owns:
+`.lib/` implements the SPIR model as a phase pipeline driven by the engine's
+`PhaseRunner`. It owns:
 
 1. **Phase ordering** — the `PHASES` constant and the `Phase` union type.
-2. **Phase-transition helper** — `completePhase`.
-3. **Per-phase dispatcher** — `executePhase` (a `switch` over `Phase`).
+2. **Phase declarations** — a `PhaseDefinition[]` array (`{ id, label, icon, run }`)
+   passed to `PhaseRunner`.
+3. **SPIR-specific orchestration hooks** — registered on the `HookRegistry`:
+   `beforePhase` (abort guard + `onPhaseStart`), `shouldRetryPhase` (scouting ≤3
+   rounds), `onPhaseSettled` (scouting collect-loop), `afterPhase`
+   (`onPhaseComplete` + sidebar indicator).
 4. **Top-level orchestrator** — `runSpir`, the single entry point thin wrappers call.
 
 Everything else — the actual scouting, planning, implementation, and review logic —
@@ -39,8 +54,8 @@ lives in the sibling phase modules (`scouting.ts`, `planning.ts`, `implementatio
 Each workflow module imports the backbone via a relative path:
 
 ```ts
-import { runSpir, type SpirRunOptions, normalizeOptions } from '../.lib/spir';
-export * from '../.lib/spir';
+import { runSpir, type SpirRunOptions, normalizeOptions } from "../.lib/spir";
+export * from "../.lib/spir";
 ```
 
 Each workflow's `tsconfig.json` includes `../.lib/**/*.ts`, so the backbone is compiled
@@ -57,70 +72,123 @@ See the engine docs for `StatusCallbacks` and `EventStore`.
 ### Phase order
 
 ```ts
-export const PHASES: readonly Phase[] = ["scouting", "planning", "implementing", "review", "done"];
+export const PHASES: readonly Phase[] = [
+  "scouting",
+  "planning",
+  "implementing",
+  "review",
+  "done",
+];
 
-export type Phase = "scouting" | "planning" | "implementing" | "review" | "done";
+export type Phase =
+  | "scouting"
+  | "planning"
+  | "implementing"
+  | "review"
+  | "done";
 ```
 
-### Dispatch model
+### Dispatch model — PhaseRunner
 
-`runSpir` iterates `PHASES` by index and calls `executePhase(phase, state, ctx)` for each.
-`executePhase` does **exactly one step** per invocation and may return a `Phase` to jump to
-instead of advancing linearly. This is how retry loops work — the caller, not the phase
-function, controls progression:
+`runSpir` declares the phases as a `PhaseDefinition[]` and drives the engine's
+`PhaseRunner`. Each `PhaseDefinition` has `{ id, label, icon, run }` where `run` is an
+async callback that executes that phase's business logic. The phase bodies close over
+`runSpir`-locals (tracker, profiles, workdir, etc.) and a shared mutable state bag
+(`ctx.state`).
 
-```ts
-const jumpTo = await executePhase(phase, state, ctx);
-if (jumpTo) {
-    currentIndex = PHASES.indexOf(jumpTo);   // non-linear jump (e.g. retry)
-} else {
-    currentIndex++;                           // linear advance
-}
-```
+The `PhaseRunner` owns phase transitions, state persistence, and hook invocation.
+SPIR-specific orchestration (retry loops, cross-round accumulation, sidebar updates) is
+**not** in an imperative loop — it is declared as phase-level hooks on the
+`HookRegistry`:
 
-Before each phase, `runSpir` checks `signal?.aborted` and throws `"Workflow cancelled"` if set.
+| Hook               | Rule            | Purpose                                                                              |
+| ------------------ | --------------- | ------------------------------------------------------------------------------------ |
+| `beforePhase`      | (first-wins)    | Abort guard (`signal?.aborted` → throws `"Workflow cancelled"`) + `onPhaseStart`     |
+| `shouldRetryPhase` | (first-wins)    | Scouting ≤3-rounds retry policy (re-runs scouting while `!ready` and `rounds < 3`)   |
+| `onPhaseSettled`   | (observe)       | Scouting collect-loop: folds settled scout-task results into `ctx.state` + tracker   |
+| `afterPhase`       | (observe)       | `onPhaseComplete` callback + sidebar indicator update                                |
+
+The `runSpir` `try`/`catch` around `runner.run()` cancels active tasks and persists the
+tracker on abort or error, then emits `onWorkflowFailed`.
 
 ### Phase progression
 
 ```
 scouting ──────▶ planning ──────▶ implementing ──────▶ review ──────▶ done
-   │  ↺ ≤3         │  ↺ ≤3                                   │
-   └───────────────┘                                         │
-                                                              ▼
-                                                          (per-lane fixer loop ≤3 attempts)
+   │  ↺ ≤3                         │
+   │  (shouldRetryPhase hook)      │  (reviewRunner drives plan↔review internally)
+   └───────────────────────────────┘
 ```
 
-**Scouting** (`scouting.ts`) — up to **3 rounds**:
+**Scouting** (`scouting.ts`) — up to **3 rounds** (controlled by `shouldRetryPhase`):
 
-1. **Round 0 (first):** The `scout-coordinator` agent analyzes the task and produces a
-   list of topics (each with a rationale and key files). These become scout tasks.
+1. **Round 0 (first):** The `scout-coordinator` agent (run via `runSingleSessionStructured`)
+   analyzes the task and produces a list of topics (each with a rationale and key files).
+   These become scout tasks added to the **shared** `TaskTracker`.
 2. **Follow-up rounds:** Topics come directly from the previous review's gaps — the
    `scout-coordinator` is skipped (`phaseOptions.topics` is set).
-3. All topics run in parallel as read-only `scout` tasks through the engine's `LanePool`.
-   New reports are **appended** to the accumulated list across rounds.
-4. The `scouting-reviewer` agent evaluates the combined reports and returns `{ ready, research, gaps }`.
-   - If `ready` → advance to planning.
-   - If not ready and `scoutingRounds < 3` → jump back to `"scouting"` using the gaps as new topics.
-   - If 3 rounds exhausted → proceed anyway with current research.
+3. All topics run in parallel as read-only `scout` tasks through a **`RunnerPool`**. Each
+   scout task's runner tree is a `linearRunner` of `singleSession` runners built from
+   `SCOUTING_STEPS` (mapped via `getRunnerForTask`). Because scout tasks accumulate on the
+   **shared tracker** across the ≤3 rounds, complete reports are naturally cumulative.
+4. The `scouting-reviewer` agent (via `runSingleSessionStructured`) evaluates the combined
+   reports and returns `{ ready, research, gaps, files }`. Results are stored in
+   `ctx.state` (`scoutingReady`, `scoutingRounds`, `research`, `scoutingGaps`,
+   `scoutingFiles`).
+   - If `ready` → the `shouldRetryPhase` hook abstains; planning advances.
+   - If not ready and `scoutingRounds < 3` → `shouldRetryPhase` returns `true`; scouting re-runs using the gaps as new topics.
+   - If 3 rounds exhausted → proceed anyway with current research (gaps are cleared).
 
-**Planning** (`planning.ts`) — up to **3 rounds**:
+> **Cross-round collection** is owned by the `onPhaseSettled` hook: after each scouting
+> round it folds the tracker's settled scout-task results into `ctx.state.scoutingReports`
+> and persists them to `workflowData` (so the planning phase's resume path works). The
+> scouting phase body itself does NOT collect or return reports.
 
-1. The `planner` agent produces a structured `Plan` (strategy + tasks) from the research and task prompt.
-   If this is a retry, the previous plan-review feedback and suggestions are injected into the prompt.
-2. The `plan-reviewer` agent evaluates the plan and returns `{ ready, feedback, suggestions }`.
-   - If `ready` → advance to implementation.
-   - If not ready and `planningRounds < 3` → clear the plan and jump back to `"planning"`.
-   - If 3 rounds exhausted → proceed with the current plan.
+**Planning** (`planning.ts`) — single dispatch, internal replan loop:
+
+1. The plan + plan-review run as a **`reviewRunner`** (execute → review loop) dispatched
+   through a `RunnerPool` (`maxConcurrentSessions: 1`). The planner writes its plan as a
+   JSON artifact to `{workDir}/artifacts/plan.json` (filesystem output mode, sandboxed to
+   the artifacts directory). The plan-reviewer evaluates it (structured output mode with
+   `PlanReviewSchema`: `{ approved, feedback }`).
+2. The `reviewRunner` drives the replan-on-rejection cycle internally: on rejection it
+   appends feedback to the planner prompt and re-runs the planner, up to
+   `DEFAULT_MAX_ROUNDS` times.
+3. After the pool settles, the plan artifact is read back and validated against
+   `PlanSchema`. Even on review exhaustion (reviewer never approved), the latest plan is
+   used (mirrors the prior "exhausted rounds → proceed anyway" behaviour).
+4. Scouting files are threaded onto the planning task's `files` so the engine's default
+   context-collection hook inlines them into both the planner and plan-reviewer prompts.
 
 **Implementation** (`implementation.ts`):
 
-1. Plan tasks are loaded into the shared `WorkflowStatusTracker.taskTracker` (skipping IDs already present).
+1. Plan tasks are loaded into the shared `WorkflowStatusTracker.taskTracker` (renumbered
+   to sequential `t-0N` IDs via `assignSequentialTaskIds`, skipping IDs already present).
 2. Dependencies are validated (`validateAllDependencies()`).
-3. A `LanePool` runs all tasks in parallel (bounded by `maxConcurrentTasks`). Each task's step sequence
-   is determined by `getStepsForTask`: code tasks use `CODE_STEPS` (test-first), non-code tasks use
-   `NON_CODE_STEPS`. If a task specifies a non-default `profile` (e.g. `implementer-lite`), that profile
-   replaces `implementer` in the `execute` step while reviewer steps stay unchanged.
+3. A **`RunnerPool`** runs all tasks in parallel (bounded by `maxConcurrentSessions`,
+   which is `maxConcurrentTasks` in the function signature). Each task's **runner tree**
+   is resolved by `getRunnerForTask` via `resolveImplementationRunner` (and/or the
+   `beforeTask` first-wins hook, which can override or skip):
+
+   - **Code tasks** (`isCode: true`) → `linearRunner([singleSession(write-tests), reviewRunner(execute, review)])`
+   - **Non-code tasks** → `reviewRunner(execute, review)`
+
+   The `reviewRunner` drives the execute → review loop (`approved` / reject + feedback,
+   up to `DEFAULT_MAX_ROUNDS` rounds). If a task specifies a non-default `profile`
+   (e.g. `implementer-lite`), that profile substitutes for `implementer` in the execute
+   session while the reviewer session stays unchanged.
+
 4. After the pool settles, a defense-in-depth check warns if settled task count ≠ total tasks.
+5. When a `worktreeManager` is supplied via options, each task runs in its own isolated
+   per-task git worktree (created before the task, merged into the main worktree on
+   success, culled on failure), so implementation tasks don't contend on files; when
+   omitted, tasks share the `cwd` exactly as before. The per-task worktree lifecycle is
+   owned by the engine — see the engine docs.
+
+> **No explicit session wipe on resume.** Replay idempotency (`runSession` skips cached
+> sessions via the `.complete` sentinel + `result.json` checksum) handles resumed tasks;
+> the pool's retry valve (`clearTaskSessions` in `maybeRetry`) clears sessions for retried
+> tasks. The workflow no longer touches persisted sessions on resume.
 
 **Review** (`final-review.ts`) — multi-dimensional review with **per-lane fixer loops**:
 
@@ -137,29 +205,33 @@ review ──▶ (no actionable findings? lane done)
                                      (loop, up to MAX_FIX_ROUNDS=3 fixer attempts)
 ```
 
-1. The initial `review` pass produces a `FinalReviewResult` —
+1. The initial `review` pass runs via `runSingleSessionStructured` (wraps `singleSession`
+   + the `runSession` primitive) and produces a `FinalReviewResult` —
    `{ dimension, applicable, notApplicableReason, summary, findings[] }`. A reviewer whose
    dimension is irrelevant to the changeset returns `applicable: false` with empty findings.
 2. Each finding carries a severity (`low | medium | high | critical`) and a self-contained `fixPrompt`.
 3. Findings rated **medium / high / critical** ("actionable") in a lane spawn one `fixer` task each
-   **within that lane** (via a per-lane `LanePool`, using `config.fixerSteps`). `low` findings are
-   recorded but do not fix.
+   **within that lane** (via a per-lane **`RunnerPool`**, using `config.fixerSteps`). `low` findings are
+   recorded but do not fix. Each fixer task's runner tree is a `linearRunner` of `singleSession`
+   wrappers (one per fixer step), pre-built so the runner infrastructure drives fixer execution
+   through the session primitive.
 4. If the initial review is clean, the fixer and review-fixes passes are **skipped entirely** for
    that lane — a clean dimension does no extra work and never re-runs.
-5. Otherwise the lane runs `fixer → review-fixes`. The **review-fixes** pass uses the **same reviewer
-   profile** with a verify-focused prompt (stepName `final-review-fixes`) and confirms the prior
-   findings were resolved without introducing regressions. If it still reports actionable findings,
-   the lane loops back to the fixer (up to 3 attempts); otherwise the lane is clean.
+5. Otherwise the lane runs `fixer → review-fixes`. The **review-fixes** pass uses `runSingleSessionStructured`
+   with the **same reviewer profile** and a verify-focused prompt (role `final-review-fixes`) and confirms
+   the prior findings were resolved without introducing regressions. If it still reports actionable
+   findings, the lane loops back to the fixer (up to 3 attempts); otherwise the lane is clean.
 6. Every pass (initial + verify) is appended to that lane's per-dimension history, so the reviewer
    never re-reports already-fixed items.
 7. The phase returns `clean = true` only if **every** lane finished clean. A lane that exhausts its
-   3 fixer attempts with findings still open makes the whole phase return `clean = false`.
+   3 fixer attempts with findings still open makes the whole phase return `clean = false`. A lane that
+   throws (e.g. structured-output failure) is counted as not-clean and the other lanes still complete.
 
-Fixer session dirs are scoped per dimension + fix round (`{workDir}/sessions/fix-{dimension}-{n}`)
-so concurrent lanes never collide.
+Per-lane fixer session dirs are scoped per dimension + fix round
+(`{workDir}/sessions/fix-{dimension}-{n}`) so concurrent lanes never collide.
 
-> **Note:** The `initialization` phase (AI title generation) runs *before* the main loop in
-> `runSpir`, not inside `executePhase`. See [initialization.ts](#initializationts).
+> **Note:** The `initialization` phase (AI title generation) runs _before_ the phase loop
+> in `runSpir`, not inside a `PhaseDefinition`. See [initialization.ts](#initializationts).
 
 ---
 
@@ -171,39 +243,41 @@ not from code branches.
 
 ```ts
 export interface WorkflowConfig {
-    name: string;
-    defaultMaxConcurrentTasks: number;
-    fixerSteps: StepDefinition[];
-    finalReviewers?: FinalReviewerConfig[];   // specialized reviewers run in the final review
-    phases: { id: string; label: string; icon: string }[];
-    titleFormatter: (description: string) => string;
+  name: string;
+  defaultMaxConcurrentSessions: number;
+  modelConcurrency?: Record<string, number>; // per-model concurrency caps (default {} = unbounded)
+  fixerSteps: StepDefinition[];
+  finalReviewers?: FinalReviewerConfig[]; // specialized reviewers run in the final review
+  phases: { id: string; label: string; icon: string }[];
+  titleFormatter: (description: string) => string;
 }
 
 export interface FinalReviewerConfig {
-    profileId: string;   // agent profile to load for this reviewer
-    dimension: string;   // stable key used to bucket review history across rounds
-    label: string;       // human-readable label shown in task titles / status
+  profileId: string; // agent profile to load for this reviewer
+  dimension: string; // stable key used to bucket review history across rounds
+  label: string; // human-readable label shown in task titles / status
 }
 ```
 
-| Field | Type | Purpose |
-|---|---|---|
-| `name` | `string` | Workflow identifier; used by `resolveProfilesDirs` to find the default profile directory |
-| `defaultMaxConcurrentTasks` | `number` | Fallback concurrency when `options.maxConcurrentTasks` is not provided |
-| `fixerSteps` | `StepDefinition[]` | Step sequence passed to the fixer `LanePool` in the final review |
-| `finalReviewers` | `FinalReviewerConfig[]?` | Specialized reviewers run as independent lanes in the final review; each loops review → fixer → review-fixes over its own dimension; defaults to efficiency / code-quality / ui-ux / security / documentation |
-| `phases` | `{ id, label, icon }[]` | Sidebar UI metadata; `getPhaseIndicator` resolves a phase → icon |
-| `titleFormatter` | `(description: string) => string` | Formats fixer task titles from finding titles |
+| Field                          | Type                              | Purpose                                                                                                                                                                                                       |
+| ------------------------------ | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                         | `string`                          | Workflow identifier; used by `resolveProfilesDirs` to find the default profile directory                                                                                                                      |
+| `defaultMaxConcurrentSessions` | `number`                          | Fallback for `maxConcurrentSessions` when `options.maxConcurrentTasks` is not provided; passed to each phase's `RunnerPool`                                                                                   |
+| `modelConcurrency`             | `Record<string, number>?`         | Per-model concurrency caps applied by the `RunnerPool` via `SessionGate`; omit (or `{}`) for unbounded per-model                                                                                              |
+| `fixerSteps`                   | `StepDefinition[]`                | Step specs mapped to `singleSession` runners in a per-lane `linearRunner`; each finding spawns one fixer task in the lane's `RunnerPool`                                                                      |
+| `finalReviewers`               | `FinalReviewerConfig[]?`          | Specialized reviewers run as independent lanes in the final review; each loops review → fixer → review-fixes over its own dimension; defaults to efficiency / code-quality / ui-ux / security / documentation |
+| `phases`                       | `{ id, label, icon }[]`           | Sidebar UI metadata; `getPhaseIndicator` resolves a phase → icon                                                                                                                                              |
+| `titleFormatter`               | `(description: string) => string` | Formats fixer task titles from finding titles                                                                                                                                                                 |
 
 ### Config differences across workflows
 
-| | `develop` | `improve` | `debug` |
-|---|---|---|---|
-| `name` | `'develop'` | `'improve'` | `'debug'` |
-| `defaultMaxConcurrentTasks` | `5` | `5` | `3` |
-| `fixerSteps` length | **2** | **2** | **2** |
-| `finalReviewers` length | **5** | **5** | **5** |
-| `phases` length | **5** (incl. initialization) | **4** (no initialization) | **5** (incl. initialization) |
+|                                | `develop`                    | `improve`                 | `debug`                      |
+| ------------------------------ | ---------------------------- | ------------------------- | ---------------------------- |
+| `name`                         | `'develop'`                  | `'improve'`               | `'debug'`                    |
+| `defaultMaxConcurrentSessions` | `5`                          | `5`                       | `3`                          |
+| `fixerSteps` length            | **2**                        | **2**                     | **2**                        |
+| `finalReviewers` length        | **5**                        | **5**                     | **5**                        |
+| `phases` length                | **5** (incl. initialization) | **4** (no initialization) | **5** (incl. initialization) |
 
 All three workflows use the **same** `finalReviewers` (efficiency, code-quality, ui-ux, security, documentation) and the
 same `titleFormatter`.
@@ -214,30 +288,40 @@ same `titleFormatter`.
 // All three workflows — a writable fix step followed by a read-only
 // verification step (using ReviewResultSchema, run by the fixer-reviewer):
 fixerSteps: [
-    { name: 'fix',    profileId: 'fixer',          isReadOnly: false },
-    { name: 'verify', profileId: 'fixer-reviewer', isReadOnly: true, schema: ReviewResultSchema },
-]
+  { name: "fix", profileId: "fixer", isReadOnly: false },
+  {
+    name: "verify",
+    profileId: "fixer-reviewer",
+    isReadOnly: true,
+    schema: ReviewResultSchema,
+  },
+];
 ```
 
-**sidebarPhases detail:** *(field renamed to `phases` — see above)*
+In the session-first model, each `StepDefinition` in `fixerSteps` is mapped to a
+`singleSession` runner (the `StepDefinition` fields — `name`, `profileId`, `isReadOnly`,
+`schema`, `outputMode` — become the `SessionSpec` minus the deterministic `id`). The
+fixer task's runner tree is a `linearRunner` of those `singleSession` runners.
+
+**phases detail:**
 
 ```ts
 // develop & debug — 5 entries (initialization is present):
 phases: [
-    { id: 'initialization', label: 'Initialization', icon: '⚙' },
-    { id: 'scouting',       label: 'Scouting',       icon: '🔍' },
-    { id: 'planning',       label: 'Planning',        icon: '📋' },
-    { id: 'implementing',   label: 'Implementing',    icon: '🔨' },
-    { id: 'review',         label: 'Review',          icon: '🔎' },
-]
+  { id: "initialization", label: "Initialization", icon: "⚙" },
+  { id: "scouting", label: "Scouting", icon: "🔍" },
+  { id: "planning", label: "Planning", icon: "📋" },
+  { id: "implementing", label: "Implementing", icon: "🔨" },
+  { id: "review", label: "Review", icon: "🔎" },
+];
 
 // improve — 4 entries (initialization omitted):
 phases: [
-    { id: 'scouting',     label: 'Scouting',    icon: '🔍' },
-    { id: 'planning',     label: 'Planning',     icon: '📋' },
-    { id: 'implementing', label: 'Implementing', icon: '🔨' },
-    { id: 'review',       label: 'Review',       icon: '🔎' },
-]
+  { id: "scouting", label: "Scouting", icon: "🔍" },
+  { id: "planning", label: "Planning", icon: "📋" },
+  { id: "implementing", label: "Implementing", icon: "🔨" },
+  { id: "review", label: "Review", icon: "🔎" },
+];
 ```
 
 All three workflows use the same `finalReviewers` and `titleFormatter`:
@@ -256,8 +340,11 @@ Each workflow exports an engine-loaded `run` function. Its signature is identica
 all three workflows:
 
 ```ts
-export async function run(taskPrompt: string, options: RunOptions): Promise<void> {
-    return runSpir(workflowConfig, taskPrompt, normalizeOptions(options));
+export async function run(
+  taskPrompt: string,
+  options: RunOptions,
+): Promise<void> {
+  return runSpir(workflowConfig, taskPrompt, normalizeOptions(options));
 }
 ```
 
@@ -267,63 +354,52 @@ export async function run(taskPrompt: string, options: RunOptions): Promise<void
 
 ```ts
 export async function runSpir(
-    config: WorkflowConfig,
-    taskPrompt: string,
-    options: SpirRunOptions,
-): Promise<void>
+  config: WorkflowConfig,
+  taskPrompt: string,
+  options: SpirRunOptions,
+): Promise<void>;
 ```
 
 `runSpir` does the following in order:
 
-1. Resolves `maxConcurrentTasks` (`options.maxConcurrentTasks ?? config.defaultMaxConcurrentTasks`).
+1. Resolves `maxConcurrentTasks` (`options.maxConcurrentTasks ?? config.defaultMaxConcurrentSessions`).
 2. Resolves `profilesDirs` (`options.profilesDirs ?? resolveProfilesDirs(options.cwd, config.name)`).
 3. Loads or creates the `WorkflowStatusTracker` (see [Resumption](#resumption)).
 4. Emits `onWorkflowStart`.
-5. Builds a mutable `RunState` (seeded from the tracker on resume).
-6. Resolves the starting phase index from `tracker.currentPhase`.
+5. Registers all phases via `onPhaseRegister`.
+6. Resolves the starting phase from `tracker.currentPhaseId` for the initial sidebar indicator.
 7. Generates the sidebar title (AI for fresh runs, truncated prompt for resumed runs).
-8. Builds a single immutable `PhaseContext` and passes it to every `executePhase` call.
-9. Loops through phases until `done` or cancellation.
-10. Emits `onWorkflowComplete` with total duration and agent count.
+8. Resolves or creates the `HookRegistry` and registers the default auditor
+   (`onStructuredOutput` / `onDecision` observe hooks against `tracker.auditLog`).
+9. Declares `PhaseDefinition[]` — each phase body is an async closure that calls the
+   corresponding sibling phase function (`scoutingPhase`, `planningPhase`,
+   `implementationPhase`, `finalReviewPhase`). The closures share a mutable `ctx.state`
+   bag.
+10. Registers the SPIR phase hooks (`beforePhase`, `shouldRetryPhase`, `onPhaseSettled`,
+    `afterPhase`) on the `HookRegistry`.
+11. Constructs a `PhaseRunner` (sliced to the resume start index on resume) and calls
+    `runner.run()`.
+12. On success, emits `onWorkflowComplete` with total duration and agent count.
+13. On error/abort, cancels active tasks, persists the tracker, and emits `onWorkflowFailed`.
 
-### PhaseContext
+### Phase state bag (`ctx.state`)
 
-Built **once** in `runSpir` and reused for every phase. Bundling these values into a single
-object eliminates the swap-risk of many positional string/optional parameters (e.g. `cwd`
-vs `workDir`, both strings):
+The `PhaseRunner` passes a shared mutable state bag to every phase body. Fields used by
+SPIR (mirror the legacy `RunState` conceptually):
 
-```ts
-export interface PhaseContext {
-    tracker: WorkflowStatusTracker;
-    profilesDirs: string[];
-    taskPrompt: string;
-    cwd: string;
-    workDir: string;
-    maxConcurrentTasks: number | undefined;
-    config: WorkflowConfig;
-    apiKeys?: Record<string, string>;
-    onStatus?: StatusCallbacks;
-    signal?: AbortSignal;
-}
-```
+| Field               | Type                     | Purpose                                                                 |
+| ------------------- | ------------------------ | ----------------------------------------------------------------------- |
+| `research`          | `string`                 | Synthesized scouting research summary                                   |
+| `plan`              | `Plan \| undefined`       | Validated implementation plan                                           |
+| `scoutingReports`   | `unknown[]`              | Cumulative scout-task results (folded by `onPhaseSettled`)              |
+| `scoutingRounds`    | `number`                 | Completed scouting rounds                                               |
+| `scoutingGaps`      | `ScoutingGap[]`          | Gaps from the latest review (used as next-round topics)                 |
+| `scoutingFiles`     | `string[]`               | Key files for the planner                                               |
+| `scoutingReady`     | `boolean`                | Whether scouting review deemed the research sufficient                   |
 
-### RunState
-
-Mutable state passed by reference through phases within a single `runSpir()` call.
-Mutations made inside `executePhase` are visible to the orchestrator:
-
-```ts
-export interface RunState {
-    research: string;
-    plan: Plan | undefined;
-    scoutingReports: unknown[];
-    scoutingRounds: number;
-    scoutingGaps: ScoutingGap[];
-    planningRounds: number;
-    planReviewFeedback?: string;
-    planReviewSuggestions?: string[];
-}
-```
+> `ctx.state` is **not** persisted by the `PhaseRunner` — only phase transitions are.
+> Cross-phase data that must survive resume is persisted to `workflowData` via
+> `tracker.setWorkflowData(...)` explicitly inside the phase bodies / hooks.
 
 ---
 
@@ -331,18 +407,18 @@ export interface RunState {
 
 ```ts
 export interface SpirRunOptions extends WorkflowRunOptions {
-    profilesDirs?: string[];   // preferred: list of profile directories
-    profilesDir?: string;      // legacy singular form
+  profilesDirs?: string[]; // preferred: list of profile directories
+  profilesDir?: string; // legacy singular form
 }
 ```
 
 Inherited `WorkflowRunOptions` fields (from the engine): `cwd`, `workDir`, `maxConcurrentTasks`,
-`apiKeys`, `onStatus`, `signal`, `tracker`.
+`apiKeys`, `onStatus`, `signal`, `tracker`, `rendererRegistry`, `hookRegistry`, `worktreeManager`.
 
 ### normalizeOptions
 
 ```ts
-export function normalizeOptions(options: SpirRunOptions): SpirRunOptions
+export function normalizeOptions(options: SpirRunOptions): SpirRunOptions;
 ```
 
 Returns a **new** `SpirRunOptions` with `profilesDirs` resolved and the legacy singular
@@ -361,7 +437,7 @@ return resolved ? { ...rest, profilesDirs: resolved } : rest;
 ```
 
 > **`onStatus`:** The engine composes the store + UI + bridge callbacks into `onStatus`
-> *before* calling `runSpir`. The backbone consumes it directly — it does not construct a
+> _before_ calling `runSpir`. The backbone consumes it directly — it does not construct a
 > TUI or EventStore of its own. See the engine docs for the `StatusCallbacks` interface.
 
 ---
@@ -374,31 +450,30 @@ engine's `resolveProfilesDirs` / `loadProfilesFromDirs` at call time.
 
 The backbone references the following profile IDs:
 
-| Profile ID | Referenced by | Phase | Role |
-|---|---|---|---|
-| `scout-coordinator` | `scouting.ts` | scouting | Analyzes the task, determines scouting topics (round 0 only) |
-| `scout` | `scouting.ts`, `initialization.ts` | scouting, initialization | Investigates a topic and reports findings; also used for AI title generation |
-| `scouting-reviewer` | `scouting.ts` | scouting | Reviews scouting reports; decides ready-to-plan vs gaps |
-| `planner` | `planning.ts` | planning | Produces a structured implementation plan from research |
-| `plan-reviewer` | `planning.ts` | planning | Approves or rejects a plan with feedback |
-| `implementer` | `steps.ts` | implementing | Executes a code or non-code task (default implementer profile) |
-| `implementer-lite` | `implementation.ts` *(example)* | implementing | Any non-default `profile` on a plan task replaces `implementer` in the `execute` step |
-| `implement-reviewer` | `steps.ts` | implementing, review | Reviews completed task output against `ReviewResultSchema` |
-| `test-writer` | `steps.ts` (`CODE_STEPS`) | implementing | Writes tests first for code tasks |
-| `test-reviewer` | `steps.ts` (`CODE_STEPS`) | implementing | Reviews the written tests |
-| `fixer` | `final-review.ts`, `develop`/`debug`/`improve` fixerSteps | review | Resolves actionable findings (severity ≥ medium) found by the specialized reviewers |
-| `fixer-reviewer` | `develop`/`debug`/`improve` fixerSteps | review | The `verify` step — reviews a completed fix (resolution, regressions, scope) against `ReviewResultSchema` |
-| `final-reviewer` | *(legacy, unused by default)* | review | The original single whole-codebase quality reviewer; superseded by the specialized reviewers |
-| `efficiency-reviewer` | `final-review.ts` | review | Performance / resource-efficiency dimension of the final review |
-| `code-quality-reviewer` | `final-review.ts` | review | Correctness / readability / maintainability dimension of the final review |
-| `ui-ux-reviewer` | `final-review.ts` | review | UI/UX dimension of the final review (returns `applicable:false` when no UI changes) |
-| `security-reviewer` | `final-review.ts` | review | Security dimension of the final review (returns `applicable:false` when no security surface) |
-| `documentation-reviewer` | `final-review.ts` | review | Documentation dimension of the final review — locates the docs (README, `docs/`, inline docstrings, API schemas), flags stale / missing / incomplete docs, and proposes structural refactors (e.g. splitting a monolith `README.md` into focused `docs/` pages) via self-contained `fixPrompt`s the fixer executes |
+| Profile ID               | Referenced by                                               | Phase                    | Role                                                                                                                                                                                                                                                                                                               |
+| ------------------------ | ----------------------------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `scout-coordinator`      | `scouting.ts`                                               | scouting                 | Analyzes the task, determines scouting topics (round 0 only)                                                                                                                                                                                                                                                       |
+| `scout`                  | `scouting.ts`, `initialization.ts`                          | scouting, initialization | Investigates a topic and reports findings; also used for AI title generation                                                                                                                                                                                                                                       |
+| `scouting-reviewer`      | `scouting.ts`                                               | scouting                 | Reviews scouting reports; decides ready-to-plan vs gaps                                                                                                                                                                                                                                                            |
+| `planner`                | `planning.ts`                                               | planning                 | Writes the implementation plan JSON artifact from research                                                                                                                                                                                                                                                         |
+| `plan-reviewer`          | `planning.ts`                                               | planning                 | Approves or rejects the plan artifact with feedback                                                                                                                                                                                                                                                               |
+| `implementer`            | `implementation.ts`                                         | implementing             | Executes a code or non-code task (default implementer profile)                                                                                                                                                                                                                                                     |
+| `implementer-lite`       | `implementation.ts` _(example)_                             | implementing             | Any non-default `profile` on a plan task substitutes for `implementer` in the execute session                                                                                                                                                                                                                     |
+| `implement-reviewer`     | `implementation.ts`                                         | implementing, review     | Reviews completed task output against `ReviewResultSchema` (via `reviewRunner`)                                                                                                                                                                                                                                    |
+| `test-writer`            | `implementation.ts`                                         | implementing             | Writes tests first for code tasks (via `singleSession` in the runner tree)                                                                                                                                                                                                                                         |
+| `fixer`                  | `final-review.ts`, `develop`/`debug`/`improve` fixerSteps   | review                   | Resolves actionable findings (severity ≥ medium) found by the specialized reviewers                                                                                                                                                                                                                                |
+| `fixer-reviewer`         | `develop`/`debug`/`improve` fixerSteps                      | review                   | The `verify` step — reviews a completed fix (resolution, regressions, scope) against `ReviewResultSchema`                                                                                                                                                                                                          |
+| `final-reviewer`         | _(legacy, unused by default)_                               | review                   | The original single whole-codebase quality reviewer; superseded by the specialized reviewers                                                                                                                                                                                                                       |
+| `efficiency-reviewer`    | `final-review.ts`                                           | review                   | Performance / resource-efficiency dimension of the final review                                                                                                                                                                                                                                                    |
+| `code-quality-reviewer`  | `final-review.ts`                                           | review                   | Correctness / readability / maintainability dimension of the final review                                                                                                                                                                                                                                          |
+| `ui-ux-reviewer`         | `final-review.ts`                                           | review                   | UI/UX dimension of the final review (returns `applicable:false` when no UI changes)                                                                                                                                                                                                                                |
+| `security-reviewer`      | `final-review.ts`                                           | review                   | Security dimension of the final review (returns `applicable:false` when no security surface)                                                                                                                                                                                                                       |
+| `documentation-reviewer` | `final-review.ts`                                           | review                   | Documentation dimension of the final review — locates the docs (README, `docs/`, inline docstrings, API schemas), flags stale / missing / incomplete docs, and proposes structural refactors (e.g. splitting a monolith `README.md` into focused `docs/` pages) via self-contained `fixPrompt`s the fixer executes |
 
 > **Note:** `implementer-lite` is not hardcoded — it appears only as an example in a code
 > comment. The substitution mechanism is generic: any `task.profile` value other than
-> `'implementer'` replaces `implementer` in the `execute` step while leaving reviewer steps
-> unchanged.
+> `'implementer'` substitutes for the implementer in the execute session while leaving
+> the reviewer session unchanged.
 
 ---
 
@@ -409,115 +484,184 @@ The backbone references the following profile IDs:
 Shared utilities for profile loading, harness creation, agent-spawn tracking, and audit-event
 construction.
 
-| Export | Signature |
-|---|---|
-| `structuredOutputEvent` | `(agentId, output, taskId?) → Omit<structured_output event, "timestamp">` |
-| `decisionEvent` | `(agentId, decision, reasoning, taskId?) → Omit<decision event, "timestamp">` |
-| `errorEvent` | `(agentId, error, taskId?) → Omit<error event, "timestamp">` |
-| `getProfile` | `(profilesDirs, profileId) → Promise<AgentProfile>` |
-| `makeHarnessOptions` | `(profilesDirs, profileId, cwd, agentId, apiKeys?, onStatus?) → Promise<HarnessCreationOptions>` |
-| `spawnAgent` | `(tracker, onStatus, info: SpawnInfo) → void` |
+| Export                  | Signature                                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------------------------ |
+| `structuredOutputEvent` | `(agentId, output, taskId?) → Omit<structured_output event, "timestamp">`                        |
+| `decisionEvent`         | `(agentId, decision, reasoning, taskId?) → Omit<decision event, "timestamp">`                    |
+| `errorEvent`            | `(agentId, error, taskId?) → Omit<error event, "timestamp">`                                     |
+| `getProfile`            | `(profilesDirs, profileId) → Promise<AgentProfile>`                                              |
+| `makeHarnessOptions`    | `(profilesDirs, profileId, cwd, agentId, apiKeys?, onStatus?) → Promise<HarnessCreationOptions>` |
+| `spawnAgent`            | `(tracker, onStatus, info: SpawnInfo) → void`                                                    |
 
 `makeHarnessOptions` loads a profile via `getProfile`, then returns `HarnessCreationOptions`
 with `onAgentStatus: forwardAgentStatus(onStatus)`. `spawnAgent` is the single source of truth
 for the three-line spawn-tracking pattern (status projection + tracker record + counter).
 
+### `session-utils.ts`
+
+| Export                     | Signature                                                                                                                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `runSingleSessionStructured` | `(spec, opts) → Promise<T \| undefined>` |
+
+Runs a single structured-output session via `singleSession`, capturing the structured
+`SessionResult` through a wrapped `runSession` in the `RunnerContext`. Creates a local
+`SessionGate({ total: 1, perModel: {} })` so exactly one session executes. Returns the
+parsed structured data, or `undefined` when the session did not produce structured output.
+Used by scouting, scouting review, initialization, and the final-review lanes.
+
 ### `scouting.ts`
 
-| Export | Signature |
-|---|---|
-| `scoutingPhase` | `(tracker, profilesDirs, taskPrompt, cwd, maxConcurrentTasks, workDir, apiKeys?, onStatus?, signal?, phaseOptions?) → Promise<unknown[]>` |
-| `scoutingReviewPhase` | `(tracker, profilesDirs, reports, cwd, apiKeys?, onStatus?) → Promise<ScoutingReview>` |
+| Export                | Signature                                                                                                                                                                   |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scoutingPhase`       | `(tracker, profilesDirs, taskPrompt, cwd, maxConcurrentTasks = 5, workDir, apiKeys?, onStatus?, signal?, phaseOptions = { round: 0 }, hookRegistry?) → Promise<void>`       |
+| `scoutingReviewPhase` | `(tracker, profilesDirs, taskPrompt, reports, cwd, apiKeys?, onStatus?, signal?, hookRegistry?, workDir?) → Promise<ScoutingReview>`                                        |
 
-`scoutingPhase` runs the `scout-coordinator` (round 0 only) to get topics, then dispatches
-parallel `scout` tasks via `LanePool`. When `phaseOptions.topics` is provided, the coordinator
-is skipped. New reports are appended to `phaseOptions.existingReports`. Session directory:
+`scoutingPhase` runs the `scout-coordinator` (round 0 only, via `runSingleSessionStructured`)
+to get topics, then adds scout tasks to the **shared tracker** and dispatches them through a
+**`RunnerPool`**. Each scout task's runner is a `linearRunner` of `singleSession` runners built
+from `SCOUTING_STEPS` (mapped via `getRunnerForTask`). When `phaseOptions.topics` is provided,
+the coordinator is skipped. Reports accumulate on the shared tracker across rounds (collected by
+the `onPhaseSettled` hook in `spir.ts`). Session directory:
 `{workDir}/sessions/scouting-round-{round}`.
+
+`scoutingReviewPhase` evaluates the accumulated reports via `runSingleSessionStructured`
+(`scouting-reviewer` profile) and returns `{ ready, research, gaps, files }`. The original task
+prompt is required so the reviewer can judge sufficiency *for this task*.
 
 ### `planning.ts`
 
-| Export | Signature |
-|---|---|
-| `planningPhase` | `(tracker, profilesDirs, research, taskPrompt, cwd, planReviewFeedback?, planReviewSuggestions?, apiKeys?, onStatus?) → Promise<Plan>` |
-| `planReviewPhase` | `(tracker, profilesDirs, plan, research, taskPrompt, cwd, apiKeys?, onStatus?) → Promise<PlanReview>` |
+| Export          | Signature                                                                                                                                                                                |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `planningPhase` | `(tracker, profilesDirs, research, files, taskPrompt, cwd, workDir, apiKeys?, onStatus?, signal?, rendererRegistry?, hookRegistry?) → Promise<Plan>`                                   |
+| `getPlanPath`   | `(workDir) → string` — path to `{workDir}/artifacts/plan.json`                                                                                                                           |
+| `getArtifactsDir` | `(workDir) → string` — path to `{workDir}/artifacts`                                                                                                                                   |
 
-`planningPhase` injects prior review feedback into the planner prompt on retries. Both functions
-emit structured-output / decision audit events.
+`planningPhase` composes a `reviewRunner` (plan → review-plan loop) and dispatches it through a
+`RunnerPool` (`maxConcurrentSessions: 1`). The planner uses **filesystem output mode** — it
+writes the plan as a JSON file to `getPlanPath(workDir)` via the `write` tool, sandboxed to the
+artifacts directory. The plan-reviewer evaluates the artifact (structured output mode with
+`PlanReviewSchema`: `{ approved, feedback }`). The `reviewRunner` appends feedback to the
+planner prompt on rejection and re-runs, up to `DEFAULT_MAX_ROUNDS`. After the pool settles, the
+plan artifact is read back and validated against `PlanSchema`. Scouting files are threaded onto
+the task's `files` so the engine's default context-collection hook inlines them.
 
 ### `implementation.ts`
 
-| Export | Signature |
-|---|---|
-| `implementationPhase` | `(tracker, profilesDirs, plan, cwd, maxConcurrentTasks, workDir, apiKeys?, onStatus?, signal?) → Promise<void>` |
+| Export                       | Signature                                                                                                                                                                                                                                              |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `implementationPhase`        | `(tracker, profilesDirs, plan, cwd, maxConcurrentTasks = 5, workDir, apiKeys?, onStatus?, signal?, rendererRegistry?, hookRegistry?, worktreeManager?, modelConcurrency = {}) → Promise<void>`                                                          |
+| `resolveImplementationRunner` | `(task: { isCode?, profile?, prompt }) → Runner`                                                                                                                                                                                                       |
 
-Loads plan tasks into the shared tracker, validates dependencies, runs a `LanePool` with
-`getStepsForTask` selecting `CODE_STEPS` or `NON_CODE_STEPS` based on `task.isCode`. Session
-directory: `{workDir}/sessions`.
+Loads plan tasks into the shared tracker (renumbered to `t-0N`), validates dependencies, and
+runs a **`RunnerPool`**. Runner resolution is provided via TWO seams sharing
+`resolveImplementationRunner`:
+
+1. **`getRunnerForTask`** — the `RunnerPool` option that returns the runner tree for a task.
+2. **`beforeTask` hook** — invoked at claim time (first-wins); returns `{ runner }` so a
+   workflow's own `beforeTask` subscriber can override the runner, or `{ skip: true }` to skip.
+
+The runner tree mirrors the old step pipeline as composed runners:
+
+- **Code tasks** → `linearRunner([singleSession(write-tests), reviewRunner(execute, review)])`
+- **Non-code tasks** → `reviewRunner(execute, review)`
+
+`reviewRunner` drives the execute → review loop (`approved` / reject + feedback, up to
+`DEFAULT_MAX_ROUNDS`). The pool is configured with `maxTaskRetries: 2` (3 total attempts). The
+optional `worktreeManager` enables per-task worktree isolation. `modelConcurrency` threads
+per-model caps into the `SessionGate`. Session directory: `{workDir}/sessions`.
 
 ### `final-review.ts`
 
-| Export | Signature |
-|---|---|
-| `finalReviewPhase` | `(tracker, profilesDirs, cwd, workDir, maxConcurrentTasks, apiKeys?, onStatus?, signal?, finalReviewers?, fixerSteps?, titleFormatter?) → Promise<boolean>` |
-| `DEFAULT_FINAL_REVIEWERS` | `readonly FinalReviewerConfig[]` (efficiency / code-quality / ui-ux / security / documentation) |
-| `isActionableSeverity` | `(severity) → boolean` (true for medium / high / critical) |
+| Export                    | Signature                                                                                                                                                                                                                         |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `finalReviewPhase`        | `(tracker, profilesDirs, cwd, workDir, maxConcurrentTasks, apiKeys?, onStatus?, signal?, finalReviewers?, fixerSteps?, titleFormatter?, hookRegistry?) → Promise<boolean>`                                                        |
+| `DEFAULT_FINAL_REVIEWERS` | `readonly FinalReviewerConfig[]` (efficiency / code-quality / ui-ux / security / documentation)                                                                                                                                  |
+| `isActionableSeverity`    | `(severity) → boolean` (true for medium / high / critical)                                                                                                                                                                        |
 
-Runs every reviewer in `finalReviewers` as an **independent lane in parallel**. Each lane loops
-`review → fixer → review-fixes` over its own dimension (up to `MAX_FIX_ROUNDS` = 3 fixer attempts per
-lane); a lane whose initial review is clean skips the fixer + review-fixes passes. The initial review
-(stepName `final-review`) and the review-fixes pass (stepName `final-review-fixes`) both use the same
-reviewer profile with a verify-focused prompt, and each lane keeps its own per-dimension history so
-fixed findings are not re-reported. The phase returns `clean = true` only if every lane finished clean.
-Per-lane fixer session directory: `{workDir}/sessions/fix-{dimension}-{fixRound}`.
+Runs every reviewer in `finalReviewers` as an **independent lane in parallel**. Each lane's
+review passes run via `runSingleSessionStructured`. Actionable findings (severity ≥ medium)
+spawn fixer tasks in a **per-lane `RunnerPool`** — each fixer task's runner is a `linearRunner`
+of `singleSession` wrappers built from `config.fixerSteps`. The lane loops
+`review → fixer → review-fixes` over its own dimension (up to `MAX_FIX_ROUNDS` = 3 fixer attempts);
+a lane whose initial review is clean skips the fixer + review-fixes passes. The initial review
+(role `final-review`) and the review-fixes pass (role `final-review-fixes`) both use the same
+reviewer profile with a verify-focused prompt, and each lane keeps its own per-dimension history
+so fixed findings are not re-reported. The phase returns `clean = true` only if every lane
+finished clean. Per-lane fixer session directory: `{workDir}/sessions/fix-{dimension}-{fixRound}`.
 
 ### `initialization.ts`
 
-| Export | Signature |
-|---|---|
-| `initializationPhase` | `(profilesDirs, taskPrompt, cwd, apiKeys, onStatus, tracker) → Promise<string>` |
+| Export                | Signature                                                                                                                |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `initializationPhase` | `(profilesDirs, taskPrompt, cwd, apiKeys, onStatus, tracker, workDir?) → Promise<string>`                                |
 
-Generates a concise AI title using the `scout` profile. Falls back to a truncated
-`taskPrompt` (max 60 chars) on any error. Called by `runSpir` before the main loop on fresh
-runs only.
+Generates a concise AI title using the `scout` profile via a dedicated `SessionGate({ total: 1 })`
+and `runSession` (out-of-phase: no `RunnerPool`, no `TaskTracker`, invisible to the task UI).
+Falls back to a truncated `taskPrompt` (max 60 chars) on any error. Called by `runSpir` before
+the phase loop on fresh runs only. Session directory: `{workDir}/sessions/initialization`.
 
 ### `schemas.ts`
 
 Zod schemas that constrain every structured LLM output in the pipeline:
 
-| Schema | Inferred type | Produced by |
-|---|---|---|
-| `ScoutingTopicSchema` | `ScoutingTopics` | `scout-coordinator` |
-| `ScoutingGapSchema` | `ScoutingGap` | (sub-schema of `ScoutingReviewSchema`) |
-| `ScoutingReviewSchema` | `ScoutingReview` | `scouting-reviewer` |
-| `PlanSchema` | `Plan` | `planner` |
-| `PlanReviewSchema` | `PlanReview` | `plan-reviewer` |
-| `ReviewResultSchema` | `ReviewResult` | `test-reviewer`, `implement-reviewer` (via `steps.ts`) |
-| `FinalReviewTopicsSchema` | `FinalReviewTopics` | *(legacy; the single `final-reviewer` — superseded by the multi-dimensional review below)* |
-| `FinalReviewResultSchema` | `FinalReviewResult` | the specialized final reviewers (efficiency / code-quality / ui-ux / security / documentation) |
-| `FinalReviewFindingSchema` | `FinalReviewFinding` | (sub-schema of `FinalReviewResultSchema`) |
-| `FinalReviewSeveritySchema` | `FinalReviewSeverity` | `low` \| `medium` \| `high` \| `critical` |
-| `TitleSchema` | `{ title: string }` | title generation (`initializationPhase`) |
+| Schema                      | Inferred type         | Produced by                                                                                    |
+| --------------------------- | --------------------- | ---------------------------------------------------------------------------------------------- |
+| `ScoutingTopicSchema`       | `ScoutingTopics`      | `scout-coordinator`                                                                            |
+| `ScoutingGapSchema`         | `ScoutingGap`         | (sub-schema of `ScoutingReviewSchema`)                                                         |
+| `ScoutingReviewSchema`      | `ScoutingReview`      | `scouting-reviewer`                                                                            |
+| `PlanSchema`                | `Plan`                | `planner` (written as `plan.json`, validated on read-back)                                     |
+| `PlanReviewSchema`          | `PlanReview`          | `plan-reviewer`                                                                                |
+| `ReviewResultSchema`        | `ReviewResult`        | `implement-reviewer` (via `reviewRunner` in `implementation.ts`)                               |
+| `FinalReviewTopicsSchema`   | `FinalReviewTopics`   | _(legacy; the single `final-reviewer` — superseded by the multi-dimensional review below)_     |
+| `FinalReviewResultSchema`   | `FinalReviewResult`   | the specialized final reviewers (efficiency / code-quality / ui-ux / security / documentation) |
+| `FinalReviewFindingSchema`  | `FinalReviewFinding`  | (sub-schema of `FinalReviewResultSchema`)                                                      |
+| `FinalReviewSeveritySchema` | `FinalReviewSeverity` | `low` \| `medium` \| `high` \| `critical`                                                      |
+| `TitleSchema`               | `{ title: string }`   | title generation (`initializationPhase`)                                                       |
 
 ### `steps.ts`
 
-Frozen `readonly StepDefinition[]` arrays used by the implementation `LanePool`:
+> **Legacy step definitions.** These `readonly StepDefinition[]` arrays are retained for
+> reference and backward compatibility, but the implementation phase (`implementation.ts`)
+> no longer consumes them directly. The runner tree (`resolveImplementationRunner`) is now
+> built from composed runners that reference the same profile IDs.
 
 ```ts
 export const CODE_STEPS: readonly StepDefinition[] = [
-    { name: 'write-tests',   profileId: 'test-writer',        isReadOnly: false },
-    { name: 'review-tests',  profileId: 'test-reviewer',      isReadOnly: true, schema: ReviewResultSchema },
-    { name: 'execute',       profileId: 'implementer',        isReadOnly: false },
-    { name: 'review',        profileId: 'implement-reviewer', isReadOnly: true, schema: ReviewResultSchema },
+  { name: "write-tests", profileId: "test-writer", isReadOnly: false },
+  {
+    name: "review-tests",
+    profileId: "test-reviewer",
+    isReadOnly: true,
+    schema: ReviewResultSchema,
+  },
+  { name: "execute", profileId: "implementer", isReadOnly: false },
+  {
+    name: "review",
+    profileId: "implement-reviewer",
+    isReadOnly: true,
+    schema: ReviewResultSchema,
+  },
 ];
 
 export const NON_CODE_STEPS: readonly StepDefinition[] = [
-    { name: 'execute',       profileId: 'implementer',        isReadOnly: false },
-    { name: 'review',        profileId: 'implement-reviewer', isReadOnly: true, schema: ReviewResultSchema },
+  { name: "execute", profileId: "implementer", isReadOnly: false },
+  {
+    name: "review",
+    profileId: "implement-reviewer",
+    isReadOnly: true,
+    schema: ReviewResultSchema,
+  },
 ];
 ```
 
-Code tasks (`is_code: true`) run test-first (4 steps). Non-code tasks skip the test
-steps (2 steps).
+The **runner-spec equivalents** used by `resolveImplementationRunner`:
+
+| Old step array    | New runner tree                                                            |
+| ----------------- | -------------------------------------------------------------------------- |
+| `CODE_STEPS`      | `linearRunner([singleSession(write-tests), reviewRunner(execute, review)])` |
+| `NON_CODE_STEPS`  | `reviewRunner(execute, review)`                                            |
+
+The `test-writer` session only runs for code tasks, ahead of the implement → review loop.
 
 ---
 
@@ -533,42 +677,30 @@ order:
 3. **Fresh tracker** — if the load fails with a `"Workflow state file not found"` error, a new
    `WorkflowStatusTracker(workDir)` is created and `resumed = false`. Any other error propagates.
 
-On resume, `RunState` is seeded from the tracker:
-
-| `RunState` field | Seeded from |
-|---|---|
-| `research` | `tracker.research ?? ""` |
-| `plan` | `undefined` (loaded lazily from `tracker.plan` inside `executePhase`) |
-| `scoutingReports` | `[]` (re-collected only if scouting re-runs) |
-| `scoutingRounds` | `0` |
-| `planningRounds` | `0` |
-| `planReviewFeedback` | `tracker.planReviewFeedback` |
-| `planReviewSuggestions` | `tracker.planReviewSuggestions` (copied) |
-
-The starting phase is determined by `tracker.currentPhase`:
+On resume, the starting phase is determined by `tracker.currentPhaseId`:
 
 ```ts
-let currentIndex = PHASES.indexOf(tracker.currentPhase as Phase);
-if (currentIndex < 0) {
-    currentIndex = 0;                    // fresh tracker — start at scouting
-    tracker.setCurrentPhase(PHASES[0]);
-}
+const startIndex = currentId
+  ? Math.max(0, PHASES.indexOf(currentId as Phase))
+  : 0;
+const runnerPhases = startIndex > 0 ? phases.slice(startIndex) : phases;
 ```
+
+Cross-phase data (`research`, `plan`, `scoutingFiles`, `scoutingReports`) is persisted to
+`workflowData` via `tracker.setWorkflowData(...)`. On resume, phase bodies lazily re-load
+it from the tracker into `ctx.state`:
+
+- `scouting` reads `scoutingRounds` / `scoutingGaps` from `ctx.state` (seeded by the
+  `onPhaseSettled` hook in prior rounds).
+- `planning` derives `research` from saved `workflowData.research` or
+  `workflowData.scoutingReports` (re-reviewing if necessary).
+- `implementing` loads the `plan` from `workflowData.plan`.
+- Session replay: `runSession` skips cached sessions (`.complete` sentinel + valid
+  `result.json`), so partially-completed tasks resume without re-running finished sessions.
 
 On a fresh run, `runSpir` generates an AI title via `initializationPhase` before entering the
-loop. On resume, it uses a truncated prompt as the sidebar title and skips AI generation:
+loop. On resume, it uses a truncated prompt as the sidebar title and skips AI generation.
 
-```ts
-if (resumed) {
-    const shortTitle = taskPrompt.length > 60 ? taskPrompt.slice(0, 57) + '...' : taskPrompt;
-    onStatus?.onSidebarUpdate?.({ title: shortTitle, ... });
-} else {
-    onStatus?.onSidebarUpdate?.({ title: 'Initializing...', indicator: '⚙', ... });
-    const title = await initializationPhase(profilesDirs, taskPrompt, cwd, apiKeys, onStatus, tracker);
-    onStatus?.onSidebarUpdate?.({ title, ... });
-}
-```
-
-If `signal.aborted` is detected before a phase starts, `runSpir` saves the tracker, emits
-`onWorkflowFailed`, and returns without rethrowing. Any other error is emitted via
-`onWorkflowFailed` and then rethrown.
+If `signal.aborted` is detected (thrown as `"Workflow cancelled"` by the `beforePhase` hook),
+`runSpir` saves the tracker, emits `onWorkflowFailed`, and returns without rethrowing. Any other
+error is emitted via `onWorkflowFailed` and then rethrown.

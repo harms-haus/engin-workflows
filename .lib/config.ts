@@ -1,4 +1,7 @@
-import type { StepDefinition, WorkflowRunOptions } from "@harms-haus/engin-engine";
+import type {
+  StepDefinition,
+  WorkflowRunOptions,
+} from "@harms-haus/engin-engine";
 
 // ─── Workflow Configuration ─────────────────────────────────────────────────
 //
@@ -12,35 +15,41 @@ import type { StepDefinition, WorkflowRunOptions } from "@harms-haus/engin-engin
  * profile (`profileId`) that knows how to assess that dimension.
  */
 export interface FinalReviewerConfig {
-    /** Agent profile id to load for this reviewer (e.g. 'efficiency-reviewer'). */
-    profileId: string;
-    /** Stable machine key for this dimension (e.g. 'efficiency', 'ui-ux'). Used to bucket review history across rounds. */
-    dimension: string;
-    /** Human-readable label shown in task titles / status (e.g. 'Efficiency'). */
-    label: string;
+  /** Agent profile id to load for this reviewer (e.g. 'efficiency-reviewer'). */
+  profileId: string;
+  /** Stable machine key for this dimension (e.g. 'efficiency', 'ui-ux'). Used to bucket review history across rounds. */
+  dimension: string;
+  /** Human-readable label shown in task titles / status (e.g. 'Efficiency'). */
+  label: string;
 }
 
 export interface WorkflowConfig {
-    name: string;
-    defaultMaxConcurrentTasks: number;
-    fixerSteps: StepDefinition[];
-    /**
-     * Specialized reviewers run in the final review phase. Each is invoked in
-     * parallel every round. When omitted, `final-review.ts` falls back to
-     * `DEFAULT_FINAL_REVIEWERS` (efficiency, code-quality, ui-ux, security).
-     */
-    finalReviewers?: FinalReviewerConfig[];
-    phases: { id: string; label: string; icon: string }[];
-    titleFormatter: (description: string) => string;
+  name: string;
+  defaultMaxConcurrentSessions: number;
+  /**
+   * Per-model concurrency limits applied by the RunnerPool. When a model id
+   * is present, the pool caps how many concurrent sessions use it. Omit (or
+   * pass `{}`) to let every model run unbounded (the RunnerPool's default).
+   */
+  modelConcurrency?: Record<string, number>;
+  fixerSteps: StepDefinition[];
+  /**
+   * Specialized reviewers run in the final review phase. Each is invoked in
+   * parallel every round. When omitted, `final-review.ts` falls back to
+   * `DEFAULT_FINAL_REVIEWERS` (efficiency, code-quality, ui-ux, security).
+   */
+  finalReviewers?: FinalReviewerConfig[];
+  phases: { id: string; label: string; icon: string }[];
+  titleFormatter: (description: string) => string;
 }
 
 // ─── Run Options ────────────────────────────────────────────────────────────
 
 export interface SpirRunOptions extends WorkflowRunOptions {
-    /** Preferred: list of profile directories to load agent profiles from. */
-    profilesDirs?: string[];
-    /** Legacy singular form; normalized to `profilesDirs: [profilesDir]` by `normalizeOptions`. */
-    profilesDir?: string;
+  /** Preferred: list of profile directories to load agent profiles from. */
+  profilesDirs?: string[];
+  /** Legacy singular form; normalized to `profilesDirs: [profilesDir]` by `normalizeOptions`. */
+  profilesDir?: string;
 }
 
 // ─── Options Normalization ─────────────────────────────────────────────────
@@ -52,7 +61,7 @@ export interface SpirRunOptions extends WorkflowRunOptions {
  * never mutated and no `any` cast is involved.
  */
 export function normalizeOptions(options: SpirRunOptions): SpirRunOptions {
-    const { profilesDir, profilesDirs, ...rest } = options;
-    const resolved = profilesDirs ?? (profilesDir ? [profilesDir] : undefined);
-    return resolved ? { ...rest, profilesDirs: resolved } : rest;
+  const { profilesDir, profilesDirs, ...rest } = options;
+  const resolved = profilesDirs ?? (profilesDir ? [profilesDir] : undefined);
+  return resolved ? { ...rest, profilesDirs: resolved } : rest;
 }

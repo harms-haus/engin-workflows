@@ -10,7 +10,7 @@ describe('WorkflowConfig', () => {
     // Type-level check: a concrete object must satisfy the interface
     const config: WorkflowConfig = {
       name: 'test-workflow',
-      defaultMaxConcurrentTasks: 3,
+      defaultMaxConcurrentSessions: 3,
       fixerSteps: [{ name: 'fix', profileId: 'fixer', isReadOnly: false }],
       phases: [
         { id: 'scouting', label: 'Scouting', icon: '🔍' },
@@ -32,7 +32,7 @@ describe('WorkflowConfig', () => {
   it('phases accepts a single-element array', () => {
     const config: WorkflowConfig = {
       name: 'minimal',
-      defaultMaxConcurrentTasks: 1,
+      defaultMaxConcurrentSessions: 1,
       fixerSteps: [],
       phases: [{ id: 'only', label: 'Only Phase', icon: '➡' }],
       titleFormatter: (d: string) => d,
@@ -43,7 +43,7 @@ describe('WorkflowConfig', () => {
   it('phases accepts an empty array', () => {
     const config: WorkflowConfig = {
       name: 'empty',
-      defaultMaxConcurrentTasks: 1,
+      defaultMaxConcurrentSessions: 1,
       fixerSteps: [],
       phases: [],
       titleFormatter: (d: string) => d,
@@ -54,7 +54,7 @@ describe('WorkflowConfig', () => {
   it('each phase entry has id, label, and icon as strings', () => {
     const config: WorkflowConfig = {
       name: 'typed',
-      defaultMaxConcurrentTasks: 2,
+      defaultMaxConcurrentSessions: 2,
       fixerSteps: [],
       phases: [
         { id: 'a', label: 'Alpha', icon: 'α' },
@@ -74,13 +74,14 @@ describe('WorkflowConfig', () => {
     // We construct a WorkflowConfig with phases and confirm no sidebarPhases key.
     const config: WorkflowConfig = {
       name: 'test',
-      defaultMaxConcurrentTasks: 1,
+      defaultMaxConcurrentSessions: 1,
       fixerSteps: [],
       phases: [],
       titleFormatter: (d: string) => d,
     };
     // @ts-expect-error — sidebarPhases should no longer exist on WorkflowConfig
     const _check: typeof config.sidebarPhases = undefined;
+
     expect(_check).toBeUndefined();
   });
 });
@@ -91,7 +92,7 @@ describe('WorkflowConfig.finalReviewers', () => {
   it('is optional (config without it still satisfies the interface)', () => {
     const config: WorkflowConfig = {
       name: 'no-reviewers',
-      defaultMaxConcurrentTasks: 1,
+      defaultMaxConcurrentSessions: 1,
       fixerSteps: [],
       phases: [],
       titleFormatter: (d: string) => d,
@@ -106,7 +107,7 @@ describe('WorkflowConfig.finalReviewers', () => {
     ];
     const config: WorkflowConfig = {
       name: 'with-reviewers',
-      defaultMaxConcurrentTasks: 5,
+      defaultMaxConcurrentSessions: 5,
       fixerSteps: [],
       finalReviewers: reviewers,
       phases: [],
@@ -115,6 +116,60 @@ describe('WorkflowConfig.finalReviewers', () => {
     expect(config.finalReviewers).toHaveLength(2);
     expect(config.finalReviewers![0].profileId).toBe('efficiency-reviewer');
     expect(config.finalReviewers![1].dimension).toBe('ui-ux');
+  });
+});
+
+// ─── WorkflowConfig: modelConcurrency field ───────────────────────────────
+
+describe('WorkflowConfig.modelConcurrency', () => {
+  it('is optional (config without it still satisfies the interface)', () => {
+    const config: WorkflowConfig = {
+      name: 'no-model-concurrency',
+      defaultMaxConcurrentSessions: 3,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+    };
+    // Accessing it on a concrete object yields undefined at runtime
+    expect((config as Record<string, unknown>).modelConcurrency).toBeUndefined();
+  });
+
+  it('accepts a Record<string, number>', () => {
+    const config: WorkflowConfig = {
+      name: 'with-model-concurrency',
+      defaultMaxConcurrentSessions: 3,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+      modelConcurrency: { 'claude-sonnet-4-20250514': 2 },
+    };
+    expect(config.modelConcurrency).toEqual({ 'claude-sonnet-4-20250514': 2 });
+  });
+
+  it('accepts an empty record', () => {
+    const config: WorkflowConfig = {
+      name: 'empty-model-concurrency',
+      defaultMaxConcurrentSessions: 3,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+      modelConcurrency: {},
+    };
+    expect(config.modelConcurrency).toEqual({});
+  });
+
+  it('accepts multiple entries', () => {
+    const config: WorkflowConfig = {
+      name: 'multi-model-concurrency',
+      defaultMaxConcurrentSessions: 3,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+      modelConcurrency: { 'model-a': 1, 'model-b': 2, 'model-c': 3 },
+    };
+    expect(config.modelConcurrency).toHaveProperty('model-a');
+    expect(config.modelConcurrency).toHaveProperty('model-c');
+    expect(config.modelConcurrency['model-b']).toBe(2);
   });
 });
 

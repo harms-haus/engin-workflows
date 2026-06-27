@@ -46,13 +46,16 @@ This workflow improves an *existing* codebase. Its job is to find and fix concre
 2. **Code smells** — long parameter lists, deep nesting, primitive obsession, feature envy, etc.
 3. **Monolith files** — oversized files or files mixing unrelated responsibilities.
 4. **God functions** — overly long or many-responsibility functions.
-5. **Timely comments** — comments describing past/"old way" behavior ("previously…", "used to…", "legacy") rather than the current code.
+5. **Timely / tracker / past-rationale comments** — comments describing past/"old way" behavior ("previously…", "used to…", "legacy"), tracker IDs (`task #` / `issue #` / ticket refs), or explaining *why it was done* rather than *why it IS* (current truth).
 6. **Misleading names** — identifiers whose names don't match what they do.
 7. **Name/file mismatches** — a type/function whose name doesn't match the file it's defined in or exported from.
 8. **Tautological / useless tests** — tests asserting nothing, always passing, or duplicating others.
 9. **Duplicate code** — repeated logic that belongs in a shared utility/system.
 10. **Magic values** — literal numbers/strings that should be named constants.
+11. **Shorthand hiding core behavior** — critical logic written as dense/overly-clever one-liners where an explicit form reads better; reserve terseness for small, low-stakes steps.
+12. **Useless barrels & mis-routed imports** — passthrough re-export modules (no added value) and imports routed through them instead of the real source.
+13. **Verbose / redundant comments** — comments restating obvious code; prefer self-documenting code and comment only the non-obvious (public-API docstrings excluded).
 
-Example topic shapes: "Audit `src/auth/` for dead code, code smells, and god functions"; "Scan the test suite for dead/tautological tests"; "Find duplicate logic and magic values across `src/utils/`". Keep respecting your rules: ≤5 topics, minimal overlap, specific file sets, justified.
+Example topic shapes: "Audit `src/auth/` for dead code, code smells, and god functions"; "Scan the test suite for dead/tautological tests"; "Find duplicate logic and magic values across `src/utils/`"; "Trace `src/barrel/` re-exports, flag useless barrels, and list imports to re-route to the real source". Keep respecting your rules: ≤5 topics, minimal overlap, specific file sets, justified.
 
 **Report your topics as a structured JSON object:** Respond with valid JSON matching the schema provided in the prompt.

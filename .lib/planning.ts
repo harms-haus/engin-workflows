@@ -1,9 +1,22 @@
-import type { RendererRegistry, StatusCallbacks, WorkflowRunOptions, WorkflowStatusTracker } from "@harms-haus/engin-engine";
-import { ensureDir, parseJsonWithRepair, runMultiStepTask, schemaToString } from "@harms-haus/engin-engine";
+import type {
+  RendererRegistry,
+  StatusCallbacks,
+  WorkflowRunOptions,
+  WorkflowStatusTracker,
+} from "@harms-haus/engin-engine";
+import {
+  DEFAULT_MAX_ROUNDS,
+  RunnerPool,
+  TaskTracker,
+  ensureDir,
+  parseJsonWithRepair,
+  reviewRunner,
+  schemaToString,
+} from "@harms-haus/engin-engine";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PlanSchema, PlanReviewSchema } from "./schemas";
-import type { Plan, PlanReview } from "./schemas";
+import type { Plan } from "./schemas";
 
 // ─── Plan artifact paths ───────────────────────────────────────────────────
 //
@@ -14,12 +27,12 @@ import type { Plan, PlanReview } from "./schemas";
 
 /** Directory holding durable artifacts for a run (created on demand). */
 export function getArtifactsDir(workDir: string): string {
-    return join(workDir, "artifacts");
+  return join(workDir, "artifacts");
 }
 
 /** Absolute path to the plan JSON artifact for a run. */
 export function getPlanPath(workDir: string): string {
-    return join(getArtifactsDir(workDir), "plan.json");
+  return join(getArtifactsDir(workDir), "plan.json");
 }
 
 // ─── Phase 3: Planning ──────────────────────────────────────────────────────
@@ -45,37 +58,41 @@ const PLAN_SHAPE_EXAMPLE = `{
  *
  * Returns `{ plan }` on success, or `{ error }` with a clear, actionable
  * message when the file is missing, unparseable, or fails `PlanSchema`
- * validation. Returning the error (rather than throwing) lets the planner's
- * `validateOutput` retry gate feed it back to the agent.
+ * validation. Returning the error (rather than throwing) lets the orchestrator
+ * surface it or fall back to the last captured plan.
  */
-async function readAndValidatePlan(planPath: string): Promise<{ plan: Plan } | { error: string }> {
-    let raw: string;
-    try {
-        raw = await readFile(planPath, "utf-8");
-    } catch {
-        return {
-            error:
-                `No plan file found at ${planPath}. You must use the \`write\` tool to create it ` +
-                `(you are sandboxed to the artifacts directory).`,
-        };
-    }
+async function readAndValidatePlan(
+  planPath: string,
+): Promise<{ plan: Plan } | { error: string }> {
+  let raw: string;
+  try {
+    raw = await readFile(planPath, "utf-8");
+  } catch {
+    return {
+      error:
+        `No plan file found at ${planPath}. You must use the \`write\` tool to create it ` +
+        `(you are sandboxed to the artifacts directory).`,
+    };
+  }
 
-    let parsed: unknown;
-    try {
-        parsed = parseJsonWithRepair(raw);
-    } catch (err: unknown) {
-        return {
-            error:
-                `The plan file at ${planPath} is not valid JSON: ` +
-                (err instanceof Error ? err.message : String(err)),
-        };
-    }
+  let parsed: unknown;
+  try {
+    parsed = parseJsonWithRepair(raw);
+  } catch (err: unknown) {
+    return {
+      error:
+        `The plan file at ${planPath} is not valid JSON: ` +
+        (err instanceof Error ? err.message : String(err)),
+    };
+  }
 
-    const result = PlanSchema.safeParse(parsed);
-    if (!result.success) {
-        return { error: `The plan file at ${planPath} failed schema validation: ${result.error.message}` };
-    }
-    return { plan: result.data };
+  const result = PlanSchema.safeParse(parsed);
+  if (!result.success) {
+    return {
+      error: `The plan file at ${planPath} failed schema validation: ${result.error.message}`,
+    };
+  }
+  return { plan: result.data };
 }
 
 /**
@@ -84,204 +101,213 @@ async function readAndValidatePlan(planPath: string): Promise<{ plan: Plan } | {
  * Unlike most agents, the planner does NOT respond with structured output.
  * Instead it WRITES its plan to a JSON artifact at `getPlanPath(workDir)` using
  * the `write` tool, confined by a write sandbox to the run's `artifacts`
- * directory. This function runs the planner, then reads and validates that
- * artifact back into a typed `Plan`.
+ * directory.
+ *
+ * Plan + plan-review run as a `reviewRunner` (execute → review loop): the
+ * planner writes plan.json (filesystem output mode) and the plan-reviewer
+ * evaluates it (structured output `{ approved, feedback }`). When the reviewer
+ * rejects, the reviewRunner appends the feedback to the planner prompt and
+ * retries — up to `DEFAULT_MAX_ROUNDS` times. The runner is dispatched through
+ * a `RunnerPool` so the engine's hook pipeline (default auditor,
+ * `beforeStepPrompt` file inlining, etc.) fires for every session.
  *
  * `files` is the list of key files the scouting review surfaced for this task.
- * Rather than inlining their contents locally (the old duplicated
- * per-file inlining path), they are handed to `runMultiStepTask` as
- * `files` on the task object so the ENGINE's default `beforeStepPrompt` /
- * `collectContext` hooks inline them — eliminating the duplicated inlining
- * logic. `hookRegistry` must be threaded for that default to actually fire.
+ * They are threaded onto the planning task so the ENGINE's default
+ * `beforeStepPrompt` / `collectContext` hooks inline them — eliminating any
+ * local inlining duplication. `hookRegistry` must be threaded for that default
+ * to actually fire.
  */
 export async function planningPhase(
-    tracker: WorkflowStatusTracker,
-    profilesDirs: string[],
-    research: string,
-    files: string[],
-    taskPrompt: string,
-    cwd: string,
-    workDir: string,
-    apiKeys?: Record<string, string>,
-    onStatus?: StatusCallbacks,
-    signal?: AbortSignal,
-    rendererRegistry?: RendererRegistry,
-    hookRegistry?: WorkflowRunOptions["hookRegistry"],
+  tracker: WorkflowStatusTracker,
+  profilesDirs: string[],
+  research: string,
+  files: string[],
+  taskPrompt: string,
+  cwd: string,
+  workDir: string,
+  apiKeys?: Record<string, string>,
+  onStatus?: StatusCallbacks,
+  signal?: AbortSignal,
+  rendererRegistry?: RendererRegistry,
+  hookRegistry?: WorkflowRunOptions["hookRegistry"],
 ): Promise<Plan> {
-    const artifactsDir = getArtifactsDir(workDir);
-    const planPath = getPlanPath(workDir);
-    await ensureDir(artifactsDir);
+  const artifactsDir = getArtifactsDir(workDir);
+  const planPath = getPlanPath(workDir);
+  await ensureDir(artifactsDir);
 
-    const promptLines: string[] = [
-        "You are a planning agent. Based on the research below, create a detailed implementation plan.",
-        "",
-        `Task: ${taskPrompt}`,
-        "",
-        "Research findings:",
-        research,
-    ];
+  const planPrompt = buildPlanPrompt({
+    taskPrompt,
+    research,
+    planPath,
+    artifactsDir,
+  });
+  const reviewPrompt = buildPlanReviewPrompt({
+    taskPrompt,
+    research,
+    planPath,
+  });
 
-    promptLines.push(
-        "",
-        "Create a plan with specific tasks. Each task should be independently implementable.",
-        "",
-        "## How to deliver your plan",
-        `You MUST write your plan as a JSON file at: \`${planPath}\``,
-        `Use the \`write\` tool to create that file. You are sandboxed: you may ONLY create or modify files under \`${artifactsDir}\`. Any attempt to write elsewhere will be rejected.`,
-        "Do NOT output the plan as text in your response — write it to the file. After writing it, reply with a single short line confirming the path.",
-        "",
-        "The JSON file must match this shape:",
-        "```json",
-        PLAN_SHAPE_EXAMPLE,
-        "```",
-        "Full schema:",
-        "```",
-        schemaToString(PlanSchema),
-        "```",
-    );
+  // Compose the execute (plan) → review (plan-review) loop. The planner uses
+  // filesystem output mode (it writes plan.json via the `write` tool); the
+  // reviewer uses structured output mode with PlanReviewSchema
+  // ({ approved, feedback }). The reviewRunner owns the replan-on-rejection
+  // loop internally — it checks `result.data.approved === true` and appends
+  // feedback to the execute prompt on rejection.
+  const runner = reviewRunner(
+    {
+      profile: "planner",
+      prompt: planPrompt,
+      outputMode: "filesystem",
+      isReadOnly: false,
+      role: "plan",
+      runnerRole: "plan",
+      attempt: 1,
+    },
+    {
+      profile: "plan-reviewer",
+      prompt: reviewPrompt,
+      outputMode: "structured",
+      schema: PlanReviewSchema,
+      isReadOnly: true,
+      role: "review-plan",
+      runnerRole: "review-plan",
+      attempt: 1,
+    },
+    { maxRounds: DEFAULT_MAX_ROUNDS },
+  );
 
-    const prompt = promptLines.join("\n");
+  // Register the planning task. Scouting files are threaded onto the task so
+  // the engine's default `beforeStepPrompt` hook inlines them into both the
+  // planner and plan-reviewer prompts (no local inlining duplication).
+  const taskTracker = new TaskTracker();
+  taskTracker.addTask({
+    id: "planning",
+    title: "Plan & Review",
+    prompt: taskPrompt,
+    profile: "planner",
+    files,
+    dependencies: [],
+    phaseId: "planning",
+  });
 
-    // Plan + plan-review run as TWO STEPS of ONE task (matching the
-    // implementation phase's per-step-agent model). The review step gates the
-    // plan step: when the reviewer rejects, runMultiStepTask backs up to the
-    // plan step, appends the reviewer's feedback to the planner prompt, and
-    // retries — up to maxStepRetries times. This single call therefore owns the
-    // entire plan → review → replan loop (no orchestrator-level round counter).
-    //
-    // Step 1 (plan): the planner WRITES plan.json (no structured output). The
-    // `validateOutput` gate reads it back, validates it against PlanSchema, and
-    // on failure re-prompts the planner within the same session. The validated
-    // plan is captured via closure.
-    //
-    // Step 2 (review-plan): the reviewer's prompt is a function evaluated at
-    // run time, so it reads the plan artifact AFTER the planner has written it.
-    // It approves / rejects via the PlanReview schema.
-    let plan: Plan | undefined;
-    const planStep = {
-        stepName: "plan",
-        profileId: "planner",
-        prompt,
-        isReadOnly: false,
-        allowedWriteDirs: [artifactsDir],
-        validateOutput: async () => {
-            const res = await readAndValidatePlan(planPath);
-            if ("plan" in res) {
-                plan = res.plan;
-                return;
-            }
-            return { error: res.error };
-        },
-    };
+  const pool = new RunnerPool({
+    maxConcurrentSessions: 1,
+    modelConcurrency: {},
+    profilesDirs,
+    sessionBaseDir: join(workDir, "sessions", "planning"),
+    cwd,
+    apiKeys,
+    onStatus,
+    signal,
+    rendererRegistry,
+    hookRegistry,
+    phaseId: "planning",
+    taskTracker,
+    getRunnerForTask: () => runner,
+  });
 
-    const reviewStep = {
-        stepName: "review-plan",
-        profileId: "plan-reviewer",
-        prompt: async () =>
-            buildPlanReviewPrompt({ taskPrompt, research, planPath }),
-        isReadOnly: true,
-        schema: PlanReviewSchema,
-        isApproved: (r: unknown) => (r as PlanReview).ready === true,
-        getFeedback: (r: unknown) => {
-            const rv = r as PlanReview;
-            const parts = [rv.feedback];
-            if (rv.suggestions && rv.suggestions.length > 0) {
-                parts.push("Specific suggestions:", ...rv.suggestions.map((s) => `- ${s}`));
-            }
-            return parts.join("\n");
-        },
-    };
+  const { completedTasks, failedTasks } = await pool.run();
 
-    const { results, approved } = await runMultiStepTask({
-        profilesDirs,
-        phaseId: "planning",
-        taskId: "planning",
-        title: "Plan & Review",
-        steps: [planStep, reviewStep],
-        cwd,
-        apiKeys,
-        onStatus,
-        signal,
-        rendererRegistry,
-        // Thread the scouting files onto the task so the engine's default
-        // `beforeStepPrompt` / `collectContext` hooks inline them into BOTH the
-        // planner and plan-reviewer prompts (no local inlining duplication).
-        // `hookRegistry` carries the default subscribers that actually fire it.
-        files,
-        hookRegistry,
-        maxStepRetries: 3,
-    });
+  // Read back and validate the plan artifact. On review exhaustion (the
+  // reviewer never approved) we proceed anyway with the latest plan —
+  // mirroring the prior "exhausted rounds → proceed anyway" behaviour.
+  const res = await readAndValidatePlan(planPath);
+  if (!("plan" in res)) {
+    throw new Error(res.error);
+  }
+  const validatedPlan = res.plan;
 
-    // The plan step's validateOutput gate guarantees `plan` is set once the
-    // task reaches the review step. On exhaustion (review never approved) we
-    // proceed anyway with the latest captured plan — mirroring the prior
-    // "exhausted rounds → proceed anyway" behaviour.
-    const validatedPlan: Plan =
-        plan ?? (() => { throw new Error("Planning completed without a validated plan"); })();
+  tracker.setWorkflowData({ plan: validatedPlan });
 
-    tracker.setWorkflowData({ plan: validatedPlan });
+  // Surface the final review outcome for the TUI store. The durable AuditLog
+  // equivalent is produced by the engine's default auditor (registered in
+  // runSpir against the threaded hookRegistry), so no manual audit append
+  // lives here.
+  const approved = failedTasks === 0 && completedTasks > 0;
+  onStatus?.onDecision?.({
+    agentId: "plan-reviewer",
+    decision: approved ? "plan_approved" : "plan_rejected",
+    reasoning: "",
+  });
 
-    // Surface the final review outcome for the TUI store. (Per-rejection
-    // "step rejected" decisions are already fired by runMultiStepTask.) The
-    // durable AuditLog equivalent is produced by the engine's default auditor
-    // (registered in runSpir against the threaded hookRegistry), so no manual
-    // audit append lives here.
-    const finalReview = results[1] as PlanReview | undefined;
-    const decision = approved ? "plan_approved" : "plan_rejected";
-    const reasoning = finalReview?.feedback ?? "";
-    onStatus?.onDecision?.({ agentId: "plan-reviewer", decision, reasoning });
-
-    return validatedPlan;
+  return validatedPlan;
 }
 
-// ─── Plan Review prompt builder ─────────────────────────────────────────────
+// ─── Prompt builders ────────────────────────────────────────────────────────
 
 /**
- * Build the plan-reviewer prompt. Reads the plan artifact the planner wrote
- * (`planPath`) at CALL time and inlines it verbatim, so the reviewer sees the
- * exact file currently on disk. This is why the review step's prompt is a
- * function evaluated lazily by `runMultiStepTask` rather than built up front:
- * the plan file does not exist until the planner step has run.
+ * Build the planner prompt. Instructs the planner to write the plan as a JSON
+ * file to `planPath` using the `write` tool, sandboxed to `artifactsDir`.
  *
- * Throws when no plan file exists yet (the plan step should have written it).
+ * Scouting file context is NOT inlined here — it is threaded onto the task's
+ * `files` and inlined by the engine's default `beforeStepPrompt` hook.
  */
-async function buildPlanReviewPrompt(opts: {
-    taskPrompt: string;
-    research: string;
-    planPath: string;
-}): Promise<string> {
-    let planText: string;
-    try {
-        planText = await readFile(opts.planPath, "utf-8");
-    } catch {
-        throw new Error(
-            `Cannot review the plan: no plan file found at ${opts.planPath}. ` +
-                `The planning phase must have written it first.`,
-        );
-    }
+function buildPlanPrompt(opts: {
+  taskPrompt: string;
+  research: string;
+  planPath: string;
+  artifactsDir: string;
+}): string {
+  const promptLines: string[] = [
+    "You are a planning agent. Based on the research below, create a detailed implementation plan.",
+    "",
+    `Task: ${opts.taskPrompt}`,
+    "",
+    "Research findings:",
+    opts.research,
+  ];
 
-    const prompt = [
-        "You are reviewing an implementation plan. Evaluate it for completeness, correctness, and feasibility.",
-        "",
-        `Task: ${opts.taskPrompt}`,
-        "",
-        "Research context:",
-        opts.research,
-    ];
+  promptLines.push(
+    "",
+    "Create a plan with specific tasks. Each task should be independently implementable.",
+    "",
+    "## How to deliver your plan",
+    `You MUST write your plan as a JSON file at: \`${opts.planPath}\``,
+    `Use the \`write\` tool to create that file. You are sandboxed: you may ONLY create or modify files under \`${opts.artifactsDir}\`. Any attempt to write elsewhere will be rejected.`,
+    "Do NOT output the plan as text in your response — write it to the file. After writing it, reply with a single short line confirming the path.",
+    "",
+    "The JSON file must match this shape:",
+    "```json",
+    PLAN_SHAPE_EXAMPLE,
+    "```",
+    "Full schema:",
+    "```",
+    schemaToString(PlanSchema),
+    "```",
+  );
 
-    // NOTE: scouting file context is NOT inlined here. It is threaded onto the
-    // task's `files` and inlined by the engine's default `beforeStepPrompt`
-    // hook (same path as the planner prompt), so there is no local duplication.
+  return promptLines.join("\n");
+}
 
-    prompt.push(
-        "",
-        "Proposed plan (written by the planner):",
-        "```json",
-        planText.trim(),
-        "```",
-        "",
-        "Approve the plan if it's sound, or provide specific feedback for improvement.",
-    );
-
-    return prompt.join("\n");
+/**
+ * Build the plan-reviewer prompt. The reviewer is told where the planner wrote
+ * the plan (`planPath`) and instructed to read and evaluate it.
+ *
+ * This prompt is built eagerly (before the reviewRunner executes the planner).
+ * The plan file does not exist yet at build time — the reviewRunner runs the
+ * planner first, then feeds the execute result into the review prompt. For
+ * filesystem output mode the reviewRunner appends a note indicating the
+ * planner wrote files; the reviewer reads `planPath` via its read tools.
+ *
+ * Scouting file context is NOT inlined here — same delegation path as the
+ * planner prompt (task `files` → engine `beforeStepPrompt` hook).
+ */
+function buildPlanReviewPrompt(opts: {
+  taskPrompt: string;
+  research: string;
+  planPath: string;
+}): string {
+  return [
+    "You are reviewing an implementation plan. Evaluate it for completeness, correctness, and feasibility.",
+    "",
+    `Task: ${opts.taskPrompt}`,
+    "",
+    "Research context:",
+    opts.research,
+    "",
+    `The planner has written the proposed plan to: \`${opts.planPath}\``,
+    "Read that file and evaluate it carefully.",
+    "",
+    "Approve the plan if it's sound, or provide specific feedback for improvement.",
+  ].join("\n");
 }

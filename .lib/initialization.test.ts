@@ -1,19 +1,52 @@
-// ─── Initialization Phase Tests ─────────────────────────────────────────────
+// ─── Initialization Phase Tests (kb-12) ───────────────────────────────────
 //
-// Tests for initialization.ts: adoption of runStepTask for title generation,
-// phaseId threading, try/catch fallback, and import updates.
+// Tests for initialization.ts: out-of-phase gate.run + runSession replacing
+// the old runStepTask call for title generation.
+//
+// Desired flow:
+//   1. Build a SessionGate({total:1, perModel:{}})
+//   2. Build a SessionSpec (title-gen prompt, outputMode:'structured',
+//      schema = TitleSchema, runnerRole:'title-gen', attempt:1)
+//   3. Load the scout profile and call gate.run(profile, async () =>
+//      runSession({spec, sessionBaseDir, cwd, phaseId, agentId, profiles, ...}))
+//   4. Extract title (and branchName) from the structured result
+//   5. Return the title string; fall back to truncated prompt on error
+//
+// The title-gen is a META concern — it runs OUT-OF-PHASE (no RunnerPool,
+// no TaskTracker), invisible to the task UI, no worktree.
 // ────────────────────────────────────────────────────────────────────────────
 
 import { describe, expect, it, jest, mock, beforeEach } from 'bun:test';
 import { createEnginMock } from './engin-mock';
 
 // ─── Mock @harms-haus/engin ────────────────────────────────────────────────
-const mockRunStepTask = jest.fn<(opts: any) => Promise<{ title: string }>>();
-const mockOnTaskRejected = jest.fn<() => void>();
+//
+// We mock the engine's full surface via createEnginMock() then override the
+// symbols relevant to the title-gen session flow:
+//   - runSession:  spy returning a structured SessionResult
+//   - SessionGate: spy on constructor + gate.run
+//   - runStepTask: spy that MUST NOT be called (asserting the old path is gone)
+
+// Mock gate.run: when called, invoke the callback so the inner runSession is executed.
+const mockGateRun = jest.fn<(profile: any, fn: (h: { signal: AbortSignal }) => Promise<unknown>) => Promise<unknown>>();
+mockGateRun.mockImplementation(async (_profile, fn) => fn({ signal: new AbortController().signal }));
+
+// Mock SessionGate constructor: track construction and return a gate with the mock .run.
+const MockSessionGate = jest.fn<(opts: any) => { run: typeof mockGateRun }>();
+(MockSessionGate as unknown as ReturnType<typeof jest.fn>).mockImplementation(() => ({ run: mockGateRun }));
+
+// Mock runSession: tracks calls and returns a structured result by default.
+const mockRunSession = jest.fn<(ctx: any) => Promise<{ mode: string; data: Record<string, unknown> }>>();
+mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'The Title', branchName: 'the-branch' } });
+
+// Spy on runStepTask — the new code MUST NOT call it.
+const mockRunStepTask = jest.fn<(opts: any) => Promise<unknown>>();
 
 mock.module('@harms-haus/engin-engine', () => ({
   ...createEnginMock(),
-  // runStepTask is the key replacement for the old createHarness + promptForStructured sequence
+  // Override with per-test spies
+  SessionGate: MockSessionGate,
+  runSession: mockRunSession,
   runStepTask: mockRunStepTask,
 }));
 
@@ -32,189 +65,385 @@ function makeMockTracker() {
   } as never;
 }
 
-// ─── runStepTask Usage ──────────────────────────────────────────────────────
+// ─── Out-of-phase gate.run + runSession flow (kb-12) ──────────────────────
 
-describe('initializationPhase — runStepTask usage', () => {
+describe('initializationPhase — out-of-phase gate.run + runSession', () => {
   beforeEach(() => {
+    mockRunSession.mockClear();
     mockRunStepTask.mockClear();
+    mockGateRun.mockClear();
+    (MockSessionGate as unknown as ReturnType<typeof jest.fn>).mockClear();
   });
 
-  it('calls runStepTask with phaseId: "initialization"', async () => {
+  // ── 1. SessionGate construction ─────────────────────────────────────────
+
+  it('constructs a SessionGate with total:1 and perModel:{}', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'My Feature Title' });
+    // Give runSession the default resolved value
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
 
-    await initializationPhase(
-      ['/profiles'],
-      'Implement the new feature',
-      '/cwd',
-      undefined,
-      undefined,
-      tracker,
-    );
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        undefined,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow — old code may throw; we only care about the construction assertion
+    }
 
-    expect(mockRunStepTask).toHaveBeenCalledTimes(1);
-    const callOpts = mockRunStepTask.mock.calls[0][0];
-    expect(callOpts).toHaveProperty('phaseId', 'initialization');
+    expect(MockSessionGate).toHaveBeenCalledWith({ total: 1, perModel: {} });
   });
 
-  it('calls runStepTask with taskId: "title-generator"', async () => {
+  it('calls gate.run with a resolved profile for the title-gen agent', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'My Feature Title' });
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
 
-    await initializationPhase(
-      ['/profiles'],
-      'Implement the new feature',
-      '/cwd',
-      undefined,
-      undefined,
-      tracker,
-    );
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        undefined,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
 
-    const callOpts = mockRunStepTask.mock.calls[0][0]!;
-    expect(callOpts).toHaveProperty('taskId', 'title-generator');
+    // gate.run must have been called at least once
+    expect(mockGateRun).toHaveBeenCalled();
+    // The first argument is the resolved AgentProfile — should have provider and model
+    const profileArg = mockGateRun.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    if (profileArg) {
+      expect(profileArg).toHaveProperty('provider');
+      expect(profileArg).toHaveProperty('model');
+    }
   });
 
-  it('calls runStepTask with stepName: "generate-title"', async () => {
+  // ── 2. runSession is called (not runStepTask) ───────────────────────────
+
+  it('calls runSession for title generation (new path)', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'My Feature Title' });
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
 
-    await initializationPhase(
-      ['/profiles'],
-      'Implement the new feature',
-      '/cwd',
-      undefined,
-      undefined,
-      tracker,
-    );
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        undefined,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
 
-    const callOpts = mockRunStepTask.mock.calls[0][0]!;
-    expect(callOpts).toHaveProperty('stepName', 'generate-title');
+    // runSession MUST be called (new path)
+    expect(mockRunSession).toHaveBeenCalled();
   });
 
-  it('calls runStepTask with profileId: "scout"', async () => {
+  it('does NOT call runStepTask (old path removed)', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'My Feature Title' });
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
 
-    await initializationPhase(
-      ['/profiles'],
-      'Implement the new feature',
-      '/cwd',
-      undefined,
-      undefined,
-      tracker,
-    );
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        undefined,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
 
-    const callOpts = mockRunStepTask.mock.calls[0][0]!;
-    expect(callOpts).toHaveProperty('profileId', 'scout');
+    // runStepTask MUST NOT be called — the old runStepTask path is removed
+    expect(mockRunStepTask).not.toHaveBeenCalled();
   });
 
-  it('passes the task prompt as the prompt to runStepTask', async () => {
+  // ── 3. SessionSpec properties ───────────────────────────────────────────
+
+  it('passes a SessionSpec with runnerRole:"title-gen" to runSession', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'My Feature Title' });
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
 
-    const taskPrompt = 'Implement a user authentication system with OAuth2 support';
-    await initializationPhase(
-      ['/profiles'],
-      taskPrompt,
-      '/cwd',
-      undefined,
-      undefined,
-      tracker,
-    );
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        undefined,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
 
-    const callOpts = mockRunStepTask.mock.calls[0][0]!;
-    expect(callOpts).toHaveProperty('prompt');
-    expect(callOpts.prompt).toContain(taskPrompt);
+    expect(mockRunSession).toHaveBeenCalled();
+    const ctx = mockRunSession.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    expect(ctx).toBeDefined();
+    const spec = ctx!.spec as Record<string, unknown>;
+    expect(spec.runnerRole).toBe('title-gen');
   });
 
-  it('passes TitleSchema as the schema to runStepTask', async () => {
+  it('passes a SessionSpec with attempt:1', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'My Feature Title' });
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
 
-    await initializationPhase(
-      ['/profiles'],
-      'Implement the new feature',
-      '/cwd',
-      undefined,
-      undefined,
-      tracker,
-    );
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        undefined,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
 
-    const callOpts = mockRunStepTask.mock.calls[0][0]!;
-    // TitleSchema should be passed as schema (imported from ./schemas)
-    expect(callOpts).toHaveProperty('schema');
-    expect(callOpts.schema).toBeDefined();
+    expect(mockRunSession).toHaveBeenCalled();
+    const ctx = mockRunSession.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    const spec = ctx!.spec as Record<string, unknown>;
+    expect(spec.attempt).toBe(1);
   });
 
-
-
-  it('passes apiKeys and onStatus through to runStepTask', async () => {
+  it('passes a SessionSpec with outputMode:"structured"', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'My Feature Title' });
-    const onStatus = { onAgentSpawn: jest.fn() };
-    const apiKeys = { ANTHROPIC: 'sk-test' };
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
 
-    await initializationPhase(
-      ['/profiles'],
-      'Implement the new feature',
-      '/cwd',
-      apiKeys,
-      onStatus as never,
-      tracker,
-    );
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        undefined,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
 
-    const callOpts = mockRunStepTask.mock.calls[0][0]!;
-    expect(callOpts).toHaveProperty('apiKeys', apiKeys);
-    expect(callOpts).toHaveProperty('onStatus', onStatus);
+    expect(mockRunSession).toHaveBeenCalled();
+    const ctx = mockRunSession.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    const spec = ctx!.spec as Record<string, unknown>;
+    expect(spec.outputMode).toBe('structured');
   });
 
-  it('passes cwd, profilesDirs, and isReadOnly: true to runStepTask', async () => {
+  it('passes a schema (TitleSchema or similar) in the SessionSpec', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'My Feature Title' });
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
 
-    await initializationPhase(
-      ['/profiles/a', '/profiles/b'],
-      'Implement the new feature',
-      '/my-cwd',
-      undefined,
-      undefined,
-      tracker,
-    );
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        undefined,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
 
-    const callOpts = mockRunStepTask.mock.calls[0][0]!;
-    expect(callOpts).toHaveProperty('profilesDirs', ['/profiles/a', '/profiles/b']);
-    expect(callOpts).toHaveProperty('cwd', '/my-cwd');
-    expect(callOpts).toHaveProperty('isReadOnly', true);
+    expect(mockRunSession).toHaveBeenCalled();
+    const ctx = mockRunSession.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    const spec = ctx!.spec as Record<string, unknown>;
+    expect(spec).toHaveProperty('schema');
+    expect(spec.schema).toBeDefined();
   });
 
-  it('returns the title from runStepTask on success', async () => {
+  it('includes the task prompt in the SessionSpec prompt', async () => {
     const tracker = makeMockTracker();
-    const expectedTitle = 'Add OAuth2 Authentication';
-    mockRunStepTask.mockResolvedValue({ title: expectedTitle });
+    const taskPrompt = 'Implement user authentication with OAuth2';
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
 
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        taskPrompt,
+        '/cwd',
+        undefined,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
+
+    expect(mockRunSession).toHaveBeenCalled();
+    const ctx = mockRunSession.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    const spec = ctx!.spec as Record<string, unknown>;
+    expect(spec.prompt).toContain(taskPrompt);
+  });
+
+  it('sets isReadOnly:true in the SessionSpec (title-gen is meta, no edits)', async () => {
+    const tracker = makeMockTracker();
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
+
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        undefined,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
+
+    expect(mockRunSession).toHaveBeenCalled();
+    const ctx = mockRunSession.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    const spec = ctx!.spec as Record<string, unknown>;
+    expect(spec.isReadOnly).toBe(true);
+  });
+
+  // ── 4. Return value ────────────────────────────────────────────────────
+
+  it('returns the title from the structured SessionResult data on success', async () => {
+    const tracker = makeMockTracker();
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'The Title', branchName: 'the-branch' } });
+
+    // With the new flow, initializationPhase should return 'The Title'
+    // (old code uses runStepTask which resolves undefined → fallback → wrong title)
     const title = await initializationPhase(
       ['/profiles'],
-      'Implement user authentication',
+      'Implement the new feature',
       '/cwd',
       undefined,
       undefined,
       tracker,
     );
 
-    expect(title).toBe(expectedTitle);
+    expect(title).toBe('The Title');
+  });
+
+  // ── 5. Context threading ────────────────────────────────────────────────
+
+  it('threads apiKeys into the runSession context', async () => {
+    const tracker = makeMockTracker();
+    const apiKeys = { ANTHROPIC: 'sk-test' };
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
+
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        apiKeys,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
+
+    expect(mockRunSession).toHaveBeenCalled();
+    const ctx = mockRunSession.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    expect(ctx).toBeDefined();
+    expect(ctx!.apiKeys).toEqual(apiKeys);
+  });
+
+  it('threads onStatus into the runSession context', async () => {
+    const tracker = makeMockTracker();
+    const onStatus = { onAgentSpawn: jest.fn() };
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
+
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        undefined,
+        onStatus as never,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
+
+    expect(mockRunSession).toHaveBeenCalled();
+    const ctx = mockRunSession.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    expect(ctx).toBeDefined();
+    expect(ctx!.onStatus).toBe(onStatus);
+  });
+
+  it('passes cwd to the runSession context', async () => {
+    const tracker = makeMockTracker();
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
+
+    try {
+      await initializationPhase(
+        ['/profiles/a', '/profiles/b'],
+        'Test task',
+        '/my-cwd',
+        undefined,
+        undefined,
+        tracker,
+      );
+    } catch {
+      // swallow
+    }
+
+    expect(mockRunSession).toHaveBeenCalled();
+    const ctx = mockRunSession.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    expect(ctx).toBeDefined();
+    expect(ctx!.cwd).toBe('/my-cwd');
+  });
+
+  it('uses workDir to derive sessionBaseDir in the runSession context', async () => {
+    const tracker = makeMockTracker();
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'X', branchName: 'y' } });
+
+    try {
+      await initializationPhase(
+        ['/profiles'],
+        'Test task',
+        '/cwd',
+        undefined,
+        undefined,
+        tracker,
+        '/some/workdir',
+      );
+    } catch {
+      // swallow
+    }
+
+    expect(mockRunSession).toHaveBeenCalled();
+    const ctx = mockRunSession.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    expect(ctx).toBeDefined();
+    // sessionBaseDir should be derived from workDir
+    expect(ctx!.sessionBaseDir).toContain('/some/workdir');
   });
 });
 
-// ─── Try/Catch Fallback ─────────────────────────────────────────────────────
+// ─── Error handling / fallback ─────────────────────────────────────────────
 
 describe('initializationPhase — error fallback', () => {
   beforeEach(() => {
+    mockRunSession.mockClear();
     mockRunStepTask.mockClear();
+    mockGateRun.mockClear();
+    (MockSessionGate as unknown as ReturnType<typeof jest.fn>).mockClear();
   });
 
-  it('falls back to truncated task prompt when runStepTask throws', async () => {
+  it('falls back to truncated task prompt when runSession throws', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockRejectedValue(new Error('API failure'));
+    mockRunSession.mockRejectedValue(new Error('Session failed'));
 
     const taskPrompt = 'Implement a new feature for the dashboard';
     const title = await initializationPhase(
@@ -226,13 +455,12 @@ describe('initializationPhase — error fallback', () => {
       tracker,
     );
 
-    // Should return the truncated prompt (less than 60 chars)
     expect(title).toBe(taskPrompt);
   });
 
   it('truncates long task prompts with ellipsis on error', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockRejectedValue(new Error('Network error'));
+    mockRunSession.mockRejectedValue(new Error('Network error'));
 
     const longPrompt = 'A'.repeat(100);
     const title = await initializationPhase(
@@ -244,14 +472,13 @@ describe('initializationPhase — error fallback', () => {
       tracker,
     );
 
-    // Should be truncated to 57 chars + '...'
     expect(title).toBe('A'.repeat(57) + '...');
     expect(title.length).toBe(60);
   });
 
   it('returns exact prompt if it fits within 60 chars on error', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockRejectedValue(new Error('Timeout'));
+    mockRunSession.mockRejectedValue(new Error('Timeout'));
 
     const shortPrompt = 'Short task';
     const title = await initializationPhase(
@@ -269,7 +496,7 @@ describe('initializationPhase — error fallback', () => {
 
   it('does not truncate prompts exactly 60 chars on error', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockRejectedValue(new Error('Error'));
+    mockRunSession.mockRejectedValue(new Error('Error'));
 
     const exactly60 = 'X'.repeat(60);
     const title = await initializationPhase(
@@ -287,7 +514,7 @@ describe('initializationPhase — error fallback', () => {
 
   it('handles non-Error throws gracefully', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockRejectedValue('string error');
+    mockRunSession.mockRejectedValue('string error');
 
     const taskPrompt = 'Implement feature';
     const title = await initializationPhase(
@@ -304,7 +531,7 @@ describe('initializationPhase — error fallback', () => {
 
   it('handles null throws gracefully', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockRejectedValue(null);
+    mockRunSession.mockRejectedValue(null);
 
     const taskPrompt = 'Implement feature';
     const title = await initializationPhase(
@@ -319,9 +546,10 @@ describe('initializationPhase — error fallback', () => {
     expect(title).toBe(taskPrompt);
   });
 
-  it('continues to work when runStepTask rejects with a DOMException', async () => {
+  it('handles AbortError gracefully', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockRejectedValue(new DOMException('Aborted', 'AbortError'));
+    const abortError = new DOMException('Aborted', 'AbortError');
+    mockRunSession.mockRejectedValue(abortError);
 
     const taskPrompt = 'Implement feature';
     const title = await initializationPhase(
@@ -333,41 +561,23 @@ describe('initializationPhase — error fallback', () => {
       tracker,
     );
 
-    // Should fall back, not propagate the error
     expect(title).toBe(taskPrompt);
   });
 });
 
-// ─── Import Verification ────────────────────────────────────────────────────
+// ─── Type-level: return type ───────────────────────────────────────────────
 
-describe('initializationPhase — imports', () => {
+describe('initializationPhase — return type', () => {
   beforeEach(() => {
+    mockRunSession.mockClear();
     mockRunStepTask.mockClear();
+    mockGateRun.mockClear();
+    (MockSessionGate as unknown as ReturnType<typeof jest.fn>).mockClear();
   });
 
-  it('uses runStepTask (not createHarness/promptForStructured) for title generation', async () => {
-    // This test verifies the old pattern (createHarness + promptForStructured)
-    // is no longer used. The mock allows us to confirm runStepTask was called
-    // and createHarness was NOT called.
+  it('returns a string from initializationPhase on success', async () => {
     const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'My Feature' });
-
-    await initializationPhase(
-      ['/profiles'],
-      'Implement the new feature',
-      '/cwd',
-      undefined,
-      undefined,
-      tracker,
-    );
-
-    // runStepTask should be the only mechanism used
-    expect(mockRunStepTask).toHaveBeenCalledTimes(1);
-  });
-
-  it('returns a string from initializationPhase', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'Add Login Page' });
+    mockRunSession.mockResolvedValue({ mode: 'structured', data: { title: 'Add Login Page', branchName: 'add-login' } });
 
     const result = await initializationPhase(
       ['/profiles'],
@@ -379,61 +589,5 @@ describe('initializationPhase — imports', () => {
     );
 
     expect(typeof result).toBe('string');
-    expect(result).toBe('Add Login Page');
-  });
-});
-
-// ─── Type-level: runStepTask Options ────────────────────────────────────────
-
-describe('initializationPhase — runStepTask options shape', () => {
-  beforeEach(() => {
-    mockRunStepTask.mockClear();
-  });
-
-  it('passes title as a human-readable string to runStepTask', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'Output Title' });
-
-    await initializationPhase(
-      ['/profiles'],
-      'Implement the new feature',
-      '/cwd',
-      undefined,
-      undefined,
-      tracker,
-    );
-
-    const callOpts = mockRunStepTask.mock.calls[0][0]!;
-    // The title field should be set (it's a required field in RunStepTaskOptions)
-    expect(callOpts).toHaveProperty('title');
-    expect(typeof callOpts.title).toBe('string');
-    expect(callOpts.title.length).toBeGreaterThan(0);
-  });
-
-  it('all required fields are present in runStepTask call', async () => {
-    const tracker = makeMockTracker();
-    mockRunStepTask.mockResolvedValue({ title: 'Title' });
-
-    await initializationPhase(
-      ['/profiles'],
-      'Implement the new feature',
-      '/cwd',
-      undefined,
-      undefined,
-      tracker,
-    );
-
-    const opts = mockRunStepTask.mock.calls[0][0]!;
-    // Verify all required fields from RunStepTaskOptions are present
-    expect(opts).toHaveProperty('profilesDirs');
-    expect(opts).toHaveProperty('phaseId');
-    expect(opts).toHaveProperty('taskId');
-    expect(opts).toHaveProperty('title');
-    expect(opts).toHaveProperty('stepName');
-    expect(opts).toHaveProperty('profileId');
-    expect(opts).toHaveProperty('cwd');
-    expect(opts).toHaveProperty('prompt');
-    // isReadOnly should default to true
-    expect(opts).toHaveProperty('isReadOnly', true);
   });
 });

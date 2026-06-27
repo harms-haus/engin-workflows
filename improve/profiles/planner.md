@@ -61,12 +61,15 @@ When in doubt, use `implementer`. Prefer `implementer-lite` when the task is sma
 - **Extract a magic value to a named constant** — move a raw literal into a well-named constant near its use (or a shared constants module if reused).
 - **Extract duplicate code into a shared utility** — pull repeated logic into one helper/util and replace all call sites; consolidate into a utilities module or small system if it spans files.
 - **Rename misleading identifiers / fix name-file mismatches** — rename and update every reference; ensure a symbol's name matches its file when appropriate.
-- **Remove timely comments** — delete or rewrite comments describing past/"old way" behavior so only current-truth remains.
+- **Remove timely/tracker/past-rationale comments** — drop tracker IDs (`task #` / `issue #` / ticket refs) and rewrite comments explaining *why it was done* into *why it IS* (current truth), or delete them entirely. Only current truth remains.
 - **Add/refresh docstrings** — document public/exported functions and types (params, returns, throws, intent).
+- **Surface core behavior** — expand dense/overly-clever shorthand around important logic into an explicit, readable form; keep terseness for small, low-stakes steps. Behavior unchanged.
+- **Officialize re-exports / eliminate useless barrels** — delete a passthrough barrel (or a wrapper that adds no value), re-route every importer to the real source module, and update all imports. A wrapper is kept only if it adds genuine value (then make it a proper first-class module). Behavior unchanged.
+- **Reduce comment verbosity** — delete comments that restate obvious code; keep public-API docstrings and comments on genuinely non-obvious logic. Let the code document itself.
 - **Improve test quality** — strengthen existing tests around touched code: more scenarios, edge/boundary/invalid inputs, meaningful assertions.
 
 **Refactors must preserve behavior.** For any restructure/split/decompose/extract task, the test-writing step should produce *characterization tests* first (pinning current behavior) so the change is provably behavior-preserving. Each task's verification must run the relevant tests/build/typecheck/lint.
 
-**Profile choice for improvement tasks:** use `implementer-lite` for mechanical changes (delete dead code, extract a constant, rename, add a docstring, remove a comment); use `implementer` for structural changes (split a file, decompose a function, build a shared-utility system) or anything with tricky edge cases. Test-only improvement tasks (remove dead/tautological tests, strengthen scenarios) are executed by the test-writing step — still mark them `is_code: true`; the implementer must not edit tests.
+**Profile choice for improvement tasks:** use `implementer-lite` for mechanical changes (delete dead code, extract a constant, rename, add/trim a docstring or comment, surface core behavior by expanding shorthand); use `implementer` for structural changes (split a file, decompose a function, build a shared-utility system, eliminate a useless barrel across many import sites) or anything with tricky edge cases. Test-only improvement tasks (remove dead/tautological tests, strengthen scenarios) are executed by the test-writing step — still mark them `is_code: true`; the implementer must not edit tests.
 
 **Write your plan to the plan file:** Use the `write` tool to save valid JSON matching the shape and schema given in the task prompt, at the plan file path provided. Do not return the plan as text in your response.

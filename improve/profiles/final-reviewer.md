@@ -40,7 +40,7 @@ You are a final quality reviewer. You perform a comprehensive review of ALL chan
 
 5. **MISSING CLEANUP**: Flag any leftover debug code, temporary files, commented-out code, or TODO comments that should have been resolved.
 
-6. **IMPROVEMENT OUTCOMES**: If this was an improvement run, confirm the intended improvements landed (dead code/tests removed, monolith files split, god functions decomposed, magic values extracted to constants, duplicate code consolidated into shared utilities, misleading names and name/file mismatches fixed, timely comments removed, docstrings added) and that refactors preserved behavior. Confirm docs/docstrings match the real code.
+6. **IMPROVEMENT OUTCOMES**: If this was an improvement run, confirm the intended improvements landed (dead code/tests removed, monolith files split, god functions decomposed, magic values extracted to constants, duplicate code consolidated into shared utilities, misleading names and name/file mismatches fixed, core behavior surfaced from dense shorthand, useless barrels eliminated and imports re-routed to the real source, comment verbosity reduced, tracker/timely/past-rationale comments removed, docstrings added) and that refactors preserved behavior. Confirm docs/docstrings match the real code.
 
 **Report your review as a structured JSON object:** Respond with valid JSON matching the schema provided in the prompt.
 

@@ -40,98 +40,109 @@
 // counterparts (asserting `tracker.auditLog.append` is no longer invoked with
 // structured_output / decision events at runtime).
 
-import { describe, expect, it } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 /** Read a sibling source file's text (relative to this test file). */
 function src(file: string): string {
-    return readFileSync(fileURLToPath(new URL(file, import.meta.url)), 'utf-8');
+  return readFileSync(fileURLToPath(new URL(file, import.meta.url)), "utf-8");
 }
 
-const SCOUTING = './scouting.ts';
-const PLANNING = './planning.ts';
-const IMPLEMENTATION = './implementation.ts';
-const FINAL_REVIEW = './final-review.ts';
-const SPIR = './spir.ts';
+const SCOUTING = "./scouting.ts";
+const PLANNING = "./planning.ts";
+const IMPLEMENTATION = "./implementation.ts";
+const FINAL_REVIEW = "./final-review.ts";
+const SPIR = "./spir.ts";
 
 /**
  * Assert `file`'s source contains `needle`. Fails with a CONCISE message
  * (just the file + needle) instead of dumping the whole file on mismatch.
  */
 function expectContains(file: string, needle: string): void {
-    expect(src(file).includes(needle), `${file} should contain ${JSON.stringify(needle)}`).toBe(true);
+  expect(
+    src(file).includes(needle),
+    `${file} should contain ${JSON.stringify(needle)}`,
+  ).toBe(true);
 }
 
 /** Assert `file`'s source does NOT contain `needle` (concise failure message). */
 function expectNotContains(file: string, needle: string): void {
-    expect(src(file).includes(needle), `${file} should NOT contain ${JSON.stringify(needle)}`).toBe(false);
+  expect(
+    src(file).includes(needle),
+    `${file} should NOT contain ${JSON.stringify(needle)}`,
+  ).toBe(false);
 }
 
 /** Assert `file`'s source matches `pattern` (concise failure message). */
 function expectMatches(file: string, pattern: RegExp): void {
-    expect(pattern.test(src(file)), `${file} should match ${pattern}`).toBe(true);
+  expect(pattern.test(src(file)), `${file} should match ${pattern}`).toBe(true);
 }
 
 /** Assert `file`'s source does NOT match `pattern` (concise failure message). */
 function expectNotMatches(file: string, pattern: RegExp): void {
-    expect(pattern.test(src(file)), `${file} should NOT match ${pattern}`).toBe(false);
+  expect(pattern.test(src(file)), `${file} should NOT match ${pattern}`).toBe(
+    false,
+  );
 }
 
 // ─── (1) Manual auditLog.append calls removed ──────────────────────────────
 
-describe('migration: manual structured_output / decision auditLog.append calls removed', () => {
-    it('scouting.ts makes zero manual auditLog.append calls', () => {
-        // scouting.ts only ever appended structured_output (coordinator) and
-        // decision (scouting-reviewer) — both are removed, so the symbols must
-        // disappear entirely (no import, no usage, no append).
-        expectNotContains(SCOUTING, 'auditLog.append');
-        expectNotContains(SCOUTING, 'structuredOutputEvent');
-        expectNotContains(SCOUTING, 'decisionEvent');
-    });
+describe("migration: manual structured_output / decision auditLog.append calls removed", () => {
+  it("scouting.ts makes zero manual auditLog.append calls", () => {
+    // scouting.ts only ever appended structured_output (coordinator) and
+    // decision (scouting-reviewer) — both are removed, so the symbols must
+    // disappear entirely (no import, no usage, no append).
+    expectNotContains(SCOUTING, "auditLog.append");
+    expectNotContains(SCOUTING, "structuredOutputEvent");
+    expectNotContains(SCOUTING, "decisionEvent");
+  });
 
-    it('planning.ts makes zero manual auditLog.append calls', () => {
-        expectNotContains(PLANNING, 'auditLog.append');
-        expectNotContains(PLANNING, 'structuredOutputEvent');
-        expectNotContains(PLANNING, 'decisionEvent');
-    });
+  it("planning.ts makes zero manual auditLog.append calls", () => {
+    expectNotContains(PLANNING, "auditLog.append");
+    expectNotContains(PLANNING, "structuredOutputEvent");
+    expectNotContains(PLANNING, "decisionEvent");
+  });
 
-    it('final-review.ts drops the structured_output appends but keeps the error append', () => {
-        // The two structuredOutputEvent appends (initial review + review-fixes)
-        // are gone; decisionEvent was never imported here.
-        expectNotContains(FINAL_REVIEW, 'structuredOutputEvent');
-        expectNotContains(FINAL_REVIEW, 'decisionEvent');
-        // No structured/decision appends remain …
-        expectNotMatches(FINAL_REVIEW, /auditLog\.append\(\s*structuredOutputEvent/);
-        expectNotMatches(FINAL_REVIEW, /auditLog\.append\(\s*decisionEvent/);
-        // … but the lane-failure error append MUST stay (no engine equivalent).
-        expectMatches(FINAL_REVIEW, /auditLog\.append\(/);
-    });
+  it("final-review.ts drops the structured_output appends but keeps the error append", () => {
+    // The two structuredOutputEvent appends (initial review + review-fixes)
+    // are gone; decisionEvent was never imported here.
+    expectNotContains(FINAL_REVIEW, "structuredOutputEvent");
+    expectNotContains(FINAL_REVIEW, "decisionEvent");
+    // No structured/decision appends remain …
+    expectNotMatches(
+      FINAL_REVIEW,
+      /auditLog\.append\(\s*structuredOutputEvent/,
+    );
+    expectNotMatches(FINAL_REVIEW, /auditLog\.append\(\s*decisionEvent/);
+    // … but the lane-failure error append MUST stay (no engine equivalent).
+    expectMatches(FINAL_REVIEW, /auditLog\.append\(/);
+  });
 });
 
 // ─── (2) Unused structuredOutputEvent / decisionEvent imports removed ───────
 
-describe('migration: unused structuredOutputEvent / decisionEvent imports removed', () => {
-    it('scouting.ts no longer imports structuredOutputEvent or decisionEvent', () => {
-        expectNotMatches(SCOUTING, /from\s+["']\.\/helpers["']/);
-        expectNotContains(SCOUTING, 'structuredOutputEvent');
-        expectNotContains(SCOUTING, 'decisionEvent');
-    });
+describe("migration: unused structuredOutputEvent / decisionEvent imports removed", () => {
+  it("scouting.ts no longer imports structuredOutputEvent or decisionEvent", () => {
+    expectNotMatches(SCOUTING, /from\s+["']\.\/helpers["']/);
+    expectNotContains(SCOUTING, "structuredOutputEvent");
+    expectNotContains(SCOUTING, "decisionEvent");
+  });
 
-    it('planning.ts no longer imports structuredOutputEvent or decisionEvent (and drops the task-17 TODO)', () => {
-        expectNotMatches(PLANNING, /from\s+["']\.\/helpers["']/);
-        expectNotContains(PLANNING, 'structuredOutputEvent');
-        expectNotContains(PLANNING, 'decisionEvent');
-        // The deferred-migration TODO is now resolved.
-        expectNotContains(PLANNING, 'TODO(task-17)');
-    });
+  it("planning.ts no longer imports structuredOutputEvent or decisionEvent (and drops the task-17 TODO)", () => {
+    expectNotMatches(PLANNING, /from\s+["']\.\/helpers["']/);
+    expectNotContains(PLANNING, "structuredOutputEvent");
+    expectNotContains(PLANNING, "decisionEvent");
+    // The deferred-migration TODO is now resolved.
+    expectNotContains(PLANNING, "TODO(task-17)");
+  });
 
-    it('final-review.ts drops structuredOutputEvent but KEEPS the errorEvent import', () => {
-        expectNotContains(FINAL_REVIEW, 'structuredOutputEvent');
-        // errorEvent is still imported from ./helpers (the lane-failure path).
-        expectContains(FINAL_REVIEW, 'errorEvent');
-        expectMatches(FINAL_REVIEW, /from\s+["']\.\/helpers["']/);
-    });
+  it("final-review.ts drops structuredOutputEvent but KEEPS the errorEvent import", () => {
+    expectNotContains(FINAL_REVIEW, "structuredOutputEvent");
+    // errorEvent is still imported from ./helpers (the lane-failure path).
+    expectContains(FINAL_REVIEW, "errorEvent");
+    expectMatches(FINAL_REVIEW, /from\s+["']\.\/helpers["']/);
+  });
 });
 
 // ─── (3) hookRegistry threaded into every engine primitive call ─────────────
@@ -142,44 +153,51 @@ describe('migration: unused structuredOutputEvent / decisionEvent imports remove
 // final-review currently reference `hookRegistry` nowhere — its appearance is
 // the migration signal. planning already threads it (regression guard).
 
-describe('migration: hookRegistry threaded into engine primitive calls', () => {
-    it('scouting.ts references hookRegistry (runStepTask coordinator/reviewer + scout LanePool)', () => {
-        expectContains(SCOUTING, 'hookRegistry');
-    });
+describe("migration: hookRegistry threaded into engine primitive calls", () => {
+  it("scouting.ts references hookRegistry (singleSession coordinator/reviewer + scout RunnerPool)", () => {
+    expectContains(SCOUTING, "hookRegistry");
+  });
 
-    it('final-review.ts references hookRegistry (reviewer runStepTask + fixer LanePool)', () => {
-        expectContains(FINAL_REVIEW, 'hookRegistry');
-    });
+  it("final-review.ts references hookRegistry (reviewer runStepTask + fixer LanePool)", () => {
+    expectContains(FINAL_REVIEW, "hookRegistry");
+  });
 
-    it('implementation.ts references hookRegistry (implementer LanePool)', () => {
-        expectContains(IMPLEMENTATION, 'hookRegistry');
-    });
+  it("implementation.ts references hookRegistry (implementer LanePool)", () => {
+    expectContains(IMPLEMENTATION, "hookRegistry");
+  });
 
-    it('planning.ts still references hookRegistry (regression guard for runMultiStepTask)', () => {
-        expectContains(PLANNING, 'hookRegistry');
-    });
+  it("planning.ts still references hookRegistry (regression guard for runMultiStepTask)", () => {
+    expectContains(PLANNING, "hookRegistry");
+  });
 });
 
-// ─── (3b) LanePool constructions carry BOTH auditLog and hookRegistry ──────
+// ─── (3b) Pool constructions carry BOTH auditLog and hookRegistry ──────────
+//
+// After the B2/B4/B5 migrations, the phase files use RunnerPool instead of
+// LanePool. Each RunnerPool construction must thread auditLog (for the
+// auditor) and hookRegistry (for the engine's default auditor hooks).
 
-describe('migration: LanePool constructions carry auditLog + hookRegistry', () => {
-    it('scouting.ts scout LanePool is wired with auditLog and hookRegistry', () => {
-        expectContains(SCOUTING, 'new LanePool');
-        expectContains(SCOUTING, 'auditLog');
-        expectContains(SCOUTING, 'hookRegistry');
-    });
+describe("migration: Pool constructions carry auditLog + hookRegistry", () => {
+  it("scouting.ts scout RunnerPool is wired with auditLog and hookRegistry", () => {
+    // B2 migration: scouting.ts now uses RunnerPool (not LanePool).
+    expectContains(SCOUTING, "new RunnerPool");
+    expectContains(SCOUTING, "auditLog");
+    expectContains(SCOUTING, "hookRegistry");
+  });
 
-    it('implementation.ts implementer LanePool is wired with auditLog and hookRegistry', () => {
-        expectContains(IMPLEMENTATION, 'new LanePool');
-        expectContains(IMPLEMENTATION, 'auditLog');
-        expectContains(IMPLEMENTATION, 'hookRegistry');
-    });
+  it("implementation.ts implementer RunnerPool is wired with auditLog and hookRegistry", () => {
+    // B4 migration: implementation.ts uses RunnerPool (not LanePool).
+    expectContains(IMPLEMENTATION, "new RunnerPool");
+    expectContains(IMPLEMENTATION, "auditLog");
+    expectContains(IMPLEMENTATION, "hookRegistry");
+  });
 
-    it('final-review.ts fixer LanePool is wired with auditLog and hookRegistry', () => {
-        expectContains(FINAL_REVIEW, 'new LanePool');
-        expectContains(FINAL_REVIEW, 'auditLog');
-        expectContains(FINAL_REVIEW, 'hookRegistry');
-    });
+  it("final-review.ts fixer RunnerPool is wired with auditLog and hookRegistry", () => {
+    // B5 migration: final-review.ts uses RunnerPool (not LanePool).
+    expectContains(FINAL_REVIEW, "new RunnerPool");
+    expectContains(FINAL_REVIEW, "auditLog");
+    expectContains(FINAL_REVIEW, "hookRegistry");
+  });
 });
 
 // ─── (4) runSpir registers the default auditor at the workflow level ────────
@@ -190,14 +208,14 @@ describe('migration: LanePool constructions carry auditLog + hookRegistry', () =
 // engine's observe-hook fires into durable AuditLog events with no manual
 // `auditLog.append` anywhere in the phase files.
 
-describe('migration: runSpir registers the default auditor against the hookRegistry', () => {
-    it('spir.ts imports createDefaultAuditor from the engine', () => {
-        expectContains(SPIR, 'createDefaultAuditor');
-    });
+describe("migration: runSpir registers the default auditor against the hookRegistry", () => {
+  it("spir.ts imports createDefaultAuditor from the engine", () => {
+    expectContains(SPIR, "createDefaultAuditor");
+  });
 
-    it('spir.ts registers onStructuredOutput + onDecision subscribers (the auditor)', () => {
-        expectContains(SPIR, 'createDefaultAuditor');
-        expectContains(SPIR, 'onStructuredOutput');
-        expectContains(SPIR, 'onDecision');
-    });
+  it("spir.ts registers onStructuredOutput + onDecision subscribers (the auditor)", () => {
+    expectContains(SPIR, "createDefaultAuditor");
+    expectContains(SPIR, "onStructuredOutput");
+    expectContains(SPIR, "onDecision");
+  });
 });

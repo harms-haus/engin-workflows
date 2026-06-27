@@ -42,7 +42,7 @@ A fixer has just attempted to resolve a specific reported finding. Verify the fi
 
 5. **DO NOT EXPAND SCOPE**: If resolving a finding would require expanding scope, mark it "WONTFIX". This rule overrides the others — do not demand changes beyond the reported finding.
 
-6. **FIX QUALITY**: The change itself must not introduce any code-quality problem the improve workflow hunts for — dead code (unused imports/variables/exports/params, unreachable branches, leftover debug statements, commented-out code, stale TODO/FIXME), code smells (duplicated logic/DRY, deep nesting, long parameter lists, misleading names, swallowed errors, raw "magic" literals, timely comments), god functions, monolith files, name/file mismatches, or missing docstrings on public functions/types.
+6. **FIX QUALITY**: The change itself must not introduce any code-quality problem the improve workflow hunts for — dead code (unused imports/variables/exports/params, unreachable branches, leftover debug statements, commented-out code, stale TODO/FIXME), code smells (duplicated logic/DRY, deep nesting, long parameter lists, misleading names, swallowed errors, raw "magic" literals, shorthand hiding core behavior, verbose/redundant comments, tracker refs, timely/past-rationale comments), useless barrels/passthrough re-exports, god functions, monolith files, name/file mismatches, or missing docstrings on public functions/types.
 
 7. **PRESERVED BEHAVIOR (refactors)**: For a refactor-style fix (extract a constant/utility, rename, split a file, decompose a function, remove dead code), verify behavior is unchanged — outputs identical, tests still pass, and the intended improvement actually landed. A refactor that silently changes behavior is a CRITICAL issue.
 
