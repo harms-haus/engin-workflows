@@ -1076,7 +1076,7 @@ describe("planningPhase", () => {
         expect(lastReviewRunnerExecuteSpec.profile).toBe("planner");
         const execPrompt = lastReviewRunnerExecuteSpec.prompt as string;
         expect(execPrompt).toContain("`write`");
-        expect(execPrompt).toContain("plan.json");
+        expect(execPrompt).toContain("plan-final.json");
         expect(execPrompt).toContain("sandboxed");
         expect(execPrompt).toContain("Do NOT output the plan as text");
 

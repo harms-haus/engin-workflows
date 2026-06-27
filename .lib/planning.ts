@@ -13,7 +13,7 @@ import {
   reviewRunner,
   schemaToString,
 } from "@harms-haus/engin-engine";
-import { readFile } from "node:fs/promises";
+import { copyFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PlanSchema, PlanReviewSchema } from "./schemas";
 import type { Plan } from "./schemas";
@@ -30,9 +30,12 @@ export function getArtifactsDir(workDir: string): string {
   return join(workDir, "artifacts");
 }
 
-/** Absolute path to the plan JSON artifact for a run. */
+/** Absolute path to the LIVE plan JSON artifact for a run — the file the
+ *  planner writes/edits every round and the final approved plan. Rejected
+ *  revisions are snapshotted to `plan-rev{N}.json` (see `snapshotPlan`), so
+ *  `plan-final.json` always reflects the latest state. */
 export function getPlanPath(workDir: string): string {
-  return join(getArtifactsDir(workDir), "plan.json");
+  return join(getArtifactsDir(workDir), "plan-final.json");
 }
 
 // ─── Phase 3: Planning ──────────────────────────────────────────────────────
@@ -104,7 +107,7 @@ async function readAndValidatePlan(
  * directory.
  *
  * Plan + plan-review run as a `reviewRunner` (execute → review loop): the
- * planner writes plan.json (filesystem output mode) and the plan-reviewer
+ * planner writes plan-final.json (filesystem output mode) and the plan-reviewer
  * evaluates it (structured output `{ approved, feedback }`). When the reviewer
  * rejects, the reviewRunner appends the feedback to the planner prompt and
  * retries — up to `DEFAULT_MAX_ROUNDS` times. The runner is dispatched through
@@ -148,11 +151,23 @@ export async function planningPhase(
   });
 
   // Compose the execute (plan) → review (plan-review) loop. The planner uses
-  // filesystem output mode (it writes plan.json via the `write` tool); the
-  // reviewer uses structured output mode with PlanReviewSchema
+  // filesystem output mode (it writes plan-final.json via the `write` tool);
+  // the reviewer uses structured output mode with PlanReviewSchema
   // ({ approved, feedback }). The reviewRunner owns the replan-on-rejection
   // loop internally — it checks `result.data.approved === true` and appends
   // feedback to the execute prompt on rejection.
+  //
+  // On rejection the just-written plan-final.json is COPIED to
+  // plan-rev{round}.json so every rejected revision is preserved; the planner
+  // then resumes and continues editing plan-final.json in place.
+  const snapshotPlan = async (round: number): Promise<void> => {
+    try {
+      await copyFile(planPath, join(artifactsDir, `plan-rev${round}.json`));
+    } catch {
+      /* first round has nothing to snapshot yet, or copy failed — non-fatal */
+    }
+  };
+
   const runner = reviewRunner(
     {
       profile: "planner",
@@ -173,7 +188,7 @@ export async function planningPhase(
       runnerRole: "review-plan",
       attempt: 1,
     },
-    { maxRounds: DEFAULT_MAX_ROUNDS },
+    { maxRounds: DEFAULT_MAX_ROUNDS, onReviewReject: snapshotPlan },
   );
 
   // Register the planning task. Scouting files are threaded onto the task so
