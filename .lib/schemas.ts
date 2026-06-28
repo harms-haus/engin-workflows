@@ -196,3 +196,57 @@ export type FinalReviewResult = z.infer<typeof FinalReviewResultSchema>;
 export const TitleSchema = z.object({
   title: z.string().describe("A concise 3-8 word title summarizing the task"),
 });
+
+// ─── Producer done-signals ─────────────────────────────────────────────────
+//
+// Producing agents (planner, test-writer, implementer) run in STRUCTURED-OUTPUT
+// mode against these schemas. This is a deliberate completion gate: the engine's
+// `promptForStructured` re-prompts the SAME session (up to 3×) when the agent
+// ends early — empty reply, no JSON, or schema-invalid — sending targeted
+// "you ended on a tool call / fix your format" reminders each time.
+//
+// Without these signals the producing sessions ran in text/filesystem mode and
+// could silently "succeed" after stopping prematurely (e.g. the planner ending
+// before writing the plan), which only surfaced downstream when a reviewer
+// rejected the empty work. The done-signal moves that detection to the source:
+// the agent must self-certify it finished, or be re-prompted in the same
+// session until it does.
+
+/** Planner done-signal. `plan_ready: true` ONLY after the plan JSON file has
+ *  been written to disk. Drives structured-output retries in the planning
+ *  phase. */
+export const PlanReadySchema = z.object({
+  plan_ready: z
+    .boolean()
+    .describe(
+      "Set to true ONLY after you have written the complete plan JSON file to disk. " +
+        "Set to false if you genuinely cannot produce a plan.",
+    ),
+});
+export type PlanReady = z.infer<typeof PlanReadySchema>;
+
+/** Test-writer done-signal. `tests_ready: true` ONLY after the tests for the
+ *  task have been written. Drives structured-output retries for the write-tests
+ *  session of a code task. */
+export const TestsReadySchema = z.object({
+  tests_ready: z
+    .boolean()
+    .describe(
+      "Set to true ONLY after you have written the tests for this task. " +
+        "Set to false if you genuinely cannot write the tests.",
+    ),
+});
+export type TestsReady = z.infer<typeof TestsReadySchema>;
+
+/** Implementer done-signal. `implementation_done: true` ONLY after the task has
+ *  been fully implemented. Drives structured-output retries for the execute
+ *  session of an implementation task. */
+export const ImplementationDoneSchema = z.object({
+  implementation_done: z
+    .boolean()
+    .describe(
+      "Set to true ONLY after you have fully implemented the task. " +
+        "Set to false if you genuinely cannot complete it.",
+    ),
+});
+export type ImplementationDone = z.infer<typeof ImplementationDoneSchema>;

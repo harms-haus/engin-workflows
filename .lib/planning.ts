@@ -17,7 +17,7 @@ import {
 } from "@harms-haus/engin-engine";
 import { copyFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { PlanSchema, PlanReviewSchema } from "./schemas";
+import { PlanReadySchema, PlanSchema, PlanReviewSchema } from "./schemas";
 import type { Plan } from "./schemas";
 
 // ─── Plan artifact paths ───────────────────────────────────────────────────
@@ -179,7 +179,15 @@ export async function planningPhase(
     {
       profile: "planner",
       prompt: planPrompt,
-      outputMode: "filesystem",
+      // Structured output with a `plan_ready` done-signal. The planner still
+      // writes the plan JSON file via the `write` tool; the structured response
+      // is a self-certified completion gate. If the planner ends before writing
+      // the file (or returns an invalid response), the engine's
+      // `promptForStructured` re-prompts the SAME session with a targeted
+      // reminder — catching "stopped early" at the source instead of letting a
+      // silently-empty filesystem result flow to the plan-reviewer.
+      outputMode: "structured",
+      schema: PlanReadySchema,
       isReadOnly: false,
       role: "plan",
     },
@@ -294,7 +302,12 @@ function buildPlanPrompt(opts: {
     "## How to deliver your plan",
     `You MUST write your plan as a JSON file at: \`${opts.planPath}\``,
     `Use the \`write\` tool to create that file. You are sandboxed: you may ONLY create or modify files under \`${opts.artifactsDir}\`. Any attempt to write elsewhere will be rejected.`,
-    "Do NOT output the plan as text in your response — write it to the file. After writing it, reply with a single short line confirming the path.",
+    "Do NOT output the plan body as text in your response — write it to the file.",
+    "",
+    "## Completion signal (required)",
+    "After you have successfully written the plan file, respond with ONLY this JSON object: `{ \"plan_ready\": true }`.",
+    "Respond with `{ \"plan_ready\": false }` only if you genuinely cannot produce a plan.",
+    "Do not send the signal until the file is written — the signal is how the workflow knows you finished.",
     "",
     "The JSON file must match this shape:",
     "```json",

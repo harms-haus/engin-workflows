@@ -17,25 +17,16 @@ import {
   linearRunner,
   loadProfilesFromDirs,
   reviewRunner,
-  singleSession,
 } from "@harms-haus/engin-engine";
 import type { Plan } from "./schemas";
-import { ReviewResultSchema } from "./schemas";
+import {
+  ImplementationDoneSchema,
+  ReviewResultSchema,
+  TestsReadySchema,
+} from "./schemas";
 import { join } from "node:path";
 
 // ─── Runner-tree resolution ───────────────────────────────────────────────
-
-/**
- * Spec for a single session consumed by {@link singleSession}. Mirrors the
- * `Omit<SessionSpec, 'id' | 'attempt'> & { role: string; attempt?: number }`
- * shape: all SessionSpec fields except the deterministic `id` (assigned at
- * run time from the task id + role) plus a `role` label that drives session-id
- * derivation.
- */
-type SingleSessionSpec = Omit<SessionSpec, "id" | "attempt"> & {
-  role: string;
-  attempt?: number;
-};
 
 /**
  * Spec for a session consumed by {@link reviewRunner}. Mirrors the
@@ -56,8 +47,21 @@ interface SessionPlanEntry {
 }
 
 /**
- * Prompt used by the implement-reviewer session. The reviewer evaluates the
- * implementation against the task prompt and returns a structured
+ * Prompt used by the test-reviewer (review-tests) session. The reviewer
+ * evaluates the tests written for the task against the task prompt and returns
+ * a structured {@link ReviewResultSchema} verdict.
+ */
+const REVIEW_TESTS_PROMPT = [
+  "Review the tests written for this task.",
+  "Read the test files and check they cover the task's requirements accurately",
+  "and follow sound testing practices.",
+  "Respond with a structured review: approved flag, feedback, and any issues",
+  "(file, description, severity).",
+].join(" ");
+
+/**
+ * Prompt used by the implement-reviewer (review-code) session. The reviewer
+ * evaluates the implementation against the task prompt and returns a structured
  * {@link ReviewResultSchema} verdict.
  */
 const REVIEW_PROMPT = [
@@ -66,6 +70,34 @@ const REVIEW_PROMPT = [
   "Respond with a structured review: approved flag, feedback, and any issues",
   "(file, description, severity).",
 ].join(" ");
+
+/**
+ * Completion-signal instruction appended to the test-writer (write-tests)
+ * session prompt. The session runs in structured-output mode against
+ * {@link TestsReadySchema}; this instruction ties the signal to the work so the
+ * agent self-certifies only after the tests are written.
+ */
+const TESTS_READY_SIGNAL = [
+  "",
+  "## Completion signal (required)",
+  'After you have written the tests, respond with ONLY this JSON object: { "tests_ready": true }.',
+  'Respond with { "tests_ready": false } only if you genuinely cannot write the tests.',
+  "Do not send the signal until the tests are written — it is how the workflow knows you finished.",
+].join("\n");
+
+/**
+ * Completion-signal instruction appended to the implementer (execute) session
+ * prompt. The session runs in structured-output mode against
+ * {@link ImplementationDoneSchema}; this instruction ties the signal to the
+ * work so the agent self-certifies only after the task is fully implemented.
+ */
+const IMPLEMENTATION_DONE_SIGNAL = [
+  "",
+  "## Completion signal (required)",
+  'After you have fully implemented the task, respond with ONLY this JSON object: { "implementation_done": true }.',
+  'Respond with { "implementation_done": false } only if you genuinely cannot complete the task.',
+  "Do not send the signal until the implementation is complete — it is how the workflow knows you finished.",
+].join("\n");
 
 /**
  * Resolve the implementation task shape consumed by the runner factories.
@@ -83,32 +115,38 @@ function resolveImplProfile(task: { profile?: string }): string {
 /**
  * Build the runner factory for a single implementation task.
  *
- * The factory mirrors the old step pipeline (`CODE_STEPS` / `NON_CODE_STEPS`)
- * but expressed as composed {@link SessionPlanFactory}-returning factories
- * instead of {@link StepDefinition}s:
+ * The runner tree is composed from {@link reviewRunner} and {@link linearRunner}
+ * factories (each a {@link SessionPlanFactory}). For `linearRunner`, which
+ * expects `SessionPlanRunner[]`, the factories are invoked (`()`) to obtain
+ * concrete runner instances.
  *
- *   • Code tasks →
+ *   • Code tasks (`is_code: true`) — test-first, two independent review loops:
+ *
  *       linearRunner([
- *         singleSession(write-tests)(),
- *         reviewRunner(execute, review)(),
+ *         reviewRunner(write-tests, review-tests)(),   // test-writer → test-reviewer
+ *         reviewRunner(write-code, review-code)(),     // implementer → implement-reviewer
  *       ])
- *   • Non-code tasks →
- *       reviewRunner(execute, review)
  *
- * `singleSession`, `reviewRunner`, and `linearRunner` each return a
- * {@link SessionPlanFactory} (`() => SessionPlanRunner`). For `linearRunner`,
- * which expects `SessionPlanRunner[]`, the factories are invoked (`()`) to
- * obtain concrete runner instances.
+ *     The test loop runs first: the test-writer writes tests, the test-reviewer
+ *     reviews them. Then the code loop runs: the implementer writes code, the
+ *     implement-reviewer reviews it. Each `reviewRunner` drives its own
+ *     execute→review loop (approve / reject + feedback, up to
+ *     `DEFAULT_MAX_ROUNDS` rounds).
  *
- * `reviewRunner` drives the execute→review loop (approve / reject + feedback,
- * up to `DEFAULT_MAX_ROUNDS` rounds). The test-writer session (a plain
- * `singleSession`) only runs for code tasks, ahead of the implement→review
- * loop, via `linearRunner`.
+ *   • Non-code tasks — a single review loop:
  *
- * `isCode` is the planner-derived `is_code` signal (test-first vs
- * execute→review). It is deliberately passed in explicitly rather than read
- * off the engine `Task` — `is_code` is a workflow concern unrelated to
- * worktree creation (every implementation task gets a worktree regardless).
+ *       reviewRunner(execute, review)                  // implementer → implement-reviewer
+ *
+ * The execute sessions (write-tests / write-code / execute) run in
+ * structured-output mode against a done-signal schema (`TestsReadySchema` /
+ * `ImplementationDoneSchema`) so an agent that stops before finishing its work
+ * is re-prompted in-session by the engine's `promptForStructured` instead of
+ * silently producing an empty result.
+ *
+ * `isCode` is the planner-derived `is_code` signal. It is deliberately passed
+ * in explicitly rather than read off the engine `Task` — `is_code` is a
+ * workflow concern unrelated to worktree creation (every implementation task
+ * gets a worktree regardless).
  */
 function resolveImplementationRunner(
   task: { profile?: string; prompt: string },
@@ -116,24 +154,21 @@ function resolveImplementationRunner(
 ): SessionPlanFactory {
   const implProfile = resolveImplProfile(task);
 
-  const writeTestsSpec: SingleSessionSpec = {
-    role: "write-tests",
-    runnerRole: "write-tests",
-    profile: "test-writer",
-    prompt: task.prompt,
-    outputMode: "text",
-    isReadOnly: false,
-    attempt: 1,
-  };
-  const implSpec: ReviewSessionSpec = {
-    role: "execute",
+  // Code-task sessions use distinct role labels (write-tests / review-tests /
+  // write-code / review-code) so their session directories and projections are
+  // unambiguous. Non-code tasks keep the generic execute / review roles.
+  const codeImplSpec: ReviewSessionSpec = {
+    role: "write-code",
     profile: implProfile,
-    prompt: task.prompt,
-    outputMode: "text",
+    prompt: `${task.prompt}${IMPLEMENTATION_DONE_SIGNAL}`,
+    // Structured output with an `implementation_done` done-signal — catches
+    // early exit at the source via in-session re-prompts.
+    schema: ImplementationDoneSchema,
+    outputMode: "structured",
     isReadOnly: false,
   };
-  const reviewSpec: ReviewSessionSpec = {
-    role: "review",
+  const codeReviewSpec: ReviewSessionSpec = {
+    role: "review-code",
     profile: "implement-reviewer",
     prompt: REVIEW_PROMPT,
     schema: ReviewResultSchema,
@@ -142,18 +177,42 @@ function resolveImplementationRunner(
   };
 
   if (isCode) {
-    // Test-first pipeline mirroring the pre-session-first CODE_STEPS:
-    //   write-tests  (singleSession — test generation)
-    //   execute      → review  (reviewRunner — code review loop)
-    // composed linearly. The review loop feeds rejection feedback back and
-    // retries (bounded by DEFAULT_MAX_ROUNDS).
+    const writeTestsSpec: ReviewSessionSpec = {
+      role: "write-tests",
+      profile: "test-writer",
+      prompt: `${task.prompt}${TESTS_READY_SIGNAL}`,
+      // Structured output with a `tests_ready` done-signal — same early-exit
+      // protection as the implementer session.
+      schema: TestsReadySchema,
+      outputMode: "structured",
+      isReadOnly: false,
+    };
+    const reviewTestsSpec: ReviewSessionSpec = {
+      role: "review-tests",
+      profile: "test-reviewer",
+      prompt: REVIEW_TESTS_PROMPT,
+      schema: ReviewResultSchema,
+      outputMode: "structured",
+      isReadOnly: true,
+    };
+
+    // Test-first pipeline: test loop, then code loop, composed linearly.
     return linearRunner([
-      singleSession(writeTestsSpec)(),
-      reviewRunner(implSpec, reviewSpec)(),
+      reviewRunner(writeTestsSpec, reviewTestsSpec)(),
+      reviewRunner(codeImplSpec, codeReviewSpec)(),
     ]);
   }
 
-  return reviewRunner(implSpec, reviewSpec);
+  // Non-code: generic execute → review loop.
+  const executeSpec: ReviewSessionSpec = {
+    ...codeImplSpec,
+    role: "execute",
+  };
+  const reviewSpec: ReviewSessionSpec = {
+    ...codeReviewSpec,
+    role: "review",
+  };
+  return reviewRunner(executeSpec, reviewSpec);
 }
 
 /**
@@ -169,8 +228,9 @@ function resolveSessionPlan(
   if (isCode) {
     return [
       { role: "write-tests", profile: "test-writer" },
-      { role: "execute", profile: implProfile },
-      { role: "review", profile: "implement-reviewer" },
+      { role: "review-tests", profile: "test-reviewer" },
+      { role: "write-code", profile: implProfile },
+      { role: "review-code", profile: "implement-reviewer" },
     ];
   }
   return [

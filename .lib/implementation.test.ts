@@ -295,9 +295,9 @@ describe("implementationPhase — E4 migration: SessionScheduler + TaskGraph", (
     expect(mockAddTask.mock.calls[0][0]).toMatchObject({ id: "t-02" });
   });
 
-  // ── 3. Runner tree: code task = linearRunner([singleSession, reviewRunner]) ──
+  // ── 3. Runner tree: code task = linearRunner([reviewRunner(write-tests, review-tests), reviewRunner(write-code, review-code)]) ──
 
-  it("builds code-task tree as linearRunner([singleSession(write-tests)(), reviewRunner(execute, review)()])", async () => {
+  it("builds code-task tree as linearRunner([reviewRunner(write-tests, review-tests), reviewRunner(write-code, review-code)])", async () => {
     const taskGraph = makeMockTaskGraph();
 
     // Use a single code task so mock counts are unambiguous
@@ -325,20 +325,29 @@ describe("implementationPhase — E4 migration: SessionScheduler + TaskGraph", (
       "/work",
     );
 
-    // singleSession called once for write-tests spec
-    expect(mockSingleSession).toHaveBeenCalledTimes(1);
-    expect(mockSingleSession.mock.calls[0][0]).toMatchObject({
+    // singleSession is NOT used — both loops are reviewRunners now
+    expect(mockSingleSession).toHaveBeenCalledTimes(0);
+
+    // reviewRunner called twice: test loop, then code loop
+    expect(mockReviewRunner).toHaveBeenCalledTimes(2);
+
+    // Test loop: test-writer → test-reviewer
+    expect(mockReviewRunner.mock.calls[0][0]).toMatchObject({
       role: "write-tests",
       profile: "test-writer",
     });
-
-    // reviewRunner called once for execute → review loop
-    expect(mockReviewRunner).toHaveBeenCalledTimes(1);
-    expect(mockReviewRunner.mock.calls[0][0]).toMatchObject({
-      role: "execute",
-    });
     expect(mockReviewRunner.mock.calls[0][1]).toMatchObject({
-      role: "review",
+      role: "review-tests",
+      profile: "test-reviewer",
+    });
+
+    // Code loop: implementer → implement-reviewer
+    expect(mockReviewRunner.mock.calls[1][0]).toMatchObject({
+      role: "write-code",
+      profile: "implementer",
+    });
+    expect(mockReviewRunner.mock.calls[1][1]).toMatchObject({
+      role: "review-code",
       profile: "implement-reviewer",
     });
 
@@ -422,29 +431,32 @@ describe("implementationPhase — E4 migration: SessionScheduler + TaskGraph", (
       "/work",
     );
 
-    // reviewRunner execute spec uses the custom profile
-    expect(mockReviewRunner).toHaveBeenCalledTimes(1);
-    const executeSpec = mockReviewRunner.mock.calls[0][0] as Record<
+    // reviewRunner called twice (test loop + code loop); the custom profile
+    // substitutes for the implementer in the code loop's execute spec.
+    expect(mockReviewRunner).toHaveBeenCalledTimes(2);
+    const testLoopExec = mockReviewRunner.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    expect(executeSpec.role).toBe("execute");
-    expect(executeSpec.profile).toBe("implementer-lite");
+    expect(testLoopExec.role).toBe("write-tests");
+    expect(testLoopExec.profile).toBe("test-writer");
 
-    // Reviewer profile is always implement-reviewer
-    const reviewSpec = mockReviewRunner.mock.calls[0][1] as Record<
+    const codeLoopExec = mockReviewRunner.mock.calls[1][0] as Record<
+      string,
+      unknown
+    >;
+    expect(codeLoopExec.role).toBe("write-code");
+    expect(codeLoopExec.profile).toBe("implementer-lite");
+
+    // Reviewer profile for the code loop is always implement-reviewer
+    const reviewSpec = mockReviewRunner.mock.calls[1][1] as Record<
       string,
       unknown
     >;
     expect(reviewSpec.profile).toBe("implement-reviewer");
 
-    // Test-writer profile is always test-writer
-    expect(mockSingleSession).toHaveBeenCalledTimes(1);
-    const writeTestsSpec = mockSingleSession.mock.calls[0][0] as Record<
-      string,
-      unknown
-    >;
-    expect(writeTestsSpec.profile).toBe("test-writer");
+    // singleSession is not used
+    expect(mockSingleSession).toHaveBeenCalledTimes(0);
   });
 
   // ── 6. beforeTask hook returns { runner: factory, sessionPlan } ────────
@@ -481,10 +493,11 @@ describe("implementationPhase — E4 migration: SessionScheduler + TaskGraph", (
     // sessionPlan is an array of entries
     const plan = (result as { sessionPlan: unknown[] }).sessionPlan;
     expect(Array.isArray(plan)).toBe(true);
-    expect(plan).toHaveLength(3);
+    expect(plan).toHaveLength(4);
     expect(plan[0]).toMatchObject({ role: "write-tests" });
-    expect(plan[1]).toMatchObject({ role: "execute" });
-    expect(plan[2]).toMatchObject({ role: "review" });
+    expect(plan[1]).toMatchObject({ role: "review-tests" });
+    expect(plan[2]).toMatchObject({ role: "write-code" });
+    expect(plan[3]).toMatchObject({ role: "review-code" });
   });
 
   it("beforeTask hook returns { runner, sessionPlan } for non-code tasks", async () => {

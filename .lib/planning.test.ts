@@ -265,7 +265,7 @@ describe("planningPhase", () => {
     }
   });
 
-  it("configures the plan execute spec (filesystem output, no schema)", async () => {
+  it("configures the plan execute spec (structured output, PlanReadySchema)", async () => {
     const workDir = makeWorkDir(SAMPLE_PLAN);
     try {
       await planningPhase(
@@ -280,9 +280,9 @@ describe("planningPhase", () => {
 
       const spec = lastReviewRunnerExecuteSpec;
       expect(spec.profile).toBe("planner");
-      expect(spec.outputMode).toBe("filesystem");
+      expect(spec.outputMode).toBe("structured");
       expect(spec.isReadOnly).toBe(false);
-      expect(spec.schema).toBeUndefined();
+      expect(spec.schema).toBeDefined();
     } finally {
       rmSync(workDir, { recursive: true, force: true });
     }
@@ -368,7 +368,7 @@ describe("planningPhase", () => {
       expect(prompt).toContain("Research results...");
       expect(prompt).toContain(getPlanPath(workDir));
       expect(prompt).toContain("sandboxed");
-      expect(prompt).toContain("Do NOT output the plan as text");
+      expect(prompt).toContain("plan_ready");
     } finally {
       rmSync(workDir, { recursive: true, force: true });
     }
@@ -729,7 +729,7 @@ describe("planningPhase", () => {
 
     // ── 2. reviewRunner composition ───────────────────────────────────────
 
-    it("2. composes plan singleSession (filesystem) + review-plan singleSession (structured) via reviewRunner", async () => {
+    it("2. composes plan singleSession (structured) + review-plan singleSession (structured) via reviewRunner", async () => {
       const workDir = makeWorkDir(SAMPLE_PLAN);
       try {
         await planningPhase(
@@ -745,11 +745,12 @@ describe("planningPhase", () => {
         // reviewRunner must be called exactly once with the two specs
         expect(mockReviewRunner).toHaveBeenCalledTimes(1);
 
-        // Execute spec = plan step with filesystem output
+        // Execute spec = plan step with structured output (plan_ready done-signal)
         expect(lastReviewRunnerExecuteSpec).toMatchObject({
           profile: "planner",
-          outputMode: "filesystem",
+          outputMode: "structured",
         });
+        expect(lastReviewRunnerExecuteSpec.schema).toBeDefined();
         const execPrompt = lastReviewRunnerExecuteSpec.prompt as string;
         expect(execPrompt).toContain("planning agent");
         expect(execPrompt).toContain("Implement X");
@@ -805,7 +806,7 @@ describe("planningPhase", () => {
 
     // ── 4. Coverage preservation ──────────────────────────────────────────
 
-    it("4. preserves coverage: plan produced (filesystem), reviewed, loop retries on rejection", async () => {
+    it("4. preserves coverage: plan produced (structured done-signal), reviewed, loop retries on rejection", async () => {
       const workDir = makeWorkDir(SAMPLE_PLAN);
       try {
         await planningPhase(
@@ -823,9 +824,10 @@ describe("planningPhase", () => {
         expect(execPrompt).toContain("`write`");
         expect(execPrompt).toContain("plan-final.json");
         expect(execPrompt).toContain("sandboxed");
-        expect(execPrompt).toContain("Do NOT output the plan as text");
+        expect(execPrompt).toContain("plan_ready");
 
-        expect(lastReviewRunnerExecuteSpec.outputMode).toBe("filesystem");
+        expect(lastReviewRunnerExecuteSpec.outputMode).toBe("structured");
+        expect(lastReviewRunnerExecuteSpec.schema).toBeDefined();
 
         expect(lastReviewRunnerReviewSpec.outputMode).toBe("structured");
         expect(lastReviewRunnerReviewSpec.schema).toBeDefined();
