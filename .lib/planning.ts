@@ -189,6 +189,10 @@ export async function planningPhase(
       outputMode: "structured",
       schema: PlanReadySchema,
       isReadOnly: false,
+      // Confine writes to the run's artifacts dir only — the planner must not
+      // touch the rest of the repo. Matches the prompt's explicit sandbox
+      // statement. (The plan-reviewer below is read-only, so no sandbox.)
+      allowedWriteDirs: [artifactsDir],
       role: "plan",
     },
     {
