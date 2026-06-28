@@ -171,30 +171,30 @@ describe("migration: hookRegistry threaded into engine primitive calls", () => {
   });
 });
 
-// ─── (3b) Pool constructions carry BOTH auditLog and hookRegistry ──────────
+// ─── (3b) SessionScheduler constructions carry BOTH auditLog and hookRegistry ─
 //
-// After the B2/B4/B5 migrations, the phase files use RunnerPool instead of
-// LanePool. Each RunnerPool construction must thread auditLog (for the
+// After the E3-E5 migrations, the phase files use SessionScheduler instead of
+// RunnerPool. Each SessionScheduler construction must thread auditLog (for the
 // auditor) and hookRegistry (for the engine's default auditor hooks).
 
-describe("migration: Pool constructions carry auditLog + hookRegistry", () => {
-  it("scouting.ts scout RunnerPool is wired with auditLog and hookRegistry", () => {
-    // B2 migration: scouting.ts now uses RunnerPool (not LanePool).
-    expectContains(SCOUTING, "new RunnerPool");
+describe("migration: SessionScheduler constructions carry auditLog + hookRegistry", () => {
+  it("scouting.ts scout SessionScheduler is wired with auditLog and hookRegistry", () => {
+    // E3 migration: scouting.ts now uses SessionScheduler (not RunnerPool).
+    expectContains(SCOUTING, "new SessionScheduler");
     expectContains(SCOUTING, "auditLog");
     expectContains(SCOUTING, "hookRegistry");
   });
 
-  it("implementation.ts implementer RunnerPool is wired with auditLog and hookRegistry", () => {
-    // B4 migration: implementation.ts uses RunnerPool (not LanePool).
-    expectContains(IMPLEMENTATION, "new RunnerPool");
+  it("implementation.ts implementer SessionScheduler is wired with auditLog and hookRegistry", () => {
+    // E4 migration: implementation.ts uses SessionScheduler (not RunnerPool).
+    expectContains(IMPLEMENTATION, "new SessionScheduler");
     expectContains(IMPLEMENTATION, "auditLog");
     expectContains(IMPLEMENTATION, "hookRegistry");
   });
 
-  it("final-review.ts fixer RunnerPool is wired with auditLog and hookRegistry", () => {
-    // B5 migration: final-review.ts uses RunnerPool (not LanePool).
-    expectContains(FINAL_REVIEW, "new RunnerPool");
+  it("final-review.ts fixer SessionScheduler is wired with auditLog and hookRegistry", () => {
+    // E5 migration: final-review.ts uses SessionScheduler (not RunnerPool).
+    expectContains(FINAL_REVIEW, "new SessionScheduler");
     expectContains(FINAL_REVIEW, "auditLog");
     expectContains(FINAL_REVIEW, "hookRegistry");
   });

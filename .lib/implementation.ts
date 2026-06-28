@@ -1,16 +1,21 @@
 import type {
+  AgentProfile,
+  AuditLog,
   RendererRegistry,
-  Runner,
+  SessionPlanFactory,
   SessionSpec,
   StatusCallbacks,
+  TaskGraph,
   WorkflowRunOptions,
-  WorkflowStatusTracker,
 } from "@harms-haus/engin-engine";
 import {
-  RunnerPool,
+  AuditLog as AuditLogCtor,
+  SessionGate,
+  SessionScheduler,
   assignSequentialTaskIds,
   createHookRegistry,
   linearRunner,
+  loadProfilesFromDirs,
   reviewRunner,
   singleSession,
 } from "@harms-haus/engin-engine";
@@ -21,17 +26,30 @@ import { join } from "node:path";
 // ─── Runner-tree resolution ───────────────────────────────────────────────
 
 /**
- * A session-spec shaped value passed to the runner factories
- * (`singleSession`, `reviewRunner`). It is a {@link SessionSpec} minus the
- * deterministic `id` (assigned at run time from the task id) plus a `role`
- * label that drives session-id derivation and status callbacks.
+ * Spec for a single session consumed by {@link singleSession}. Mirrors the
+ * `Omit<SessionSpec, 'id' | 'attempt'> & { role: string; attempt?: number }`
+ * shape: all SessionSpec fields except the deterministic `id` (assigned at
+ * run time from the task id + role) plus a `role` label that drives session-id
+ * derivation.
  */
-type SessionRoleSpec = Omit<SessionSpec, "id"> & { role: string };
+type SingleSessionSpec = Omit<SessionSpec, "id" | "attempt"> & {
+  role: string;
+  attempt?: number;
+};
+
+/**
+ * Spec for a session consumed by {@link reviewRunner}. Mirrors the
+ * `Omit<SessionSpec, 'id' | 'attempt' | 'runnerRole'> & { role: string }`
+ * shape — `runnerRole` is derived from `role` internally.
+ */
+type ReviewSessionSpec = Omit<SessionSpec, "id" | "attempt" | "runnerRole"> & {
+  role: string;
+};
 
 /** One entry in a task's declared session plan — the ordered list of sessions
- *  a task's runner tree will produce (e.g. write-tests → review-tests →
- *  execute → review). Declared upfront so the TUI can show all planned
- *  sessions (including not-yet-started ones) and a progress counter (●N/M). */
+ *  a task's runner tree will produce (e.g. write-tests → execute → review).
+ *  Declared upfront so a TUI / observer can show all planned sessions and a
+ *  progress counter. */
 interface SessionPlanEntry {
   role: string;
   profile: string;
@@ -63,25 +81,29 @@ function resolveImplProfile(task: { profile?: string }): string {
 }
 
 /**
- * Build the runner tree for a single implementation task.
+ * Build the runner factory for a single implementation task.
  *
- * The tree mirrors the old step pipeline (`CODE_STEPS` / `NON_CODE_STEPS`) but
- * expressed as composed runners instead of {@link StepDefinition}s:
+ * The factory mirrors the old step pipeline (`CODE_STEPS` / `NON_CODE_STEPS`)
+ * but expressed as composed {@link SessionPlanFactory}-returning factories
+ * instead of {@link StepDefinition}s:
  *
  *   • Code tasks →
  *       linearRunner([
- *         singleSession(write-tests),
- *         reviewRunner(execute, review),
+ *         singleSession(write-tests)(),
+ *         reviewRunner(execute, review)(),
  *       ])
  *   • Non-code tasks →
- *       reviewRunner(
- *         execute = singleSession(execute),
- *         review  = singleSession(review),
- *       )
+ *       reviewRunner(execute, review)
+ *
+ * `singleSession`, `reviewRunner`, and `linearRunner` each return a
+ * {@link SessionPlanFactory} (`() => SessionPlanRunner`). For `linearRunner`,
+ * which expects `SessionPlanRunner[]`, the factories are invoked (`()`) to
+ * obtain concrete runner instances.
  *
  * `reviewRunner` drives the execute→review loop (approve / reject + feedback,
- * up to `DEFAULT_MAX_ROUNDS` rounds). The test-writer session only runs for
- * code tasks, ahead of the implement→review loop, via `linearRunner`.
+ * up to `DEFAULT_MAX_ROUNDS` rounds). The test-writer session (a plain
+ * `singleSession`) only runs for code tasks, ahead of the implement→review
+ * loop, via `linearRunner`.
  *
  * `isCode` is the planner-derived `is_code` signal (test-first vs
  * execute→review). It is deliberately passed in explicitly rather than read
@@ -91,10 +113,10 @@ function resolveImplProfile(task: { profile?: string }): string {
 function resolveImplementationRunner(
   task: { profile?: string; prompt: string },
   isCode: boolean,
-): { runner: Runner; plan: SessionPlanEntry[] } {
+): SessionPlanFactory {
   const implProfile = resolveImplProfile(task);
 
-  const writeTestsSpec: SessionRoleSpec = {
+  const writeTestsSpec: SingleSessionSpec = {
     role: "write-tests",
     runnerRole: "write-tests",
     profile: "test-writer",
@@ -103,87 +125,85 @@ function resolveImplementationRunner(
     isReadOnly: false,
     attempt: 1,
   };
-  const reviewTestsSpec: SessionRoleSpec = {
-    role: "review-tests",
-    runnerRole: "review-tests",
-    profile: "test-reviewer",
-    prompt: REVIEW_PROMPT,
-    schema: ReviewResultSchema,
-    outputMode: "structured",
-    isReadOnly: true,
-    attempt: 1,
-  };
-  const implSpec: SessionRoleSpec = {
+  const implSpec: ReviewSessionSpec = {
     role: "execute",
-    runnerRole: "execute",
     profile: implProfile,
     prompt: task.prompt,
     outputMode: "text",
     isReadOnly: false,
-    attempt: 1,
   };
-  const reviewSpec: SessionRoleSpec = {
+  const reviewSpec: ReviewSessionSpec = {
     role: "review",
-    runnerRole: "review",
     profile: "implement-reviewer",
     prompt: REVIEW_PROMPT,
     schema: ReviewResultSchema,
     outputMode: "structured",
     isReadOnly: true,
-    attempt: 1,
   };
 
   if (isCode) {
     // Test-first pipeline mirroring the pre-session-first CODE_STEPS:
-    //   write-tests → review-tests  (test review loop)
-    //   execute     → review        (code review loop)
-    // composed linearly. Both loops are reviewRunners so a rejection feeds
-    // feedback back and retries (bounded by DEFAULT_MAX_ROUNDS).
-    const testReviewLoop = reviewRunner(writeTestsSpec, reviewTestsSpec);
-    const codeReviewLoop = reviewRunner(implSpec, reviewSpec);
-    return {
-      runner: linearRunner([testReviewLoop, codeReviewLoop]),
-      plan: [
-        { role: "write-tests", profile: "test-writer" },
-        { role: "review-tests", profile: "test-reviewer" },
-        { role: "execute", profile: implProfile },
-        { role: "review", profile: "implement-reviewer" },
-      ],
-    };
+    //   write-tests  (singleSession — test generation)
+    //   execute      → review  (reviewRunner — code review loop)
+    // composed linearly. The review loop feeds rejection feedback back and
+    // retries (bounded by DEFAULT_MAX_ROUNDS).
+    return linearRunner([
+      singleSession(writeTestsSpec)(),
+      reviewRunner(implSpec, reviewSpec)(),
+    ]);
   }
 
-  return {
-    runner: reviewRunner(implSpec, reviewSpec),
-    plan: [
+  return reviewRunner(implSpec, reviewSpec);
+}
+
+/**
+ * Resolve the declared session-plan entries for a task — the ordered list of
+ * sessions the runner tree will produce. Used by the `beforeTask` hook so
+ * observers can render planned sessions + a progress counter.
+ */
+function resolveSessionPlan(
+  task: { profile?: string },
+  isCode: boolean,
+): SessionPlanEntry[] {
+  const implProfile = resolveImplProfile(task);
+  if (isCode) {
+    return [
+      { role: "write-tests", profile: "test-writer" },
       { role: "execute", profile: implProfile },
       { role: "review", profile: "implement-reviewer" },
-    ],
-  };
+    ];
+  }
+  return [
+    { role: "execute", profile: implProfile },
+    { role: "review", profile: "implement-reviewer" },
+  ];
 }
 
 // ─── Phase 5: Implementation ────────────────────────────────────────────────
 
 /**
  * Execute the implementation plan by:
- * 1. Loading tasks into the tracker
- * 2. Dispatching tasks to a {@link RunnerPool} where each task runs its
- *    resolved runner tree (test → implement → review)
+ * 1. Loading tasks into the shared {@link TaskGraph} (each with its resolved
+ *    runner factory).
+ * 2. Dispatching the graph through a {@link SessionScheduler} where each task
+ *    runs its resolved runner tree (test → implement → review).
  *
  * Runner resolution is provided via TWO seams that share a single helper
  * (`resolveImplementationRunner`):
- *   1. `getRunnerForTask` — the {@link RunnerPool} option that returns the
- *      runner tree for a task.
- *   2. `beforeTask` hook — invoked at claim time; returns `{ runner }` so a
- *      workflow that supplies its OWN `beforeTask` subscriber can override the
- *      runner (first-wins: the first non-`undefined` result decides).
+ *   1. `taskGraph.addTask(task, runnerFactory)` — the primary runner source;
+ *      the scheduler instantiates the runner from the factory at claim time.
+ *   2. `beforeTask` hook — invoked at claim time; returns
+ *      `{ runner: SessionPlanFactory, sessionPlan }` so a workflow that
+ *      supplies its OWN `beforeTask` subscriber can override the runner
+ *      (first-wins: the first non-`undefined` result decides).
  *
  * Resume: the explicit session-wipe for non-complete tasks was removed. Replay
  * idempotency (`runSession` skips cached sessions) handles resume, and the
- * pool's internal retry valve (`clearTaskSessions` in `maybeRetry`) handles
- * retry-wipes. The workflow no longer touches persisted sessions on resume.
+ * scheduler's internal retry handling clears sessions for retried tasks. The
+ * workflow no longer touches persisted sessions on resume.
  */
 export async function implementationPhase(
-  tracker: WorkflowStatusTracker,
+  taskGraph: TaskGraph,
   profilesDirs: string[],
   plan: Plan,
   cwd: string,
@@ -197,7 +217,8 @@ export async function implementationPhase(
   worktreeManager?: WorkflowRunOptions["worktreeManager"],
   modelConcurrency: Record<string, number> = {},
 ): Promise<void> {
-  // 1. Load plan tasks into the tracker (renumber IDs to sequential t-0N form).
+  // 1. Load plan tasks into the shared task graph (renumber IDs to sequential
+  //    t-0N form). Each task gets its resolved runner factory.
   //
   // `is_code` is a planner/workflow signal that controls runner flow
   // (test-first vs execute→review). It is NOT threaded onto the engine Task —
@@ -209,102 +230,106 @@ export async function implementationPhase(
   const taskIsCode = new Map<string, boolean>();
   for (const task of renumberedTasks) {
     taskIsCode.set(task.id, task.is_code);
-    if (!tracker.taskTracker.getTask(task.id)) {
-      tracker.taskTracker.addTask({
-        id: task.id,
-        title: task.title,
-        prompt: task.prompt,
-        profile: task.profile,
-        files: task.files,
-        dependencies: task.dependencies,
-        worktree: "code",
-        phaseId: "implementing",
-      });
+    if (!taskGraph.getTask(task.id)) {
+      const runnerFactory = resolveImplementationRunner(
+        task,
+        task.is_code,
+      );
+      taskGraph.addTask(
+        {
+          id: task.id,
+          title: task.title,
+          prompt: task.prompt,
+          profile: task.profile,
+          files: task.files,
+          dependencies: task.dependencies,
+          worktree: "code",
+          phaseId: "implementing",
+          status: "ready",
+        },
+        runnerFactory,
+      );
     }
   }
 
-  // Validate that all dependency references are valid
-  tracker.taskTracker.validateAllDependencies();
+  // Validate dependencies: TaskGraph performs cycle detection at add time
+  // (addTask throws on a cycle). Deadlocked tasks (missing deps) are detected
+  // and failed by SessionScheduler.run() at startup via failDeadlockedTasks().
 
   // NOTE: no explicit session-wipe on resume. Replay idempotency (runSession
-  // skips cached sessions) handles resumed tasks; the pool's retry valve
-  // clears sessions for retried tasks. See resolveImplementationRunner doc.
-
-  const sessionBaseDir = join(workDir, "sessions");
+  // skips cached sessions) handles resumed tasks; the scheduler handles
+  // retry-wipes. See resolveImplementationRunner doc.
 
   // 2. Resolve the hook registry. spir.ts forwards the engine-assembled (or
   // freshly created) registry so the engine's default auditor + prompt hooks
-  // fire for this phase's runner pool. Direct callers that omit it get a
-  // fresh local registry so the `beforeTask` runner-substitution hook below
-  // still has a home.
+  // fire for this phase's scheduler. Direct callers that omit it get a fresh
+  // local registry so the `beforeTask` runner-substitution hook below still
+  // has a home.
   const resolvedRegistry = hookRegistry ?? createHookRegistry();
 
   // 3. Register the `beforeTask` runner-substitution hook. This fires at
   // claim time (first-wins). A workflow-provided `beforeTask` subscriber
   // registered BEFORE this one wins; one registered AFTER is short-circuited.
   //
-  // Cast: the engine's `BeforeTaskResult` type doesn't yet include a `runner`
-  // field (transitional gap — the runner-pool handles it at runtime by casting
-  // the hook result to `Record<string, unknown>` and checking `result.runner`).
-  // Resolve the runner + declared session plan for a task via the shared
-  // helper + sidecar map. Falls back to test-first (is_code=true) when the
-  // task id isn't in the sidecar (defensive — the map is populated for every
-  // plan task above).
-  const resolveRunner = (
-    task: { id: string; profile?: string; prompt: string },
-  ): { runner: Runner; plan: SessionPlanEntry[] } =>
-    resolveImplementationRunner(task, taskIsCode.get(task.id) ?? true);
-
+  // The hook returns `{ runner: SessionPlanFactory, sessionPlan }`. The
+  // scheduler checks `typeof result.runner === 'object'` — a factory is a
+  // function, so the scheduler falls through to the task's runnerFactory
+  // (registered via addTask, which is the same factory). The hook exists so
+  // external beforeTask subscribers can override the runner, and so the
+  // declared sessionPlan is available for observer consumers.
+  //
+  // `is_code` is read from the sidecar map (keyed by task id). Falls back to
+  // test-first (is_code=true) when the task id isn't in the sidecar
+  // (defensive — the map is populated for every plan task above).
   resolvedRegistry.register({
     beforeTask: ({
       task,
     }: {
       task: { id: string; profile?: string; prompt: string };
     }) => {
-      const { runner, plan } = resolveRunner(task);
-      // `sessionPlan` is read by the RunnerPool and threaded into onTaskStart
-      // so the TUI can render all planned sessions + a ●N/M progress counter.
-      return { runner, sessionPlan: plan };
+      const isCode = taskIsCode.get(task.id) ?? true;
+      const runner = resolveImplementationRunner(task, isCode);
+      const sessionPlan = resolveSessionPlan(task, isCode);
+      return { runner, sessionPlan };
     },
   } as never);
 
-  // 4. Create and run the runner pool
-  const pool = new RunnerPool({
-    maxConcurrentSessions: maxConcurrentTasks,
-    modelConcurrency,
-    profilesDirs,
-    phaseId: "implementing",
-    sessionBaseDir,
+  // 4. Load profiles + build the session gate, audit log, and active-session
+  //    set for the SessionScheduler.
+  const profiles: Map<string, AgentProfile> =
+    await loadProfilesFromDirs(profilesDirs);
+  const gate = new SessionGate({
+    total: maxConcurrentTasks,
+    perModel: modelConcurrency,
+  });
+  const auditLog: AuditLog = new AuditLogCtor(workDir);
+  const activeSessions = new Set<{ abort(): Promise<void> }>();
+
+  const scheduler = new SessionScheduler({
+    graph: taskGraph,
+    gate,
+    profiles,
+    sessionBaseDir: join(workDir, "sessions"),
     cwd,
-    apiKeys,
     onStatus,
-    auditLog: tracker.auditLog,
-    taskTracker: tracker.taskTracker,
-    rendererRegistry,
-    // Runner tree source: returns the composed runner (test → implement →
-    // review) for each task. Replaces the old getStepsForTask seam.
-    getRunnerForTask: (task) => resolveRunner(task).runner,
-    // Thread the resolved hook registry so the pool fires the `beforeTask`
-    // hook registered above (runner substitution) AND so the engine's
-    // default auditor / prompt hooks fire for this pool.
     hookRegistry: resolvedRegistry,
-    // Thread the worktree manager (if supplied by the workflow run) so each
-    // task runner can operate in its own isolated worktree.
-    worktreeManager,
-    // A failed task is reset and re-run (sessions cleared by the pool) up
-    // to 2 extra times — 3 total attempts — before it is left failed.
-    maxTaskRetries: 2,
+    auditLog,
     signal,
+    phaseId: "implementing",
+    ...(apiKeys !== undefined ? { apiKeys } : {}),
+    ...(rendererRegistry !== undefined ? { rendererRegistry } : {}),
+    ...(worktreeManager !== undefined ? { worktreeManager } : {}),
+    activeSessions,
   });
 
-  const result = await pool.run();
+  const result = await scheduler.run();
 
-  // Defense-in-depth: check pool result against tracker state
-  const totalTasks = tracker.taskTracker.getAllTasks().length;
+  // Defense-in-depth: check scheduler result against graph state
+  const totalTasks = taskGraph.getAllTasks().length;
   const settledTasks = result.completedTasks + result.failedTasks;
   if (settledTasks !== totalTasks) {
     console.warn(
-      `[implementationPhase] Pool result discrepancy: ${settledTasks} settled tasks (${result.completedTasks} completed + ${result.failedTasks} failed) vs ${totalTasks} total tasks in tracker`,
+      `[implementationPhase] Scheduler result discrepancy: ${settledTasks} settled tasks (${result.completedTasks} completed + ${result.failedTasks} failed) vs ${totalTasks} total tasks in graph`,
     );
   }
 }

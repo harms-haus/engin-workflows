@@ -1,4 +1,4 @@
-import type { AgentProfile, HarnessCreationOptions, StatusCallbacks, WorkflowStatusTracker, AuditEvent } from "@harms-haus/engin-engine";
+import type { AgentProfile, HarnessCreationOptions, StatusCallbacks, AuditEvent } from "@harms-haus/engin-engine";
 import { loadProfilesFromDirs, forwardAgentStatus } from "@harms-haus/engin-engine";
 
 // ─── Audit Event Helpers ─────────────────────────────────────────────────
@@ -51,27 +51,4 @@ export async function makeHarnessOptions(
 ): Promise<HarnessCreationOptions> {
     const profile = await getProfile(profilesDirs, profileId);
     return { profile, cwd, apiKeys, agentId, onAgentStatus: forwardAgentStatus(onStatus) };
-}
-
-// ─── Helper: track an agent spawn ─────────────────────────────────────────
-//
-// Single source of truth for the 3-line spawn-tracking pattern (projection +
-// tracker + counter). Passing `info` once guarantees the onAgentSpawn payload
-// and tracker record cannot diverge.
-
-export interface SpawnInfo {
-    agentId: string;
-    profile: string;
-    phaseId: string;
-    taskId?: string;
-}
-
-export function spawnAgent(
-    tracker: WorkflowStatusTracker,
-    onStatus: StatusCallbacks | undefined,
-    info: SpawnInfo,
-): void {
-    onStatus?.onAgentSpawn?.(info);
-    tracker.recordAgentSpawn(info);
-    tracker.incrementAgentCount();
 }

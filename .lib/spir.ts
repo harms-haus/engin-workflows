@@ -7,20 +7,34 @@
 // SPIR-specific phase hooks, and the top-level orchestrator that drives the
 // engine's `PhaseRunner`.
 //
-// The hand-written `executePhase` switch + `runSpir` phase loop have been
-// replaced by `PhaseRunner` (task-20): phases are declared as
-// `PhaseDefinition[]` (`{ id, label, icon, run }`), and the SPIR-specific
-// orchestration (scouting ≤3-rounds retry, scouting collect-loop, sidebar
-// indicator) is registered as phase-level hooks on the hookRegistry.
+// ── Contract migration (kb-28 / E2) ────────────────────────────────────────
+//   WorkflowStatusTracker → REMOVED (resume state read from EventStore projection)
+//   tracker.taskTracker   → TaskGraph
+//   RunnerPool            → SessionScheduler (constructed by phase modules in E3-E6)
+//   tracker.setTaskPrompt → onStatus.onWorkflowStart (event)
+//   tracker.setWorktree   → onStatus.onWorkflowStart (event)
+//   tracker.setWorkflowData → onStatus.onWorkflowData (event)
+//   tracker.save/setPhase → REMOVED (PhaseRunner emits via onStatus per D6)
+//   tracker.auditLog      → AuditLog from options or constructed from workDir
+//   taskTracker.cancelTask → signal abort (SessionScheduler handles cancellation)
+//
+// Phase execution: each phase's run() callback receives the TaskGraph +
+// SessionScheduler factory via closure scope. The phase BODY modules
+// (scouting.ts, planning.ts, implementation.ts, final-review.ts) still use
+// old APIs — E3-E6 will rewrite them to consume TaskGraph + SessionScheduler
+// directly.
 import type {
+  AuditLog,
   PhaseDefinition,
+  PhaseTracker,
   RendererRegistry,
   StatusCallbacks,
   WorkflowRunOptions,
 } from "@harms-haus/engin-engine";
 import {
+  AuditLog as AuditLogCtor,
   PhaseRunner,
-  WorkflowStatusTracker,
+  TaskGraph,
   createDefaultAuditor,
   createHookRegistry,
   resolveProfilesDirs,
@@ -83,10 +97,6 @@ export function getPhaseIndicator(
   return entry?.icon ?? "⏳";
 }
 
-function getSpirData(tracker: WorkflowStatusTracker): SpirWorkflowData {
-  return tracker.workflowData as SpirWorkflowData;
-}
-
 // ─── Orchestrator: runSpir ───────────────────────────────────────────────────
 
 /**
@@ -103,6 +113,10 @@ function getSpirData(tracker: WorkflowStatusTracker): SpirWorkflowData {
  * as a `PhaseDefinition[]` and the SPIR-specific orchestration (scouting retry,
  * scouting collect-loop, sidebar indicator) is registered as phase-level hooks
  * on the (created or passed-in) hookRegistry.
+ *
+ * Resume state is read from `options.eventStore.getProjection()` — the
+ * workflow data (research/scoutingFiles/plan) lives in `projection.workflowData`
+ * via the `workflow_data_set` event.
  */
 export async function runSpir(
   config: WorkflowConfig,
@@ -115,6 +129,7 @@ export async function runSpir(
     workDir,
     onStatus,
     signal,
+    eventStore,
     rendererRegistry,
     hookRegistry: optionsHookRegistry,
     worktreeManager,
@@ -125,48 +140,30 @@ export async function runSpir(
     options.profilesDirs ?? resolveProfilesDirs(options.cwd, config.name);
   const workflowStartTime = Date.now();
 
-  // Create or load tracker (or reuse a passed-in one)
-  let tracker: WorkflowStatusTracker;
-  let resumed: boolean;
-  if (options.tracker instanceof WorkflowStatusTracker) {
-    tracker = options.tracker;
-    // A passed tracker is "resumed" only if it has progress from a previous run
-    resumed = tracker.completedPhaseIds.length > 0;
-  } else {
-    try {
-      tracker = await WorkflowStatusTracker.load(workDir);
-      resumed = true;
-    } catch (err: unknown) {
-      const isNotFound =
-        err instanceof Error &&
-        err.message.startsWith("Workflow state file not found");
-      if (isNotFound) {
-        tracker = new WorkflowStatusTracker(workDir);
-        resumed = false;
-      } else {
-        throw err;
-      }
-    }
-  }
+  // ── Read resume state from EventStore projection ─────────────────
+  //
+  // Replaces WorkflowStatusTracker.load(). The projection carries the
+  // workflow data (research, scoutingFiles, plan, scoutingReports) via the
+  // `workflowData` field, the current/completed phase ids, and stats — all
+  // sourced from the event log.
+  const projection = eventStore?.getProjection();
+  const resumed = (projection?.completedPhaseIds?.length ?? 0) > 0;
+  const spirData: SpirWorkflowData = (projection?.workflowData ?? {}) as SpirWorkflowData;
+  const currentPhaseId = projection?.currentPhaseId ?? "";
 
-  tracker.setTaskPrompt(taskPrompt);
-  if (options.worktree) tracker.setWorktree(options.worktree);
-  await tracker.save();
-
-  // The engine composes store + UI + bridge callbacks into onStatus before calling runSpir; the backbone consumes it directly.
+  // ── Emit workflow start (replaces tracker.setTaskPrompt / setWorktree) ──
   onStatus?.onWorkflowStart?.({ taskPrompt, resumed, workDir });
 
   // ── Register phases via phase_registered events ─────────────────
+  // PhaseRunner also emits these via onStatus when provided, but emitting
+  // here ensures registration BEFORE the first sidebar update.
   for (const p of config.phases) {
     onStatus?.onPhaseRegister?.({ id: p.id, label: p.label, icon: p.icon });
   }
 
   // ── Sidebar: initial phase metadata ─────────────────────────────
-  // Resolve the starting phase for the initial sidebar indicator. The
-  // PhaseRunner drives the actual transitions; this is display-only.
-  const currentId = tracker.currentPhaseId;
-  const startPhase: Phase = (PHASES as readonly string[]).includes(currentId)
-    ? (currentId as Phase)
+  const startPhase: Phase = (PHASES as readonly string[]).includes(currentPhaseId)
+    ? (currentPhaseId as Phase)
     : PHASES[0];
 
   // On resume, use truncated title and skip AI generation
@@ -186,7 +183,9 @@ export async function runSpir(
       cwd,
       apiKeys,
       onStatus,
-      tracker,
+      // E3-E6: initializationPhase will drop the tracker param; for now it
+      // is unused inside the function body, so pass undefined.
+      undefined as never,
       workDir,
     );
     onStatus?.onSidebarUpdate?.({
@@ -195,42 +194,41 @@ export async function runSpir(
     });
   }
 
+  // ── Build TaskGraph (replaces tracker.taskTracker) ──────────────
+  const taskGraph = new TaskGraph();
+
   // ── Resolve / create the hook registry ──────────────────────────
-  //
-  // Thread `options.hookRegistry` (engine-assembled) when supplied;
-  // otherwise create a fresh registry so the SPIR phase hooks have a home.
-  // Infer the type from the `??` expression so the interface-typed
-  // `optionsHookRegistry` and the class-typed `createHookRegistry()` both
-  // widen to the structural `HookRegistry` interface (the type
-  // `PhaseRunnerOptions.hookRegistry` expects).
-  //
-  // Declared BEFORE the phase bodies so the `implementing` closure can
-  // forward the resolved (never-`undefined`) registry into
-  // `implementationPhase`, which registers its `beforeTask` step-substitution
-  // hook against it. (Phase bodies are async closures executed later by the
-  // PhaseRunner, so there is no TDZ concern at runtime; declaring it here
-  // keeps the data-flow obvious.)
   const hookRegistry = optionsHookRegistry ?? createHookRegistry();
-  // Register the default auditor once so both RunnerPool and runTask paths
-  // audit structured_output/decision events. Spreading the auditor's
-  // onStructuredOutput + onDecision observe-hook subscribers against the
-  // resolved registry is what translates the engine's fires into durable
-  // AuditLog appends (replacing the deleted per-phase manual appends).
-  const auditor = createDefaultAuditor(tracker.auditLog);
+
+  // ── Register the default auditor ────────────────────────────────
+  //
+  // The auditLog is obtained from options (when the engine supplies one) or
+  // constructed fresh from workDir. This replaces the old
+  // `createDefaultAuditor(tracker.auditLog)` — the tracker is gone.
+  const auditLog: AuditLog = options.auditLog ?? new AuditLogCtor(workDir);
+  const auditor = createDefaultAuditor(auditLog);
   hookRegistry.register({
     onStructuredOutput: auditor.onStructuredOutput,
     onDecision: auditor.onDecision,
   });
+
+  // ── Helper: emit workflowData via events (replaces tracker.setWorkflowData) ──
+  const emitWorkflowData = (data: Record<string, unknown>): void => {
+    onStatus?.onWorkflowData?.({ data });
+  };
 
   // ── PhaseDefinition[] — the phase bodies close over runSpir-locals ──
   //
   // Each `run` callback calls the SAME sibling phase body the old
   // `executePhase` switch did. The orchestration (loop, transitions,
   // retry) is owned by the PhaseRunner; the SPIR business logic stays in
-  // the workflow layer. `ctx.state` is the PhaseRunner's shared mutable
-  // state bag — the fields mirror the legacy `RunState` (research, plan,
-  // scoutingReports, scoutingRounds, scoutingGaps, scoutingFiles) plus
-  // `scoutingReady`, which the `shouldRetryPhase` hook reads.
+  // the workflow layer. The phase bodies close over `taskGraph`,
+  // `spirData`, `emitWorkflowData`, etc.
+  //
+  // NOTE: The phase module calls (scoutingPhase, planningPhase, etc.) still
+  // use old signatures that expect WorkflowStatusTracker as first arg. E3-E6
+  // will rewrite these modules to consume TaskGraph + SessionScheduler. The
+  // `as never` casts on the first argument bridge the red window.
   const phaseRuns: Record<Phase, PhaseDefinition["run"]> = {
     // ── Scouting: get topics → lane-pool scouts → review → loop if needed ──
     scouting: async (ctx) => {
@@ -238,12 +236,8 @@ export async function runSpir(
       const gaps = (state.scoutingGaps as ScoutingGap[] | undefined) ?? [];
       const rounds = (state.scoutingRounds as number | undefined) ?? 0;
 
-      // scoutingPhase adds scout tasks to the SHARED tracker and runs the
-      // RunnerPool against it. It no longer collects/returns reports — the
-      // onPhaseSettled hook owns cross-round accumulation + persistence
-      // (it re-reads the same shared tracker once the phase settles).
       await scoutingPhase(
-        tracker,
+        taskGraph as never,
         profilesDirs,
         taskPrompt,
         cwd,
@@ -253,25 +247,21 @@ export async function runSpir(
         onStatus,
         ctx.signal,
         {
-          // On follow-up rounds, use gaps from the previous review directly
           topics: gaps.length > 0 ? gaps : undefined,
           round: rounds,
         },
         hookRegistry,
       );
 
-      // Read the cumulative complete scout reports off the shared tracker
-      // for THIS round's review. Scout tasks accumulate across rounds on
-      // the same tracker, so this naturally includes every prior round's
-      // reports (no manual existingReports threading needed) — matching
-      // exactly what the onPhaseSettled hook will fold into state.
-      const reports = tracker.taskTracker
+      // Read the cumulative complete scout reports off the task graph for
+      // THIS round's review.
+      const reports = taskGraph
         .getAllTasks()
-        .filter((t) => t.status === "complete" && t.phaseId === "scouting")
-        .map((t) => t.result);
+        .filter((e) => e.status === "complete" && e.task.phaseId === "scouting")
+        .map((e) => e.task.result);
 
       const review = await scoutingReviewPhase(
-        tracker,
+        taskGraph as never,
         profilesDirs,
         taskPrompt,
         reports,
@@ -287,15 +277,11 @@ export async function runSpir(
       state.scoutingGaps = review.gaps;
       state.scoutingFiles = review.files ?? [];
       state.scoutingReady = review.ready;
-      tracker.setWorkflowData({
+      emitWorkflowData({
         research: state.research,
         scoutingFiles: state.scoutingFiles,
       });
 
-      // Clear gaps when ready OR when rounds are exhausted (proceed with
-      // current research either way). The shouldRetryPhase hook breaks
-      // the loop; clearing gaps here ensures the planner never sees
-      // stale follow-up topics.
       if (review.ready || (state.scoutingRounds as number) >= 3) {
         state.scoutingGaps = [];
       }
@@ -307,16 +293,15 @@ export async function runSpir(
       let research = state.research as string | undefined;
       let scoutingFiles = state.scoutingFiles as string[] | undefined;
 
-      // Derive research from saved scouting reports if not yet available
+      // Derive research from projection data if not yet available
       if (!research) {
-        const data = getSpirData(tracker);
-        if (data.research) {
-          research = data.research;
-          scoutingFiles = scoutingFiles ?? data.scoutingFiles;
+        if (spirData.research) {
+          research = spirData.research;
+          scoutingFiles = scoutingFiles ?? spirData.scoutingFiles;
         } else {
-          const reports = (data.scoutingReports as unknown[]) ?? [];
+          const reports = (spirData.scoutingReports as unknown[]) ?? [];
           const review = await scoutingReviewPhase(
-            tracker,
+            taskGraph as never,
             profilesDirs,
             taskPrompt,
             reports,
@@ -329,17 +314,14 @@ export async function runSpir(
           );
           research = review.research;
           scoutingFiles = review.files ?? [];
-          tracker.setWorkflowData({ research, scoutingFiles });
+          emitWorkflowData({ research, scoutingFiles });
         }
         state.research = research;
         state.scoutingFiles = scoutingFiles;
       }
 
-      // planningPhase runs plan → review-plan as a reviewRunner loop
-      // (dispatched via RunnerPool) that owns its own replan-on-rejection
-      // cycle internally, so this body just runs it once and advances.
       const plan = await planningPhase(
-        tracker,
+        taskGraph as never,
         profilesDirs,
         research,
         scoutingFiles ?? [],
@@ -350,27 +332,23 @@ export async function runSpir(
         onStatus,
         ctx.signal,
         rendererRegistry,
-        // Thread the resolved hook registry (the one the default auditor
-        // was registered against) instead of the raw options value, so
-        // the planning phase's RunnerPool hook observers fire.
         hookRegistry,
       );
 
-      state.plan = plan ?? getSpirData(tracker).plan;
+      state.plan = plan ?? spirData.plan;
     },
 
     // ── Implementation: run the plan tasks via lane pool ──
     implementing: async (ctx) => {
       const state = ctx.state;
       let plan = state.plan as Plan | undefined;
-      // Load plan from tracker on resume
       if (!plan) {
-        plan = getSpirData(tracker).plan;
+        plan = spirData.plan;
         state.plan = plan;
       }
       if (plan) {
         await implementationPhase(
-          tracker,
+          taskGraph as never,
           profilesDirs,
           plan,
           cwd,
@@ -380,16 +358,8 @@ export async function runSpir(
           onStatus,
           ctx.signal,
           rendererRegistry,
-          // Thread the resolved hook registry (never `undefined`) so the
-          // implementation phase can register its `beforeTask` step-substitution
-          // hook AND so the engine's default auditor / prompt hooks fire for
-          // its lane pool. Without this, the removed `getStepsForTask` shim
-          // would leave the pool with no step source.
           hookRegistry,
-          // Thread the worktree manager so task lanes can create/merge their
-          // own worktrees when a workflow run opts into worktree isolation.
           worktreeManager,
-          // Per-model concurrency caps from config (default {} = unbounded).
           config.modelConcurrency ?? {},
         );
       }
@@ -398,7 +368,7 @@ export async function runSpir(
     // ── Review: final quality check + fixer loop ──
     review: async (ctx) => {
       await finalReviewPhase(
-        tracker,
+        taskGraph as never,
         profilesDirs,
         cwd,
         workDir,
@@ -431,40 +401,26 @@ export async function runSpir(
 
   // ── Register SPIR phase hooks ───────────────────────────────────
   //
-  // The SPIR-specific orchestration moves OUT of the imperative loop and
-  // INTO declarative phase-level hooks on the registry. The old
-  // `executePhase` switch / `completePhase` helper fired StatusCallbacks
-  // (onPhaseStart, onPhaseComplete) and had an explicit signal-abort guard;
-  // the PhaseRunner doesn't fire these itself, so they are re-emitted here
-  // via the registry hooks. The hook set is:
-  //   • beforePhase          — abort guard + onPhaseStart callback
+  // The SPIR-specific orchestration lives in declarative phase-level hooks.
+  // The PhaseRunner now emits onPhaseStart / onPhaseComplete / onPhaseRegister
+  // via onStatus itself (D6), so these hooks own only:
+  //   • beforePhase          — abort guard
   //   • shouldRetryPhase     — scouting ≤3-rounds retry policy
-  //   • onPhaseSettled       — scouting collect-loop (task-38)
-  //   • afterPhase           — onPhaseComplete callback + sidebar indicator
+  //   • onPhaseSettled       — scouting collect-loop
+  //   • afterPhase           — sidebar indicator update
   hookRegistry.register({
-    // Abort guard + onPhaseStart: the PhaseRunner has no built-in abort
-    // check between phases, so reproduce the legacy `signal?.aborted` guard
-    // here. Throwing 'Workflow cancelled' propagates to runSpir's catch
-    // block, which cancels active tasks and persists the tracker. The
-    // onPhaseStart callback carries the phase id and a round number
-    // (scoutingRounds for scouting, else 0) — matching the legacy
-    // `executePhase` payload shape.
-    beforePhase: async (args, ctx) => {
+    // Abort guard: the PhaseRunner has no built-in abort check between
+    // phases, so reproduce the legacy `signal?.aborted` guard here. Throwing
+    // 'Workflow cancelled' propagates to runSpir's catch block.
+    beforePhase: async (_args, ctx) => {
       if (ctx.signal?.aborted) {
         throw new Error("Workflow cancelled");
       }
-      const round =
-        args.phaseId === "scouting"
-          ? ((args.state.scoutingRounds as number | undefined) ?? 0)
-          : 0;
-      onStatus?.onPhaseStart?.({ phase: args.phaseId, round });
-      // Returning undefined abstains — the phase runs normally.
       return undefined;
     },
 
     // Scouting ≤3 rounds: retry while the review is not ready AND fewer
-    // than 3 rounds have completed. Abstains (returns undefined) for every
-    // other phase so non-scouting phases keep their default behavior.
+    // than 3 rounds have completed. Abstains for every other phase.
     shouldRetryPhase: async (args) => {
       if (args.phaseId !== "scouting") return undefined;
       if (args.state.scoutingReady === true) return undefined;
@@ -473,86 +429,72 @@ export async function runSpir(
       return true;
     },
 
-    // Scouting collect-loop: fold the tracker's settled scout-task results
-    // into the shared state bag so the next scouting round (and the
-    // planning phase) can read them. Because scout tasks accumulate on the
-    // SHARED tracker across the ≤3 rounds, this collection is naturally
-    // cumulative (it overwrites state.scoutingReports with the full set
-    // each settlement). The reports are ALSO persisted to workflowData so
-    // the planning phase's resume path (which reads data.scoutingReports)
-    // works — the PhaseRunner persists only its setPhase transitions, not
-    // the shared state bag, so persistence must be explicit here.
-    // Non-scouting phases are untouched.
+    // Scouting collect-loop: fold the task graph's settled scout-task
+    // results into the shared state bag so the next scouting round (and
+    // the planning phase) can read them.
     onPhaseSettled: async (args) => {
       if (args.phaseId !== "scouting") return;
       const reports = args.tasks
         .filter((t) => t.status === "complete" && t.phaseId === "scouting")
         .map((t) => t.result);
       args.state.scoutingReports = reports;
-      tracker.setWorkflowData({ scoutingReports: reports });
+      emitWorkflowData({ scoutingReports: reports });
     },
 
-    // onPhaseComplete callback + sidebar indicator update: mirrors the
-    // legacy `completePhase`'s two side effects. The onPhaseComplete
-    // payload carries the phase id and the runner-measured durationMs;
-    // the sidebar indicator uses the config-supplied icon for the phase.
+    // Sidebar indicator update: uses the config-supplied icon for the
+    // just-completed phase. PhaseRunner emits onPhaseComplete itself.
     afterPhase: async (args) => {
-      onStatus?.onPhaseComplete?.({
-        phase: args.phaseId,
-        durationMs: args.durationMs,
-      });
       onStatus?.onSidebarUpdate?.({
         indicator: getPhaseIndicator(args.phaseId as Phase, config.phases),
       });
     },
   });
 
+  // ── Build PhaseTracker adapter for PhaseRunner ──────────────────
+  //
+  // PhaseRunner still requires a `PhaseTracker`. Since WorkflowStatusTracker
+  // is gone, this adapter satisfies the interface with no-ops (phase
+  // registration / transitions flow through onStatus → EventStore per D6) and
+  // surfaces the TaskGraph's tasks to the `onPhaseSettled` hook.
+  const phaseTracker: PhaseTracker = {
+    registerPhase: () => {},
+    setPhase: () => {},
+    save: async () => {},
+    get taskTracker() {
+      return {
+        getAllTasks: () => taskGraph.getAllTasks().map((e) => e.task),
+      };
+    },
+  };
+
   // ── Drive the PhaseRunner ───────────────────────────────────────
   //
-  // On resume, start from the tracker's saved current phase. The runner
-  // always begins at index 0, so we slice the phase list to the resume
-  // target and clear the tracker's current-phase marker (so the runner's
-  // first `setPhase` doesn't double-push the resume target into
-  // completedPhaseIds before its body runs).
-  const startIndex = currentId
-    ? Math.max(0, PHASES.indexOf(currentId as Phase))
+  // On resume, start from the projection's saved current phase.
+  const startIndex = currentPhaseId
+    ? Math.max(0, PHASES.indexOf(currentPhaseId as Phase))
     : 0;
   const runnerPhases = startIndex > 0 ? phases.slice(startIndex) : phases;
-  if (startIndex > 0) {
-    tracker.setCurrentPhase("");
-  }
 
   const runner = new PhaseRunner({
     phases: runnerPhases,
-    tracker,
+    tracker: phaseTracker,
     hookRegistry,
     cwd,
     workDir,
     signal,
+    onStatus,
   });
 
   try {
     await runner.run();
   } catch (error: unknown) {
     const err = error instanceof Error ? error : new Error(String(error));
-    // Cancel all still-active tasks so an abort (Ctrl+C / signal) doesn't
-    // leave them half-finished — without this the next resume can't tell
-    // what already ran and re-runs everything.
-    for (const task of tracker.taskTracker.getAllTasks()) {
-      if (task.status === "active") {
-        try {
-          tracker.taskTracker.cancelTask(task.id);
-        } catch {
-          // ignore — the task may have settled between getAllTasks and cancelTask
-        }
-      }
-    }
-    // Always durably persist the tracker state before exiting, regardless of
-    // the error type, so the in-memory task statuses survive for resume.
-    await tracker.save();
+    // No more tracker.taskTracker.cancelTask — the SessionScheduler (constructed
+    // by phase modules) aborts active sessions via `options.signal`. The
+    // PhaseRunner's abort signal handles cancellation cooperatively.
     onStatus?.onWorkflowFailed?.({
       error: err,
-      phaseId: tracker.currentPhaseId,
+      phaseId: currentPhaseId,
     });
     if (err.message === "Workflow cancelled") {
       return;
@@ -563,6 +505,6 @@ export async function runSpir(
   onStatus?.onSidebarUpdate?.({ indicator: "✅" });
   onStatus?.onWorkflowComplete?.({
     totalDurationMs: Date.now() - workflowStartTime,
-    agentCount: tracker.stats.agentCount,
+    agentCount: projection?.stats?.sessionCount ?? 0,
   });
 }

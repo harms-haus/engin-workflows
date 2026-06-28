@@ -1,14 +1,16 @@
 import type {
+  AgentProfile,
   RendererRegistry,
   StatusCallbacks,
   WorkflowRunOptions,
-  WorkflowStatusTracker,
 } from "@harms-haus/engin-engine";
 import {
   DEFAULT_MAX_ROUNDS,
-  RunnerPool,
-  TaskTracker,
+  SessionGate,
+  SessionScheduler,
+  TaskGraph,
   ensureDir,
+  loadProfilesFromDirs,
   parseJsonWithRepair,
   reviewRunner,
   schemaToString,
@@ -111,8 +113,13 @@ async function readAndValidatePlan(
  * evaluates it (structured output `{ approved, feedback }`). When the reviewer
  * rejects, the reviewRunner appends the feedback to the planner prompt and
  * retries — up to `DEFAULT_MAX_ROUNDS` times. The runner is dispatched through
- * a `RunnerPool` so the engine's hook pipeline (default auditor,
+ * a `SessionScheduler` so the engine's hook pipeline (default auditor,
  * `beforeStepPrompt` file inlining, etc.) fires for every session.
+ *
+ * `graph` is the shared `TaskGraph` from the orchestrator. The planning task
+ * is registered there with the reviewRunner factory as its runner. Planning
+ * generates a PLAN ARTIFACT — the plan's tasks are NOT added to the graph;
+ * implementation.ts consumes the plan and adds the real tasks.
  *
  * `files` is the list of key files the scouting review surfaced for this task.
  * They are threaded onto the planning task so the ENGINE's default
@@ -121,7 +128,7 @@ async function readAndValidatePlan(
  * to actually fire.
  */
 export async function planningPhase(
-  tracker: WorkflowStatusTracker,
+  graph: TaskGraph,
   profilesDirs: string[],
   research: string,
   files: string[],
@@ -168,15 +175,13 @@ export async function planningPhase(
     }
   };
 
-  const runner = reviewRunner(
+  const runnerFactory = reviewRunner(
     {
       profile: "planner",
       prompt: planPrompt,
       outputMode: "filesystem",
       isReadOnly: false,
       role: "plan",
-      runnerRole: "plan",
-      attempt: 1,
     },
     {
       profile: "plan-reviewer",
@@ -185,43 +190,51 @@ export async function planningPhase(
       schema: PlanReviewSchema,
       isReadOnly: true,
       role: "review-plan",
-      runnerRole: "review-plan",
-      attempt: 1,
     },
     { maxRounds: DEFAULT_MAX_ROUNDS, onReviewReject: snapshotPlan },
   );
 
-  // Register the planning task. Scouting files are threaded onto the task so
-  // the engine's default `beforeStepPrompt` hook inlines them into both the
-  // planner and plan-reviewer prompts (no local inlining duplication).
-  const taskTracker = new TaskTracker();
-  taskTracker.addTask({
-    id: "planning",
-    title: "Plan & Review",
-    prompt: taskPrompt,
-    profile: "planner",
-    files,
-    dependencies: [],
-    phaseId: "planning",
-  });
+  // Register the planning task in the shared graph. Scouting files are
+  // threaded onto the task so the engine's default `beforeStepPrompt` hook
+  // inlines them into both the planner and plan-reviewer prompts (no local
+  // inlining duplication).
+  graph.addTask(
+    {
+      id: "planning",
+      title: "Plan & Review",
+      prompt: taskPrompt,
+      profile: "planner",
+      files,
+      dependencies: [],
+      phaseId: "planning",
+      worktree: "none",
+      status: "ready",
+    },
+    runnerFactory,
+  );
 
-  const pool = new RunnerPool({
-    maxConcurrentSessions: 1,
-    modelConcurrency: {},
-    profilesDirs,
+  // Build a SessionScheduler scoped to the planning phase. The scheduler owns
+  // the gate and drives the planning task's reviewRunner to completion.
+  const gate = new SessionGate({ total: 1, perModel: {} });
+  const profiles: Map<string, AgentProfile> =
+    await loadProfilesFromDirs(profilesDirs);
+
+  const scheduler = new SessionScheduler({
+    graph,
+    gate,
+    profiles,
     sessionBaseDir: join(workDir, "sessions", "planning"),
     cwd,
-    apiKeys,
-    onStatus,
-    signal,
-    rendererRegistry,
-    hookRegistry,
+    ...(apiKeys !== undefined ? { apiKeys } : {}),
+    ...(onStatus !== undefined ? { onStatus } : {}),
+    ...(signal !== undefined ? { signal } : {}),
+    ...(rendererRegistry !== undefined ? { rendererRegistry } : {}),
+    ...(hookRegistry !== undefined ? { hookRegistry } : {}),
     phaseId: "planning",
-    taskTracker,
-    getRunnerForTask: () => runner,
+    activeSessions: new Set(),
   });
 
-  const { completedTasks, failedTasks } = await pool.run();
+  const { completedTasks, failedTasks } = await scheduler.run();
 
   // Read back and validate the plan artifact. On review exhaustion (the
   // reviewer never approved) we proceed anyway with the latest plan —
@@ -232,7 +245,9 @@ export async function planningPhase(
   }
   const validatedPlan = res.plan;
 
-  tracker.setWorkflowData({ plan: validatedPlan });
+  // Surface the plan via onWorkflowData (replaces the old
+  // tracker.setWorkflowData — the workflow store is now event-sourced).
+  onStatus?.onWorkflowData?.({ data: { plan: validatedPlan } });
 
   // Surface the final review outcome for the TUI store. The durable AuditLog
   // equivalent is produced by the engine's default auditor (registered in

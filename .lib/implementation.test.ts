@@ -1,45 +1,98 @@
-// ─── Implementation Phase Tests (B4 migration) ─────────────────────────────
+// ─── Implementation Phase Tests (E4 migration) ─────────────────────────────
 //
-// Tests for implementation.ts after B4 migration:
-//   • RunnerPool replaces LanePool
-//   • getRunnerForTask replaces getStepsForTask
-//   • beforeTask hook returns {runner} instead of {steps}
-//   • No explicit clearTaskSessions on resume — replay handles idempotency
-//   • RunnerPoolOptions: maxConcurrentSessions + modelConcurrency
-//
-// Mock module provides BOTH old exports (LanePool, clearTaskSessions) for
-// compile compat with the current implementation AND new exports (RunnerPool,
-// reviewRunner, linearRunner, singleSession) for B4 assertions.
+// Tests for implementation.ts after E4 migration:
+//   • TaskGraph replaces WorkflowStatusTracker/TaskTracker
+//   • SessionScheduler replaces RunnerPool
+//   • taskGraph.addTask(task, runnerFactory) replaces tracker.taskTracker.addTask
+//   • resolveImplementationRunner returns a SessionPlanFactory (() => SessionPlanRunner)
+//   • beforeTask hook returns { runner: SessionPlanFactory, sessionPlan }
+//   • SessionGate({ total, perModel }) replaces maxConcurrentSessions + modelConcurrency
+//   • Cycle detection at addTask time; failDeadlockedTasks at scheduler.run() startup
+//   • No explicit clearTaskSessions — replay idempotency handles resume
 //
 // Builds on: kb-3 (runSession), kb-4 (reviewRunner/linearRunner/singleSession),
-// kb-7 (RunnerPool), kb-12 (createEnginMock additions).
+// kb-7 (SessionScheduler), kb-12 (createEnginMock additions).
 // ────────────────────────────────────────────────────────────────────────────
 
 import { describe, expect, it, jest, mock, beforeEach } from "bun:test";
-import type { WorkflowRunOptions } from "@harms-haus/engin-engine";
+import type {
+  StatusCallbacks,
+  TaskGraph,
+  WorkflowRunOptions,
+} from "@harms-haus/engin-engine";
 import { createEnginMock } from "./engin-mock";
 
 // ─── Mock @harms-haus/engin-engine ──────────────────────────────────────────
-// The mock provides: new exports (RunnerPool, reviewRunner, linearRunner,
-// singleSession) for B4 assertions, plus old exports (LanePool, clearTaskSessions
-// etc.) so the current implementation.ts can still compile and run.
+//
+// The mock provides SessionScheduler, SessionGate, TaskGraph, AuditLog,
+// singleSession/reviewRunner/linearRunner (callable-factory versions matching
+// the real SessionPlanFactory contract), plus loadProfilesFromDirs and
+// assignSequentialTaskIds (renumbering).
 
-const mockAddTask =
-  jest.fn<
-    (task: {
-      id: string;
-      title: string;
-      prompt: string;
-      profile: string;
-      files: string[];
-      dependencies: string[];
-      isCode: boolean;
-      phaseId: string;
-    }) => void
-  >();
+// ── TaskGraph method mocks (shared across makeMockTaskGraph instances) ──
+const mockAddTask = jest.fn<(task: Record<string, unknown>, runnerFactory: unknown) => void>();
+const mockGetTask = jest.fn<(id: string) => unknown>();
+const mockGetAllTasks = jest.fn<() => { id: string; status: string }[]>();
+
+// ── SessionScheduler mock ────────────────────────────────────────────────
+const mockSchedulerRun =
+  jest.fn<() => Promise<{ completedTasks: number; failedTasks: number }>>();
+
+const MockSessionScheduler = jest.fn().mockImplementation(() => ({
+  run: mockSchedulerRun,
+}));
+
+// ── SessionGate mock (captures constructor options) ──────────────────────
+const MockSessionGate = jest.fn().mockImplementation(() => ({
+  run: jest.fn(),
+  acquire: jest.fn().mockReturnValue(true),
+  release: jest.fn(),
+  canStart: jest.fn().mockReturnValue(true),
+  availableTotal: jest.fn().mockReturnValue(5),
+}));
+
+// ── AuditLog mock ────────────────────────────────────────────────────────
+const MockAuditLog = jest.fn().mockImplementation(() => ({
+  append: jest.fn().mockResolvedValue(undefined),
+}));
+
+// ── Runner factories: callable-factory versions matching real contract ──
+// singleSession(spec) → SessionPlanFactory (() => SessionPlanRunner).
+// Production code calls singleSession(spec)() so the mock must return
+// a callable that yields a SessionPlanRunner.
+const mockSingleSession = jest.fn().mockImplementation((spec: Record<string, unknown>) =>
+  jest.fn(() => ({
+    plan: async function* () {
+      yield [spec];
+    },
+    execute: jest.fn().mockResolvedValue({ mode: "text", text: "" }),
+  })),
+);
+
+// reviewRunner(executeSpec, reviewSpec, opts?) → SessionPlanFactory.
+const mockReviewRunner = jest.fn().mockImplementation(
+  (_executeSpec: unknown, _reviewSpec: unknown, _opts?: unknown) =>
+    jest.fn(() => ({
+      plan: async function* () {
+        yield [];
+      },
+      execute: jest.fn().mockResolvedValue({ mode: "text", text: "" }),
+    })),
+);
+
+// linearRunner(children) → SessionPlanFactory.
+const mockLinearRunner = jest.fn().mockImplementation((_children: unknown[]) =>
+  jest.fn(() => ({
+    plan: async function* () {
+      yield [];
+    },
+    execute: jest.fn().mockResolvedValue({ mode: "text", text: "" }),
+  })),
+);
+
+// ── assignSequentialTaskIds: renumbers like the real function ────────────
 const mockAssignSequentialTaskIds = jest.fn(
   (tasks: { id: string; dependencies: string[] }[]) => {
-    // Default: renumber IDs like the real function (t-01, t-02, …) and remap deps
     const idMap = new Map<string, string>();
     const result = tasks.map((t, i) => {
       const newId = `t-${String(i + 1).padStart(2, "0")}`;
@@ -52,52 +105,26 @@ const mockAssignSequentialTaskIds = jest.fn(
     return result;
   },
 );
-const mockValidateAllDependencies = jest.fn<() => void>();
-const mockGetAllTasks = jest.fn<() => { id: string; status: string }[]>();
-const mockGetTask = jest.fn<(id: string) => { id: string } | undefined>();
-const mockPoolRun =
-  jest.fn<() => Promise<{ completedTasks: number; failedTasks: number }>>();
-const mockClearTaskSessions =
-  jest.fn<(sessionBaseDir: string, taskId: string) => void>();
 
-const MockTaskTracker = jest.fn().mockImplementation(() => ({
-  addTask: mockAddTask,
-  validateAllDependencies: mockValidateAllDependencies,
-  getAllTasks: mockGetAllTasks,
-  getTask: mockGetTask,
-}));
-
-// ── NEW: RunnerPool + runner factories ────────────────────────────────────
-const MockRunnerPool = jest.fn().mockImplementation(() => ({
-  run: mockPoolRun,
-}));
-
-const mockReviewRunner =
-  jest.fn<(execute: unknown, review: unknown, opts?: unknown) => unknown>();
-const mockLinearRunner = jest.fn<(children: unknown[]) => unknown>();
-const mockSingleSession = jest.fn<(spec: unknown) => unknown>();
-
-// ── OLD: LanePool (kept for compile compat — current impl still imports it) ──
-const MockLanePool = jest.fn().mockImplementation(() => ({
-  run: mockPoolRun,
-}));
+// ── loadProfilesFromDirs ─────────────────────────────────────────────────
+const mockLoadProfilesFromDirs = jest.fn().mockResolvedValue(new Map());
 
 mock.module("@harms-haus/engin-engine", () => ({
   ...createEnginMock(),
 
-  // NEW pool + runner factories
-  RunnerPool: MockRunnerPool,
+  // Override constructors with our capturing mocks
+  SessionScheduler: MockSessionScheduler,
+  SessionGate: MockSessionGate,
+  AuditLog: MockAuditLog,
+
+  // Callable-factory runner mocks (real contract: return SessionPlanFactory)
+  singleSession: mockSingleSession,
   reviewRunner: mockReviewRunner,
   linearRunner: mockLinearRunner,
-  singleSession: mockSingleSession,
 
-  // OLD pool (compile compat — tests assert it is NOT used)
-  LanePool: MockLanePool,
-
-  // Override these from createEnginMock() so we can assert on them
-  clearTaskSessions: mockClearTaskSessions,
+  // Override utilities
   assignSequentialTaskIds: mockAssignSequentialTaskIds,
-  TaskTracker: MockTaskTracker,
+  loadProfilesFromDirs: mockLoadProfilesFromDirs,
 }));
 
 // Dynamic import to ensure mock is applied first
@@ -131,42 +158,34 @@ const SAMPLE_PLAN: Plan = {
   strategy: "Implement in order",
 };
 
-function makeMockTracker() {
+function makeMockTaskGraph(): TaskGraph {
   return {
-    taskTracker: {
-      addTask: mockAddTask,
-      validateAllDependencies: mockValidateAllDependencies,
-      getAllTasks: mockGetAllTasks,
-      getTask: mockGetTask,
-    },
-    auditLog: {
-      append: jest.fn().mockResolvedValue(undefined),
-    },
-  } as never;
+    addTask: mockAddTask,
+    getTask: mockGetTask,
+    getAllTasks: mockGetAllTasks,
+  } as unknown as TaskGraph;
 }
 
 /**
- * Extract the `beforeTask` hook that `implementationPhase` registers on the
- * RunnerPool's hookRegistry. Returns the hook function so tests can invoke it
- * directly and assert it returns `{ runner }` (not `{ steps }`).
+ * Extract the `beforeTask` hook registered by implementationPhase. Searches
+ * the hookRegistry passed to SessionScheduler for a `register` call that
+ * includes a `beforeTask` subscriber.
  */
 function extractBeforeTaskHook(): (args: {
   task: unknown;
-  steps: unknown[];
-}) => { runner: unknown } | { skip: boolean } | undefined {
-  const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
+}) => { runner: unknown; sessionPlan: unknown } | undefined {
+  const schedulerOptions = MockSessionScheduler.mock.calls[0][0] as Record<
     string,
     unknown
   >;
-  expect(poolOptions).toHaveProperty("hookRegistry");
-  const registry = poolOptions.hookRegistry as {
+  expect(schedulerOptions).toHaveProperty("hookRegistry");
+  const registry = schedulerOptions.hookRegistry as {
     register: { mock: { calls: unknown[][] } };
   };
   for (const call of registry.register.mock.calls) {
     const hooks = call[0] as Record<string, unknown> | undefined;
     if (hooks && "beforeTask" in hooks) {
       const value = hooks.beforeTask;
-      // The hook may be registered as a single fn or fn[] (both are valid).
       const fn = Array.isArray(value) ? value[0] : value;
       if (typeof fn === "function") return fn as never;
     }
@@ -174,61 +193,41 @@ function extractBeforeTaskHook(): (args: {
   throw new Error("beforeTask hook was not registered on the hookRegistry");
 }
 
-/**
- * Extract `getRunnerForTask` from RunnerPool options (the function that builds
- * the runner tree).
- */
-function extractGetRunnerForTask(): ((task: unknown) => unknown) | undefined {
-  const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
-    string,
-    unknown
-  >;
-  return poolOptions.getRunnerForTask as
-    | ((task: unknown) => unknown)
-    | undefined;
-}
-
 // ══════════════════════════════════════════════════════════════════════════
-// B4 MIGRATION: RunnerPool replaces LanePool
+// E4 MIGRATION: SessionScheduler + TaskGraph
 // ══════════════════════════════════════════════════════════════════════════
 
-describe("implementationPhase — B4 migration: RunnerPool", () => {
+describe("implementationPhase — E4 migration: SessionScheduler + TaskGraph", () => {
   beforeEach(() => {
     mockAddTask.mockClear();
-    mockValidateAllDependencies.mockClear();
-    mockGetAllTasks.mockClear();
     mockGetTask.mockClear();
-    mockPoolRun.mockClear();
-    mockClearTaskSessions.mockClear();
-    MockRunnerPool.mockClear();
-    MockLanePool.mockClear();
+    mockGetAllTasks.mockClear();
+    mockSchedulerRun.mockClear();
+    MockSessionScheduler.mockClear();
+    MockSessionGate.mockClear();
+    MockAuditLog.mockClear();
+    mockSingleSession.mockClear();
     mockReviewRunner.mockClear();
     mockLinearRunner.mockClear();
-    mockSingleSession.mockClear();
-    // Default: runner factories return mock Runner functions so that
-    // getRunnerForTask resolves to a function without per-test setup.
-    // Tests needing specific values override with mockReturnValue(Once).
-    mockReviewRunner.mockReturnValue(jest.fn());
-    mockLinearRunner.mockReturnValue(jest.fn());
-    mockSingleSession.mockReturnValue(jest.fn());
-    // Default: pool returns all tasks as completed
-    mockPoolRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
-    // Default: getTask returns undefined (task not already present)
+    mockAssignSequentialTaskIds.mockClear();
+    mockLoadProfilesFromDirs.mockClear();
+
+    // Defaults
+    mockSchedulerRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
     mockGetTask.mockReturnValue(undefined);
-    // Default: getAllTasks returns the expected tasks
     mockGetAllTasks.mockReturnValue([
-      { id: "task-1", status: "done" },
-      { id: "task-2", status: "done" },
+      { id: "t-01", status: "done" },
+      { id: "t-02", status: "done" },
     ]);
   });
 
-  // ── 1. RunnerPool constructed (not LanePool) ──────────────────────────
+  // ── 1. SessionScheduler constructed (not RunnerPool) ──────────────────
 
-  it("constructs RunnerPool (not LanePool)", async () => {
-    const tracker = makeMockTracker();
+  it("constructs SessionScheduler", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -236,17 +235,16 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       "/work",
     );
 
-    expect(MockRunnerPool).toHaveBeenCalledTimes(1);
-    expect(MockLanePool).toHaveBeenCalledTimes(0);
+    expect(MockSessionScheduler).toHaveBeenCalledTimes(1);
   });
 
-  // ── 2. getRunnerForTask (not getStepsForTask) ──────────────────────────
+  // ── 2. Tasks loaded into TaskGraph via addTask(task, runnerFactory) ────
 
-  it("passes getRunnerForTask (not getStepsForTask) to RunnerPool", async () => {
-    const tracker = makeMockTracker();
+  it("adds each plan task to the task graph with a runnerFactory", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -254,21 +252,208 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       "/work",
     );
 
-    const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
+    expect(mockAddTask).toHaveBeenCalledTimes(2);
+
+    // First task — verify task object + runnerFactory
+    const firstCall = mockAddTask.mock.calls[0];
+    expect(firstCall[0]).toMatchObject({
+      id: "t-01",
+      title: "Add feature A",
+      worktree: "code",
+      phaseId: "implementing",
+      status: "ready",
+    });
+    expect(typeof firstCall[1]).toBe("function"); // runnerFactory
+
+    // Second task
+    const secondCall = mockAddTask.mock.calls[1];
+    expect(secondCall[0]).toMatchObject({
+      id: "t-02",
+      title: "Update docs",
+      worktree: "code",
+      phaseId: "implementing",
+    });
+    expect(typeof secondCall[1]).toBe("function");
+  });
+
+  it("skips addTask for tasks already in the graph (resume)", async () => {
+    const taskGraph = makeMockTaskGraph();
+    mockGetTask.mockImplementation((id: string) =>
+      id === "t-01" ? { task: { id: "t-01" } } : undefined,
+    );
+
+    await implementationPhase(
+      taskGraph,
+      ["/profiles"],
+      SAMPLE_PLAN,
+      "/cwd",
+      5,
+      "/work",
+    );
+
+    expect(mockAddTask).toHaveBeenCalledTimes(1);
+    expect(mockAddTask.mock.calls[0][0]).toMatchObject({ id: "t-02" });
+  });
+
+  // ── 3. Runner tree: code task = linearRunner([singleSession, reviewRunner]) ──
+
+  it("builds code-task tree as linearRunner([singleSession(write-tests)(), reviewRunner(execute, review)()])", async () => {
+    const taskGraph = makeMockTaskGraph();
+
+    // Use a single code task so mock counts are unambiguous
+    const codePlan: Plan = {
+      tasks: [
+        {
+          id: "code-a",
+          title: "Code task",
+          prompt: "Do the thing",
+          profile: "implementer",
+          files: ["src/a.ts"],
+          is_code: true,
+          dependencies: [],
+        },
+      ],
+      strategy: "",
+    };
+
+    await implementationPhase(
+      taskGraph,
+      ["/profiles"],
+      codePlan,
+      "/cwd",
+      5,
+      "/work",
+    );
+
+    // singleSession called once for write-tests spec
+    expect(mockSingleSession).toHaveBeenCalledTimes(1);
+    expect(mockSingleSession.mock.calls[0][0]).toMatchObject({
+      role: "write-tests",
+      profile: "test-writer",
+    });
+
+    // reviewRunner called once for execute → review loop
+    expect(mockReviewRunner).toHaveBeenCalledTimes(1);
+    expect(mockReviewRunner.mock.calls[0][0]).toMatchObject({
+      role: "execute",
+    });
+    expect(mockReviewRunner.mock.calls[0][1]).toMatchObject({
+      role: "review",
+      profile: "implement-reviewer",
+    });
+
+    // linearRunner called once with 2 children
+    expect(mockLinearRunner).toHaveBeenCalledTimes(1);
+    const linearChildren = mockLinearRunner.mock.calls[0][0] as unknown[];
+    expect(linearChildren).toHaveLength(2);
+  });
+
+  // ── 4. Runner tree: non-code task = reviewRunner(execute, review) ───────
+
+  it("builds non-code tree as reviewRunner(execute, review) with no singleSession", async () => {
+    const taskGraph = makeMockTaskGraph();
+
+    const nonCodePlan: Plan = {
+      tasks: [
+        {
+          id: "doc-a",
+          title: "Doc task",
+          prompt: "Write docs",
+          profile: "implementer",
+          files: ["README.md"],
+          is_code: false,
+          dependencies: [],
+        },
+      ],
+      strategy: "",
+    };
+
+    await implementationPhase(
+      taskGraph,
+      ["/profiles"],
+      nonCodePlan,
+      "/cwd",
+      5,
+      "/work",
+    );
+
+    // singleSession NOT called for non-code tasks
+    expect(mockSingleSession).toHaveBeenCalledTimes(0);
+    // linearRunner NOT called
+    expect(mockLinearRunner).toHaveBeenCalledTimes(0);
+
+    // reviewRunner called once
+    expect(mockReviewRunner).toHaveBeenCalledTimes(1);
+    expect(mockReviewRunner.mock.calls[0][0]).toMatchObject({
+      role: "execute",
+    });
+    expect(mockReviewRunner.mock.calls[0][1]).toMatchObject({
+      role: "review",
+      profile: "implement-reviewer",
+    });
+  });
+
+  // ── 5. Profile substitution ───────────────────────────────────────────
+
+  it("substitutes custom profile for the execute (implementer) session", async () => {
+    const taskGraph = makeMockTaskGraph();
+
+    const customProfilePlan: Plan = {
+      tasks: [
+        {
+          id: "code-custom",
+          title: "Custom profile code task",
+          prompt: "Do it",
+          profile: "implementer-lite",
+          files: ["src/b.ts"],
+          is_code: true,
+          dependencies: [],
+        },
+      ],
+      strategy: "",
+    };
+
+    await implementationPhase(
+      taskGraph,
+      ["/profiles"],
+      customProfilePlan,
+      "/cwd",
+      5,
+      "/work",
+    );
+
+    // reviewRunner execute spec uses the custom profile
+    expect(mockReviewRunner).toHaveBeenCalledTimes(1);
+    const executeSpec = mockReviewRunner.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    expect(poolOptions).toHaveProperty("getRunnerForTask");
-    expect(typeof poolOptions.getRunnerForTask).toBe("function");
-    // getStepsForTask must NOT be on RunnerPool options
-    expect(poolOptions).not.toHaveProperty("getStepsForTask");
+    expect(executeSpec.role).toBe("execute");
+    expect(executeSpec.profile).toBe("implementer-lite");
+
+    // Reviewer profile is always implement-reviewer
+    const reviewSpec = mockReviewRunner.mock.calls[0][1] as Record<
+      string,
+      unknown
+    >;
+    expect(reviewSpec.profile).toBe("implement-reviewer");
+
+    // Test-writer profile is always test-writer
+    expect(mockSingleSession).toHaveBeenCalledTimes(1);
+    const writeTestsSpec = mockSingleSession.mock.calls[0][0] as Record<
+      string,
+      unknown
+    >;
+    expect(writeTestsSpec.profile).toBe("test-writer");
   });
 
-  it("getRunnerForTask returns a runner for code tasks (reviewRunner tree)", async () => {
-    const tracker = makeMockTracker();
+  // ── 6. beforeTask hook returns { runner: factory, sessionPlan } ────────
+
+  it("beforeTask hook returns { runner, sessionPlan } for code tasks", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -276,87 +461,8 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       "/work",
     );
 
-    const getRunnerForTask = extractGetRunnerForTask();
-    expect(getRunnerForTask).toBeDefined();
+    const beforeTask = extractBeforeTaskHook();
 
-    // Build a runner for a code task — the runner factories should be called
-    const codeTask = {
-      id: "t1",
-      title: "",
-      prompt: "",
-      profile: "implementer",
-      files: [],
-      dependencies: [],
-      isCode: true,
-    } as never;
-    const runner = getRunnerForTask!(codeTask);
-
-    // Must return a function (a Runner)
-    expect(typeof runner).toBe("function");
-  });
-
-  it("getRunnerForTask returns a runner for non-code tasks (reviewRunner tree)", async () => {
-    const tracker = makeMockTracker();
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    );
-
-    const getRunnerForTask = extractGetRunnerForTask();
-    expect(getRunnerForTask).toBeDefined();
-
-    const nonCodeTask = {
-      id: "t2",
-      title: "",
-      prompt: "",
-      profile: "implementer",
-      files: [],
-      dependencies: [],
-      isCode: false,
-    } as never;
-    const runner = getRunnerForTask!(nonCodeTask);
-
-    expect(typeof runner).toBe("function");
-  });
-
-  // ── 3. Runner tree: linearRunner + reviewRunner (restored CODE_STEPS) ──
-  //
-  // Code-task pipeline mirrors the pre-session-first CODE_STEPS:
-  //   linearRunner([
-  //     reviewRunner(write-tests, review-tests),  // test review loop
-  //     reviewRunner(execute, review),            // code review loop
-  //   ])
-  // singleSession is NOT used directly; both stages are review loops so a
-  // rejection feeds feedback back and retries. A 4-session plan is declared.
-
-  it("builds the code-task tree as linearRunner([reviewRunner(write-tests, review-tests), reviewRunner(execute, review)])", async () => {
-    const tracker = makeMockTracker();
-
-    const linearRunnerResult = jest.fn();
-    const testReviewLoop = jest.fn();
-    const codeReviewLoop = jest.fn();
-
-    mockLinearRunner.mockReturnValue(linearRunnerResult);
-    // reviewRunner is called twice: test loop, then code loop.
-    mockReviewRunner
-      .mockReturnValueOnce(testReviewLoop)
-      .mockReturnValueOnce(codeReviewLoop);
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    );
-
-    const getRunnerForTask = extractGetRunnerForTask();
     const codeTask = {
       id: "t-01",
       title: "",
@@ -365,235 +471,27 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       files: [],
       dependencies: [],
     } as never;
-    const runner = getRunnerForTask!(codeTask);
-
-    // ── 1. Final returned runner is the linearRunner result ─────────
-    expect(runner).toBe(linearRunnerResult);
-
-    // ── 2. linearRunner called once with the two review-loop children ──
-    expect(mockLinearRunner).toHaveBeenCalledTimes(1);
-    expect(mockLinearRunner).toHaveBeenCalledWith([
-      testReviewLoop,
-      codeReviewLoop,
-    ]);
-
-    // ── 3. singleSession is NOT used directly ───────────────────────
-    expect(mockSingleSession).toHaveBeenCalledTimes(0);
-
-    // ── 4. reviewRunner called twice: test loop then code loop ──────
-    expect(mockReviewRunner).toHaveBeenCalledTimes(2);
-    expect(mockReviewRunner.mock.calls[0][0]).toMatchObject({
-      role: "write-tests",
-      profile: "test-writer",
-    });
-    expect(mockReviewRunner.mock.calls[0][1]).toMatchObject({
-      role: "review-tests",
-      profile: "test-reviewer",
-    });
-    expect(mockReviewRunner.mock.calls[1][0]).toMatchObject({
-      role: "execute",
-    });
-    expect(mockReviewRunner.mock.calls[1][1]).toMatchObject({
-      role: "review",
-      profile: "implement-reviewer",
-    });
-  });
-
-
-  it("builds the runner tree with only implement+review for non-code tasks (no test-writer)", async () => {
-    const tracker = makeMockTracker();
-
-    const mockNonCodeReviewRunner = jest.fn();
-
-    mockReviewRunner.mockReturnValue(mockNonCodeReviewRunner);
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    );
-
-    const getRunnerForTask = extractGetRunnerForTask();
-    // task-2 (is_code: false) is renumbered to t-02 by assignSequentialTaskIds.
-    // Runner resolution reads is_code from the sidecar map keyed by task id,
-    // NOT from a field on the engine Task (is_code is a planner concern).
-    const nonCodeTask = {
-      id: "t-02",
-      title: "",
-      prompt: "",
-      profile: "implementer",
-      files: [],
-      dependencies: [],
-    } as never;
-    const runner = getRunnerForTask!(nonCodeTask);
-
-    expect(runner).toBe(mockNonCodeReviewRunner);
-
-    // For non-code tasks, no test-writer session — reviewRunner wraps both
-    // implementer and reviewer. singleSession is NOT called directly.
-    expect(mockSingleSession).toHaveBeenCalledTimes(0);
-
-    // reviewRunner called exactly once with (implSpec, reviewSpec)
-    expect(mockReviewRunner).toHaveBeenCalledTimes(1);
-    const reviewArgs = mockReviewRunner.mock.calls[0];
-    expect(reviewArgs[0] as Record<string, unknown>).toMatchObject({
-      role: "execute",
-    });
-    expect(reviewArgs[1] as Record<string, unknown>).toMatchObject({
-      role: "review",
-    });
-  });
-
-  it("substitutes custom profile for implementer session when task.profile differs", async () => {
-    const tracker = makeMockTracker();
-
-    mockSingleSession.mockReturnValue(jest.fn());
-    mockLinearRunner.mockReturnValue(jest.fn());
-    mockReviewRunner.mockReturnValue(jest.fn());
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    );
-
-    const getRunnerForTask = extractGetRunnerForTask();
-    const customProfileTask = {
-      id: "t3",
-      title: "",
-      prompt: "",
-      profile: "implementer-lite",
-      files: [],
-      dependencies: [],
-      isCode: true,
-    } as never;
-    getRunnerForTask!(customProfileTask);
-
-    // singleSession is NOT used directly (both stages are review loops).
-    expect(mockSingleSession).toHaveBeenCalledTimes(0);
-
-    // The custom task.profile substitutes ONLY the execute (implementer)
-    // session — the second reviewRunner call's first arg.
-    expect(mockReviewRunner).toHaveBeenCalledTimes(2);
-    const implSpec = mockReviewRunner.mock.calls[1][0] as Record<
-      string,
-      unknown
-    >;
-    expect(implSpec.role).toBe("execute");
-    expect(implSpec.profile).toBe("implementer-lite");
-  });
-
-  it("preserves test-writer and implement-reviewer profiles when substituting implementer", async () => {
-    const tracker = makeMockTracker();
-
-    mockSingleSession.mockReturnValue(jest.fn());
-    mockLinearRunner.mockReturnValue(jest.fn());
-    mockReviewRunner.mockReturnValue(jest.fn());
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    );
-
-    const getRunnerForTask = extractGetRunnerForTask();
-    const customProfileTask = {
-      id: "t4",
-      title: "",
-      prompt: "",
-      profile: "implementer-lite",
-      files: [],
-      dependencies: [],
-      isCode: true,
-    } as never;
-    getRunnerForTask!(customProfileTask);
-
-    // singleSession is NOT used directly (both stages are review loops).
-    expect(mockSingleSession).toHaveBeenCalledTimes(0);
-
-    // reviewRunner is called twice: (write-tests, review-tests) then (execute, review).
-    // The test-writer / test-reviewer profiles are fixed.
-    expect(mockReviewRunner).toHaveBeenCalledTimes(2);
-    const testLoopSpec = mockReviewRunner.mock.calls[0][0] as Record<
-      string,
-      unknown
-    >;
-    expect(testLoopSpec.role).toBe("write-tests");
-    expect(testLoopSpec.profile).toBe("test-writer");
-
-    // The custom task.profile substitutes ONLY the execute (implementer) session.
-    const codeLoopSpec = mockReviewRunner.mock.calls[1][0] as Record<
-      string,
-      unknown
-    >;
-    expect(codeLoopSpec.role).toBe("execute");
-    expect(codeLoopSpec.profile).toBe("implementer-lite");
-
-    // implement-reviewer must remain 'implement-reviewer' (second arg of code loop)
-    const reviewSpec = mockReviewRunner.mock.calls[1][1] as Record<
-      string,
-      unknown
-    >;
-    expect(reviewSpec.role).toBe("review");
-    expect(reviewSpec.profile).toBe("implement-reviewer");
-  });
-
-  // ── 4. beforeTask hook returns {runner} ────────────────────────────────
-
-  it("beforeTask hook returns {runner} for code tasks (not {steps})", async () => {
-    const tracker = makeMockTracker();
-
-    mockSingleSession.mockReturnValue(jest.fn());
-    mockLinearRunner.mockReturnValue(jest.fn());
-    mockReviewRunner.mockReturnValue(jest.fn());
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    );
-
-    const beforeTask = extractBeforeTaskHook();
-
-    const codeTask = {
-      id: "t1",
-      title: "",
-      prompt: "",
-      profile: "implementer",
-      files: [],
-      dependencies: [],
-      isCode: true,
-    } as never;
-    const result = beforeTask({ task: codeTask, steps: [] });
+    const result = beforeTask({ task: codeTask });
 
     expect(result).toBeDefined();
-    // The hook must return { runner: ... } (not { steps: ... })
     expect(result).toHaveProperty("runner");
-    expect(result).not.toHaveProperty("steps");
+    expect(result).toHaveProperty("sessionPlan");
+    // runner is a SessionPlanFactory (function)
     expect(typeof (result as { runner: unknown }).runner).toBe("function");
+    // sessionPlan is an array of entries
+    const plan = (result as { sessionPlan: unknown[] }).sessionPlan;
+    expect(Array.isArray(plan)).toBe(true);
+    expect(plan).toHaveLength(3);
+    expect(plan[0]).toMatchObject({ role: "write-tests" });
+    expect(plan[1]).toMatchObject({ role: "execute" });
+    expect(plan[2]).toMatchObject({ role: "review" });
   });
 
-  it("beforeTask hook returns {runner} for non-code tasks", async () => {
-    const tracker = makeMockTracker();
-
-    mockSingleSession.mockReturnValue(jest.fn());
-    mockLinearRunner.mockReturnValue(jest.fn());
-    mockReviewRunner.mockReturnValue(jest.fn());
+  it("beforeTask hook returns { runner, sessionPlan } for non-code tasks", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -604,48 +502,27 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
     const beforeTask = extractBeforeTaskHook();
 
     const nonCodeTask = {
-      id: "t2",
+      id: "t-02",
       title: "",
       prompt: "",
       profile: "implementer",
       files: [],
       dependencies: [],
-      isCode: false,
     } as never;
-    const result = beforeTask({ task: nonCodeTask, steps: [] });
+    const result = beforeTask({ task: nonCodeTask });
 
     expect(result).toBeDefined();
     expect(result).toHaveProperty("runner");
-    expect(result).not.toHaveProperty("steps");
     expect(typeof (result as { runner: unknown }).runner).toBe("function");
+
+    const plan = (result as { sessionPlan: unknown[] }).sessionPlan;
+    expect(Array.isArray(plan)).toBe(true);
+    expect(plan).toHaveLength(2);
+    expect(plan[0]).toMatchObject({ role: "execute" });
+    expect(plan[1]).toMatchObject({ role: "review" });
   });
 
-  it("beforeTask hook still supports {skip: true} for abstain", async () => {
-    const tracker = makeMockTracker();
-
-    mockSingleSession.mockReturnValue(jest.fn());
-    mockLinearRunner.mockReturnValue(jest.fn());
-    mockReviewRunner.mockReturnValue(jest.fn());
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    );
-
-    // The hook registered by implementationPhase always returns {runner}.
-    // But the test verifies the hook shape is compatible: { runner } | { skip } | undefined
-    // as per the RunnerPool.resolveRunner contract.
-    const beforeTask = extractBeforeTaskHook();
-    // We can't test skip directly since the registered hook never returns skip,
-    // but we verify the hook exists and returns the expected shape.
-    expect(typeof beforeTask).toBe("function");
-  });
-
-  // ── 5. No explicit clearTaskSessions on resume ─────────────────────────
+  // ── 7. No clearTaskSessions on resume ─────────────────────────────────
 
   it("does NOT call clearTaskSessions for non-complete tasks (replay handles idempotency)", async () => {
     mockGetAllTasks.mockReturnValue([
@@ -653,10 +530,10 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       { id: "task-2", status: "failed" },
       { id: "task-3", status: "ready" },
     ]);
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -664,60 +541,39 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       "/work",
     );
 
-    // The B4 migration removes the explicit session-wipe loop. The pool's
-    // internal retry valve (clearTaskSessions in maybeRetry) handles it.
-    expect(mockClearTaskSessions).toHaveBeenCalledTimes(0);
+    // No explicit session-wipe; the scheduler handles retry-wipes internally.
+    // (clearTaskSessions is not imported by implementation.ts anymore.)
+    expect(MockSessionScheduler).toHaveBeenCalledTimes(1);
   });
 
-  it("does NOT call clearTaskSessions on a fresh run (no sessions to reset)", async () => {
-    mockGetAllTasks.mockReturnValue([
-      { id: "task-1", status: "ready" },
-      { id: "task-2", status: "ready" },
-    ]);
-    const tracker = makeMockTracker();
+  // ── 8. Config threading: gate total + perModel ────────────────────────
+
+  it("passes maxConcurrentTasks to SessionGate.total", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
-      5,
+      3,
       "/work",
     );
 
-    expect(mockClearTaskSessions).toHaveBeenCalledTimes(0);
-  });
-
-  // ── 6. Config threading: maxConcurrentSessions + modelConcurrency ──────
-
-  it("passes maxConcurrentSessions (not maxConcurrentLanes) to RunnerPool", async () => {
-    const tracker = makeMockTracker();
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      3, // 5th positional: maxConcurrentSessions
-      "/work",
-    );
-
-    const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
+    expect(MockSessionGate).toHaveBeenCalledTimes(1);
+    const gateOpts = MockSessionGate.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    // New RunnerPool uses maxConcurrentSessions (not maxConcurrentLanes)
-    expect(poolOptions).toHaveProperty("maxConcurrentSessions");
-    expect(poolOptions.maxConcurrentSessions).toBe(3);
-    expect(poolOptions).not.toHaveProperty("maxConcurrentLanes");
+    expect(gateOpts.total).toBe(3);
   });
 
-  it("passes modelConcurrency to RunnerPool from config", async () => {
-    const tracker = makeMockTracker();
+  it("passes modelConcurrency to SessionGate.perModel", async () => {
+    const taskGraph = makeMockTaskGraph();
     const modelConcurrency = { "claude-sonnet-4-20250514": 2 };
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -729,22 +585,21 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       undefined, // rendererRegistry
       undefined, // hookRegistry
       undefined, // worktreeManager
-      modelConcurrency, // 13th positional: modelConcurrency
+      modelConcurrency, // 13th positional
     );
 
-    const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
+    const gateOpts = MockSessionGate.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    expect(poolOptions).toHaveProperty("modelConcurrency");
-    expect(poolOptions.modelConcurrency).toEqual(modelConcurrency);
+    expect(gateOpts.perModel).toEqual(modelConcurrency);
   });
 
   it("defaults modelConcurrency to empty object when not provided", async () => {
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -752,19 +607,18 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       "/work",
     );
 
-    const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
+    const gateOpts = MockSessionGate.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    expect(poolOptions).toHaveProperty("modelConcurrency");
-    expect(poolOptions.modelConcurrency).toEqual({});
+    expect(gateOpts.perModel).toEqual({});
   });
 
-  it("defaults maxConcurrentSessions to 5 when not specified", async () => {
-    const tracker = makeMockTracker();
+  it("defaults maxConcurrentTasks to 5 when undefined", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -772,21 +626,20 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       "/work",
     );
 
-    const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
+    const gateOpts = MockSessionGate.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    expect(poolOptions).toHaveProperty("maxConcurrentSessions");
-    expect(poolOptions.maxConcurrentSessions).toBe(5);
+    expect(gateOpts.total).toBe(5);
   });
 
-  // ── 7. Standard RunnerPool options (phaseId, profilesDirs, etc.) ───────
+  // ── 9. Standard SessionScheduler options ──────────────────────────────
 
-  it('passes phaseId: "implementing" to RunnerPool', async () => {
-    const tracker = makeMockTracker();
+  it('passes phaseId: "implementing" to SessionScheduler', async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -794,18 +647,18 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       "/work",
     );
 
-    const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
+    const opts = MockSessionScheduler.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    expect(poolOptions).toHaveProperty("phaseId", "implementing");
+    expect(opts.phaseId).toBe("implementing");
   });
 
-  it("passes standard options to RunnerPool (profilesDirs, cwd, sessionBaseDir)", async () => {
-    const tracker = makeMockTracker();
+  it("passes graph, gate, profiles, sessionBaseDir, cwd to SessionScheduler", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -813,53 +666,68 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       "/work",
     );
 
-    const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
+    expect(MockSessionScheduler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        graph: taskGraph,
+        cwd: "/cwd",
+        sessionBaseDir: expect.stringContaining("/work/sessions"),
+      }),
+    );
+    // gate is the SessionGate instance
+    const opts = MockSessionScheduler.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    expect(poolOptions).toHaveProperty("profilesDirs", ["/profiles"]);
-    expect(poolOptions).toHaveProperty("cwd", "/cwd");
-    expect(poolOptions).toHaveProperty("sessionBaseDir");
-    expect(poolOptions.sessionBaseDir as string).toContain("/work/sessions");
+    expect(opts).toHaveProperty("gate");
+    expect(opts).toHaveProperty("profiles");
+    expect(opts).toHaveProperty("activeSessions");
   });
 
-  it("passes apiKeys and onStatus through to RunnerPool when provided", async () => {
-    const tracker = makeMockTracker();
-    const onStatus = { onAgentSpawn: jest.fn() };
+  it("loads profiles from profilesDirs", async () => {
+    const taskGraph = makeMockTaskGraph();
+
+    await implementationPhase(
+      taskGraph,
+      ["/profiles", "/more-profiles"],
+      SAMPLE_PLAN,
+      "/cwd",
+      5,
+      "/work",
+    );
+
+    expect(mockLoadProfilesFromDirs).toHaveBeenCalledTimes(1);
+    expect(mockLoadProfilesFromDirs).toHaveBeenCalledWith([
+      "/profiles",
+      "/more-profiles",
+    ]);
+  });
+
+  it("passes apiKeys and onStatus through to SessionScheduler when provided", async () => {
+    const taskGraph = makeMockTaskGraph();
+    const onStatus = { onAgentSpawn: jest.fn() } as never;
     const apiKeys = { ANTHROPIC: "sk-test" };
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
       5,
       "/work",
       apiKeys,
-      onStatus as never,
+      onStatus as StatusCallbacks,
     );
 
-    expect(MockRunnerPool).toHaveBeenCalledWith(
-      expect.objectContaining({
-        apiKeys,
-        onStatus,
-      }),
+    expect(MockSessionScheduler).toHaveBeenCalledWith(
+      expect.objectContaining({ apiKeys, onStatus }),
     );
   });
 
-  it("passes auditLog and taskTracker to RunnerPool", async () => {
-    const tracker = {
-      taskTracker: {
-        addTask: mockAddTask,
-        validateAllDependencies: mockValidateAllDependencies,
-        getAllTasks: mockGetAllTasks,
-        getTask: mockGetTask,
-      },
-      auditLog: { append: jest.fn() },
-    } as never;
+  it("constructs an AuditLog from workDir and threads it into SessionScheduler", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -867,19 +735,20 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       "/work",
     );
 
-    expect(MockRunnerPool).toHaveBeenCalledWith(
-      expect.objectContaining({
-        auditLog: { append: expect.any(Function) },
-        taskTracker: expect.any(Object),
-      }),
-    );
+    expect(MockAuditLog).toHaveBeenCalledTimes(1);
+    expect(MockAuditLog).toHaveBeenCalledWith("/work");
+    const opts = MockSessionScheduler.mock.calls[0][0] as Record<
+      string,
+      unknown
+    >;
+    expect(opts).toHaveProperty("auditLog");
   });
 
-  it("calls RunnerPool.run() and awaits it", async () => {
-    const tracker = makeMockTracker();
+  it("calls SessionScheduler.run() and awaits it", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -887,11 +756,11 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       "/work",
     );
 
-    expect(mockPoolRun).toHaveBeenCalledTimes(1);
+    expect(mockSchedulerRun).toHaveBeenCalledTimes(1);
   });
 
-  it("forwards a provided hookRegistry into RunnerPool and registers beforeTask on it", async () => {
-    const tracker = makeMockTracker();
+  it("forwards a provided hookRegistry into SessionScheduler and registers beforeTask on it", async () => {
+    const taskGraph = makeMockTaskGraph();
     const customRegistry = {
       register: jest.fn(),
       hasSubscribers: jest.fn().mockReturnValue(false),
@@ -902,7 +771,7 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
     };
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -915,22 +784,22 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       customRegistry as never,
     );
 
-    const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
+    const opts = MockSessionScheduler.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    expect(poolOptions.hookRegistry).toBe(customRegistry);
+    expect(opts.hookRegistry).toBe(customRegistry);
     expect(customRegistry.register).toHaveBeenCalledWith(
       expect.objectContaining({ beforeTask: expect.any(Function) }),
     );
   });
 
-  it("passes signal through to RunnerPool when provided", async () => {
-    const tracker = makeMockTracker();
+  it("passes signal through to SessionScheduler when provided", async () => {
+    const taskGraph = makeMockTaskGraph();
     const abortController = new AbortController();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -941,28 +810,8 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
       abortController.signal,
     );
 
-    expect(MockRunnerPool).toHaveBeenCalledWith(
-      expect.objectContaining({
-        signal: abortController.signal,
-      }),
-    );
-  });
-
-  it("passes maxTaskRetries: 2 to RunnerPool", async () => {
-    mockGetAllTasks.mockReturnValue([]);
-    const tracker = makeMockTracker();
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    );
-
-    expect(MockRunnerPool).toHaveBeenCalledWith(
-      expect.objectContaining({ maxTaskRetries: 2 }),
+    expect(MockSessionScheduler).toHaveBeenCalledWith(
+      expect.objectContaining({ signal: abortController.signal }),
     );
   });
 });
@@ -974,29 +823,29 @@ describe("implementationPhase — B4 migration: RunnerPool", () => {
 describe("implementationPhase — phaseId threading", () => {
   beforeEach(() => {
     mockAddTask.mockClear();
-    mockValidateAllDependencies.mockClear();
-    mockGetAllTasks.mockClear();
     mockGetTask.mockClear();
-    mockPoolRun.mockClear();
-    mockClearTaskSessions.mockClear();
-    MockRunnerPool.mockClear();
-    MockLanePool.mockClear();
+    mockGetAllTasks.mockClear();
+    mockSchedulerRun.mockClear();
+    MockSessionScheduler.mockClear();
+    MockSessionGate.mockClear();
+    MockAuditLog.mockClear();
+    mockSingleSession.mockClear();
     mockReviewRunner.mockClear();
     mockLinearRunner.mockClear();
-    mockSingleSession.mockClear();
-    mockPoolRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
+    mockAssignSequentialTaskIds.mockClear();
+    mockSchedulerRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
     mockGetTask.mockReturnValue(undefined);
     mockGetAllTasks.mockReturnValue([
-      { id: "task-1", status: "done" },
-      { id: "task-2", status: "done" },
+      { id: "t-01", status: "done" },
+      { id: "t-02", status: "done" },
     ]);
   });
 
   it('calls addTask with phaseId: "implementing" for each plan task', async () => {
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -1006,102 +855,73 @@ describe("implementationPhase — phaseId threading", () => {
 
     expect(mockAddTask).toHaveBeenCalledTimes(2);
 
-    expect(mockAddTask).toHaveBeenNthCalledWith(1, {
-      id: "t-01",
-      title: "Add feature A",
-      prompt: "Implement feature A in module X",
-      profile: "implementer",
-      files: ["src/x.ts"],
-      dependencies: [],
-      worktree: "code",
-      phaseId: "implementing",
-    });
-
-    expect(mockAddTask).toHaveBeenNthCalledWith(2, {
-      id: "t-02",
-      title: "Update docs",
-      prompt: "Document feature A",
-      profile: "implementer",
-      files: ["README.md"],
-      dependencies: ["t-01"],
-      worktree: "code",
-      phaseId: "implementing",
-    });
-  });
-
-  it("skips addTask for tasks already in the tracker", async () => {
-    const tracker = makeMockTracker();
-    mockGetTask.mockImplementation((id: string) => {
-      return id === "t-01" ? { id: "t-01" } : undefined;
-    });
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
+    expect(mockAddTask).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        id: "t-01",
+        title: "Add feature A",
+        prompt: "Implement feature A in module X",
+        profile: "implementer",
+        files: ["src/x.ts"],
+        dependencies: [],
+        worktree: "code",
+        phaseId: "implementing",
+        status: "ready",
+      }),
+      expect.any(Function),
     );
 
-    expect(mockAddTask).toHaveBeenCalledTimes(1);
-    expect(mockAddTask).toHaveBeenCalledWith(
+    expect(mockAddTask).toHaveBeenNthCalledWith(
+      2,
       expect.objectContaining({
         id: "t-02",
+        title: "Update docs",
+        prompt: "Document feature A",
+        profile: "implementer",
+        files: ["README.md"],
+        dependencies: ["t-01"],
+        worktree: "code",
+        phaseId: "implementing",
+        status: "ready",
       }),
+      expect.any(Function),
     );
-  });
-
-  it("calls validateAllDependencies after adding tasks", async () => {
-    const tracker = makeMockTracker();
-
-    await implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    );
-
-    expect(mockValidateAllDependencies).toHaveBeenCalledTimes(1);
   });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// Pool Result Discrepancy (preserved coverage)
+// Scheduler Result Handling (preserved coverage)
 // ══════════════════════════════════════════════════════════════════════════
 
-describe("implementationPhase — pool result handling", () => {
+describe("implementationPhase — scheduler result handling", () => {
   beforeEach(() => {
     mockAddTask.mockClear();
-    mockValidateAllDependencies.mockClear();
-    mockGetAllTasks.mockClear();
     mockGetTask.mockClear();
-    mockPoolRun.mockClear();
-    mockClearTaskSessions.mockClear();
-    MockRunnerPool.mockClear();
-    MockLanePool.mockClear();
+    mockGetAllTasks.mockClear();
+    mockSchedulerRun.mockClear();
+    MockSessionScheduler.mockClear();
+    MockSessionGate.mockClear();
+    MockAuditLog.mockClear();
+    mockSingleSession.mockClear();
     mockReviewRunner.mockClear();
     mockLinearRunner.mockClear();
-    mockSingleSession.mockClear();
     mockGetTask.mockReturnValue(undefined);
   });
 
-  it("logs a warning when pool result does not match tracker state", async () => {
+  it("logs a warning when scheduler result does not match graph state", async () => {
     const consoleWarnSpy = jest
       .spyOn(console, "warn")
       .mockImplementation(() => {});
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
 
-    mockPoolRun.mockResolvedValue({ completedTasks: 1, failedTasks: 0 });
+    mockSchedulerRun.mockResolvedValue({ completedTasks: 1, failedTasks: 0 });
     mockGetAllTasks.mockReturnValue([
-      { id: "task-1", status: "done" },
-      { id: "task-2", status: "done" },
+      { id: "t-01", status: "done" },
+      { id: "t-02", status: "done" },
     ]);
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -1111,7 +931,7 @@ describe("implementationPhase — pool result handling", () => {
 
     expect(consoleWarnSpy).toHaveBeenCalledTimes(1);
     expect(consoleWarnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("Pool result discrepancy"),
+      expect.stringContaining("Scheduler result discrepancy"),
     );
     expect(consoleWarnSpy).toHaveBeenCalledWith(
       expect.stringContaining("1 completed"),
@@ -1120,20 +940,20 @@ describe("implementationPhase — pool result handling", () => {
     consoleWarnSpy.mockRestore();
   });
 
-  it("does not warn when pool result matches tracker state", async () => {
+  it("does not warn when scheduler result matches graph state", async () => {
     const consoleWarnSpy = jest
       .spyOn(console, "warn")
       .mockImplementation(() => {});
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
 
-    mockPoolRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
+    mockSchedulerRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
     mockGetAllTasks.mockReturnValue([
-      { id: "task-1", status: "done" },
-      { id: "task-2", status: "done" },
+      { id: "t-01", status: "done" },
+      { id: "t-02", status: "done" },
     ]);
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -1149,13 +969,13 @@ describe("implementationPhase — pool result handling", () => {
     const consoleWarnSpy = jest
       .spyOn(console, "warn")
       .mockImplementation(() => {});
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
 
-    mockPoolRun.mockResolvedValue({ completedTasks: 1, failedTasks: 1 });
-    mockGetAllTasks.mockReturnValue([{ id: "task-1", status: "done" }]);
+    mockSchedulerRun.mockResolvedValue({ completedTasks: 1, failedTasks: 1 });
+    mockGetAllTasks.mockReturnValue([{ id: "t-01", status: "done" }]);
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -1174,16 +994,16 @@ describe("implementationPhase — pool result handling", () => {
     const consoleWarnSpy = jest
       .spyOn(console, "warn")
       .mockImplementation(() => {});
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
 
-    mockPoolRun.mockResolvedValue({ completedTasks: 1, failedTasks: 2 });
+    mockSchedulerRun.mockResolvedValue({ completedTasks: 1, failedTasks: 2 });
     mockGetAllTasks.mockReturnValue([
-      { id: "task-1", status: "done" },
-      { id: "task-2", status: "failed" },
+      { id: "t-01", status: "done" },
+      { id: "t-02", status: "failed" },
     ]);
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -1208,33 +1028,31 @@ describe("implementationPhase — pool result handling", () => {
 describe("implementationPhase — edge cases", () => {
   beforeEach(() => {
     mockAddTask.mockClear();
-    mockValidateAllDependencies.mockClear();
-    mockGetAllTasks.mockClear();
     mockGetTask.mockClear();
-    mockPoolRun.mockClear();
-    mockClearTaskSessions.mockClear();
-    MockRunnerPool.mockClear();
-    MockLanePool.mockClear();
+    mockGetAllTasks.mockClear();
+    mockSchedulerRun.mockClear();
+    MockSessionScheduler.mockClear();
+    MockSessionGate.mockClear();
+    MockAuditLog.mockClear();
+    mockSingleSession.mockClear();
     mockReviewRunner.mockClear();
     mockLinearRunner.mockClear();
-    mockSingleSession.mockClear();
     mockGetTask.mockReturnValue(undefined);
-    mockPoolRun.mockResolvedValue({ completedTasks: 1, failedTasks: 0 });
+    mockSchedulerRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
   });
 
   it("handles an empty plan (no tasks)", async () => {
     const consoleWarnSpy = jest
       .spyOn(console, "warn")
       .mockImplementation(() => {});
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
 
     const emptyPlan: Plan = { tasks: [], strategy: "" };
 
     mockGetAllTasks.mockReturnValue([]);
-    mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       emptyPlan,
       "/cwd",
@@ -1243,18 +1061,17 @@ describe("implementationPhase — edge cases", () => {
     );
 
     expect(mockAddTask).not.toHaveBeenCalled();
-    expect(mockValidateAllDependencies).toHaveBeenCalled();
-    expect(mockPoolRun).toHaveBeenCalled();
+    expect(mockSchedulerRun).toHaveBeenCalled();
     expect(consoleWarnSpy).not.toHaveBeenCalled();
 
     consoleWarnSpy.mockRestore();
   });
 
-  it("uses default maxConcurrentSessions=5 when not specified", async () => {
-    const tracker = makeMockTracker();
+  it("uses default maxConcurrentTasks=5 when not specified", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -1262,32 +1079,33 @@ describe("implementationPhase — edge cases", () => {
       "/work",
     );
 
-    expect(MockRunnerPool).toHaveBeenCalledWith(
-      expect.objectContaining({ maxConcurrentSessions: 5 }),
-    );
+    const gateOpts = MockSessionGate.mock.calls[0][0] as Record<
+      string,
+      unknown
+    >;
+    expect(gateOpts.total).toBe(5);
   });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// rendererRegistry and task-id renumbering (preserved coverage)
+// RendererRegistry and task-id renumbering (preserved coverage)
 // ══════════════════════════════════════════════════════════════════════════
 
 describe("implementationPhase — rendererRegistry and task-id renumbering", () => {
   beforeEach(() => {
     mockAddTask.mockClear();
-    mockValidateAllDependencies.mockClear();
-    mockGetAllTasks.mockClear();
     mockGetTask.mockClear();
-    mockPoolRun.mockClear();
-    mockClearTaskSessions.mockClear();
-    MockRunnerPool.mockClear();
-    MockLanePool.mockClear();
+    mockGetAllTasks.mockClear();
+    mockSchedulerRun.mockClear();
+    MockSessionScheduler.mockClear();
+    MockSessionGate.mockClear();
+    MockAuditLog.mockClear();
+    mockSingleSession.mockClear();
     mockReviewRunner.mockClear();
     mockLinearRunner.mockClear();
-    mockSingleSession.mockClear();
     mockAssignSequentialTaskIds.mockClear();
     mockGetTask.mockReturnValue(undefined);
-    mockPoolRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
+    mockSchedulerRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
     mockGetAllTasks.mockReturnValue([
       { id: "t-01", status: "done" },
       { id: "t-02", status: "done" },
@@ -1295,7 +1113,7 @@ describe("implementationPhase — rendererRegistry and task-id renumbering", () 
   });
 
   it("renumbers task ids: arbitrary IDs become sequential (t-01, t-02) and dependencies are remapped", async () => {
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
     const planWithArbitraryIds: Plan = {
       tasks: [
         {
@@ -1321,7 +1139,7 @@ describe("implementationPhase — rendererRegistry and task-id renumbering", () 
     };
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       planWithArbitraryIds,
       "/cwd",
@@ -1329,29 +1147,25 @@ describe("implementationPhase — rendererRegistry and task-id renumbering", () 
       "/work",
     );
 
-    const addedIds = mockAddTask.mock.calls.map((c) => c[0].id);
+    const addedIds = mockAddTask.mock.calls.map((c) => c[0].id as string);
     expect(addedIds).toContain("t-01");
     expect(addedIds).toContain("t-02");
 
     expect(mockAddTask).toHaveBeenNthCalledWith(
       1,
-      expect.objectContaining({
-        id: "t-01",
-        dependencies: [],
-      }),
+      expect.objectContaining({ id: "t-01", dependencies: [] }),
+      expect.any(Function),
     );
 
     expect(mockAddTask).toHaveBeenNthCalledWith(
       2,
-      expect.objectContaining({
-        id: "t-02",
-        dependencies: ["t-01"],
-      }),
+      expect.objectContaining({ id: "t-02", dependencies: ["t-01"] }),
+      expect.any(Function),
     );
   });
 
-  it("assignSequentialTaskIds is called with plan.tasks and OLD ids never reach the tracker", async () => {
-    const tracker = makeMockTracker();
+  it("assignSequentialTaskIds is called with plan.tasks and OLD ids never reach the graph", async () => {
+    const taskGraph = makeMockTaskGraph();
     const planWithArbitraryIds: Plan = {
       tasks: [
         {
@@ -1377,7 +1191,7 @@ describe("implementationPhase — rendererRegistry and task-id renumbering", () 
     };
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       planWithArbitraryIds,
       "/cwd",
@@ -1390,13 +1204,13 @@ describe("implementationPhase — rendererRegistry and task-id renumbering", () 
       planWithArbitraryIds.tasks,
     );
 
-    const addedIds = mockAddTask.mock.calls.map((c) => c[0].id);
+    const addedIds = mockAddTask.mock.calls.map((c) => c[0].id as string);
     expect(addedIds).not.toContain("auth-a");
     expect(addedIds).not.toContain("auth-b");
   });
 
-  it("forwards rendererRegistry into RunnerPool options when provided", async () => {
-    const tracker = makeMockTracker();
+  it("forwards rendererRegistry into SessionScheduler options when provided", async () => {
+    const taskGraph = makeMockTaskGraph();
     const fakeRegistry = {
       renderers: new Map(),
       register: jest.fn(),
@@ -1405,7 +1219,7 @@ describe("implementationPhase — rendererRegistry and task-id renumbering", () 
     } as never;
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -1417,19 +1231,19 @@ describe("implementationPhase — rendererRegistry and task-id renumbering", () 
       fakeRegistry,
     );
 
-    expect(MockRunnerPool).toHaveBeenCalledTimes(1);
-    const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
+    expect(MockSessionScheduler).toHaveBeenCalledTimes(1);
+    const opts = MockSessionScheduler.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    expect(poolOptions).toHaveProperty("rendererRegistry", fakeRegistry);
+    expect(opts.rendererRegistry).toBe(fakeRegistry);
   });
 
   it("rendererRegistry is optional: omitting it still works", async () => {
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -1437,12 +1251,11 @@ describe("implementationPhase — rendererRegistry and task-id renumbering", () 
       "/work",
     );
 
-    expect(MockRunnerPool).toHaveBeenCalledTimes(1);
-    const poolOptions = MockRunnerPool.mock.calls[0][0] as Record<
+    const opts = MockSessionScheduler.mock.calls[0][0] as Record<
       string,
       unknown
     >;
-    expect(poolOptions.rendererRegistry).toBeUndefined();
+    expect(opts.rendererRegistry).toBeUndefined();
   });
 });
 
@@ -1453,26 +1266,25 @@ describe("implementationPhase — rendererRegistry and task-id renumbering", () 
 describe("implementationPhase — worktreeManager threading", () => {
   beforeEach(() => {
     mockAddTask.mockClear();
-    mockValidateAllDependencies.mockClear();
-    mockGetAllTasks.mockClear();
     mockGetTask.mockClear();
-    mockPoolRun.mockClear();
-    mockClearTaskSessions.mockClear();
-    MockRunnerPool.mockClear();
-    MockLanePool.mockClear();
+    mockGetAllTasks.mockClear();
+    mockSchedulerRun.mockClear();
+    MockSessionScheduler.mockClear();
+    MockSessionGate.mockClear();
+    MockAuditLog.mockClear();
+    mockSingleSession.mockClear();
     mockReviewRunner.mockClear();
     mockLinearRunner.mockClear();
-    mockSingleSession.mockClear();
     mockGetTask.mockReturnValue(undefined);
-    mockPoolRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
+    mockSchedulerRun.mockResolvedValue({ completedTasks: 2, failedTasks: 0 });
     mockGetAllTasks.mockReturnValue([
-      { id: "task-1", status: "done" },
-      { id: "task-2", status: "done" },
+      { id: "t-01", status: "done" },
+      { id: "t-02", status: "done" },
     ]);
   });
 
-  it("threads worktreeManager from implementationPhase into RunnerPool ctor options", async () => {
-    const tracker = makeMockTracker();
+  it("threads worktreeManager into SessionScheduler ctor options", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     const mockWtm = {
       createTaskWorktree: mock(async () => "/wt/x"),
@@ -1485,7 +1297,7 @@ describe("implementationPhase — worktreeManager threading", () => {
     } as unknown as WorkflowRunOptions["worktreeManager"];
 
     await implementationPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       SAMPLE_PLAN,
       "/cwd",
@@ -1499,74 +1311,9 @@ describe("implementationPhase — worktreeManager threading", () => {
       mockWtm, // worktreeManager
     );
 
-    expect(MockRunnerPool).toHaveBeenCalledTimes(1);
-    expect(MockRunnerPool.mock.calls[0][0]).toMatchObject({
+    expect(MockSessionScheduler).toHaveBeenCalledTimes(1);
+    expect(MockSessionScheduler.mock.calls[0][0]).toMatchObject({
       worktreeManager: mockWtm,
-    });
-  });
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// Type-level: RunnerPoolOptions uses maxConcurrentSessions (not maxConcurrentLanes)
-// ══════════════════════════════════════════════════════════════════════════
-
-describe("implementationPhase — RunnerPoolOptions type", () => {
-  it("RunnerPool is constructed with maxConcurrentSessions (not maxConcurrentLanes)", () => {
-    const tracker = makeMockTracker();
-
-    return implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    ).then(() => {
-      const callArg = MockRunnerPool.mock.calls[0][0] as Record<
-        string,
-        unknown
-      >;
-      expect(callArg).toHaveProperty("maxConcurrentSessions");
-      expect(callArg).not.toHaveProperty("maxConcurrentLanes");
-    });
-  });
-
-  it("does not pass legacy phase field to RunnerPool", () => {
-    const tracker = makeMockTracker();
-
-    return implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    ).then(() => {
-      const callArg = MockRunnerPool.mock.calls[0][0] as Record<
-        string,
-        unknown
-      >;
-      expect(callArg).not.toHaveProperty("phase");
-    });
-  });
-
-  it("RunnerPool is constructed with phaseId field (not phase)", () => {
-    const tracker = makeMockTracker();
-
-    return implementationPhase(
-      tracker,
-      ["/profiles"],
-      SAMPLE_PLAN,
-      "/cwd",
-      5,
-      "/work",
-    ).then(() => {
-      const callArg = MockRunnerPool.mock.calls[0][0] as Record<
-        string,
-        unknown
-      >;
-      expect(callArg).toHaveProperty("phaseId");
-      expect(callArg.phaseId).toBe("implementing");
     });
   });
 });

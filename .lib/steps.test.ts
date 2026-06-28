@@ -32,7 +32,7 @@ describe('StepDefinition', () => {
       name: 'approval-step',
       profileId: 'approver',
       isReadOnly: true,
-      isApproved: (result) => result.approved === true,
+      isApproved: (result: { approved: boolean }) => result.approved === true,
     };
     expect(step.isApproved?.({ approved: true })).toBe(true);
     expect(step.isApproved?.({ approved: false })).toBe(false);
@@ -43,7 +43,7 @@ describe('StepDefinition', () => {
       name: 'feedback-step',
       profileId: 'feedbacker',
       isReadOnly: true,
-      getFeedback: (result) => result.feedback ?? 'No feedback',
+      getFeedback: (result: { feedback: string }) => result.feedback ?? 'No feedback',
     };
     expect(step.getFeedback?.({ feedback: 'Good job' })).toBe('Good job');
   });

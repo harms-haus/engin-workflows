@@ -131,7 +131,7 @@ describe('WorkflowConfig.modelConcurrency', () => {
       titleFormatter: (d: string) => d,
     };
     // Accessing it on a concrete object yields undefined at runtime
-    expect((config as Record<string, unknown>).modelConcurrency).toBeUndefined();
+    expect((config as unknown as Record<string, unknown>).modelConcurrency).toBeUndefined();
   });
 
   it('accepts a Record<string, number>', () => {
@@ -169,7 +169,7 @@ describe('WorkflowConfig.modelConcurrency', () => {
     };
     expect(config.modelConcurrency).toHaveProperty('model-a');
     expect(config.modelConcurrency).toHaveProperty('model-c');
-    expect(config.modelConcurrency['model-b']).toBe(2);
+    expect(config.modelConcurrency!['model-b']).toBe(2);
   });
 });
 
@@ -273,7 +273,7 @@ describe('normalizeOptions', () => {
     };
     const result = normalizeOptions(input);
     expect(result.profilesDirs).toEqual(['/legacy']);
-    expect((result as Record<string, unknown>).profilesDir).toBeUndefined();
+    expect((result as unknown as Record<string, unknown>).profilesDir).toBeUndefined();
   });
 
   it('strips the legacy profilesDir field from output', () => {
@@ -285,7 +285,7 @@ describe('normalizeOptions', () => {
     };
     const result = normalizeOptions(input);
     expect(result.profilesDirs).toEqual(['/a']);
-    expect((result as Record<string, unknown>).profilesDir).toBeUndefined();
+    expect((result as unknown as Record<string, unknown>).profilesDir).toBeUndefined();
   });
 
   it('leaves profilesDirs undefined when neither is provided', () => {

@@ -1,12 +1,15 @@
 import type {
+  AuditLog,
   StatusCallbacks,
-  Task,
+  TaskGraph,
   WorkflowRunOptions,
-  WorkflowStatusTracker,
 } from "@harms-haus/engin-engine";
 import {
-  RunnerPool,
+  AuditLog as AuditLogCtor,
+  SessionGate,
+  SessionScheduler,
   linearRunner,
+  loadProfilesFromDirs,
   singleSession,
 } from "@harms-haus/engin-engine";
 import { join } from "node:path";
@@ -17,9 +20,10 @@ import type { ScoutingReview, ScoutingTopics } from "./schemas";
 // ─── Scouting step definitions ─────────────────────────────────────────────
 //
 // Each scout task runs a single "scouting" step via a read-only scout profile.
-// Mapped (in getRunnerForTask) to a linearRunner of singleSession runners —
-// one SessionSpec per step — so the RunnerPool drives scout execution through
-// the session primitive instead of the legacy LanePool/getStepsForTask path.
+// Mapped (in the runnerFactory passed to taskGraph.addTask) to a linearRunner
+// of singleSession runners — one SessionSpec per step — so the SessionScheduler
+// drives scout execution through the session primitive instead of the legacy
+// LanePool/getStepsForTask path.
 
 interface ScoutingStep {
   name: string;
@@ -50,27 +54,28 @@ interface ScoutingPhaseOptions {
  * Scout the codebase to identify key areas of investigation.
  *
  * When `options.topics` is provided, skips the scout-coordinator and runs a
- * RunnerPool directly against those topics (used for follow-up rounds after a
- * review identifies gaps).
+ * SessionScheduler directly against those topics (used for follow-up rounds
+ * after a review identifies gaps).
  *
  * When `options.topics` is omitted, runs the scout-coordinator first (via
- * `singleSession`) to determine the topics, then runs the RunnerPool (first
- * round).
+ * `runSingleSessionStructured`) to determine the topics, then runs the
+ * SessionScheduler (first round).
  *
- * Scout tasks are added to the SHARED tracker (`tracker.taskTracker`) and the
- * RunnerPool runs against it. Because the shared tracker persists across the
- * ≤3 scouting rounds, complete scout-task results accumulate naturally, so the
- * `onPhaseSettled` hook registered in spir.ts can collect the cumulative set
- * into `state.scoutingReports` (and persist it to workflowData) once the phase
- * settles.
+ * Scout tasks are added to the SHARED `taskGraph` and the SessionScheduler runs
+ * against it. Because the shared graph persists across the ≤3 scouting rounds,
+ * complete scout-task results accumulate naturally, so the `onPhaseSettled`
+ * hook registered in spir.ts can collect the cumulative set into
+ * `state.scoutingReports` (and persist it to workflowData via
+ * `onStatus.onWorkflowData`) once the phase settles.
  *
- * This function does NOT collect reports, call `setWorkflowData`, or fire
- * `onAgentComplete` itself — collection/persistence is the hook's job, and
- * per-scout completion is already surfaced by the RunnerPool's own status
- * callbacks, the same path `implementationPhase` relies on.
+ * This function does NOT collect reports, call `onStatus.onWorkflowData`, or
+ * fire `onAgentComplete` itself — collection/persistence is the hook's job,
+ * and per-scout completion is already surfaced by the SessionScheduler's own
+ * status callbacks (via `graph.onStatusTransition`), the same path
+ * `implementationPhase` relies on.
  */
 export async function scoutingPhase(
-  tracker: WorkflowStatusTracker,
+  taskGraph: TaskGraph,
   profilesDirs: string[],
   taskPrompt: string,
   cwd: string,
@@ -128,82 +133,96 @@ export async function scoutingPhase(
 
   if (topics.length === 0) return;
 
-  // Add scout tasks to the SHARED tracker (mirrors implementationPhase). The
+  // Add scout tasks to the SHARED task graph (mirrors implementationPhase). The
   // `getTask` guard prevents a duplicate-add when a follow-up round's gap
-  // repeats a prior topic slug — the shared tracker accumulates scout tasks
+  // repeats a prior topic slug — the shared graph accumulates scout tasks
   // across rounds, so a re-encountered id would otherwise throw.
   for (const topic of topics) {
     const taskId = `scout-${topic.topic
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/(^-|-$)/g, "")}`;
-    if (!tracker.taskTracker.getTask(taskId)) {
-      tracker.taskTracker.addTask({
-        id: taskId,
-        title: topic.topic,
-        prompt: [
-          "You are scouting ONE focused area of a codebase to support a larger task. Investigate YOUR assigned topic specifically, and relate everything you find back to why it matters for the task below.",
-          "",
-          "## Overall task (the goal this scouting supports)",
-          taskPrompt,
-          "",
-          "## Your scouting topic (stay focused here — other scouts are covering the rest)",
-          `Topic: ${topic.topic}`,
-          `Rationale: ${topic.rationale}`,
-          `Key files to start from: ${topic.files.join(", ")}`,
-          "",
-          "Provide a detailed report of your findings. For each finding, briefly note how it is relevant to the overall task. Do not duplicate work that falls outside your topic.",
-        ].join("\n"),
-        profile: "scout",
-        files: topic.files,
-        dependencies: [],
-        phaseId: "scouting",
-        worktree: "none",
-      });
+    if (!taskGraph.getTask(taskId)) {
+      const scoutPrompt = [
+        "You are scouting ONE focused area of a codebase to support a larger task. Investigate YOUR assigned topic specifically, and relate everything you find back to why it matters for the task below.",
+        "",
+        "## Overall task (the goal this scouting supports)",
+        taskPrompt,
+        "",
+        "## Your scouting topic (stay focused here — other scouts are covering the rest)",
+        `Topic: ${topic.topic}`,
+        `Rationale: ${topic.rationale}`,
+        `Key files to start from: ${topic.files.join(", ")}`,
+        "",
+        "Provide a detailed report of your findings. For each finding, briefly note how it is relevant to the overall task. Do not duplicate work that falls outside your topic.",
+      ].join("\n");
+
+      // Build the runner factory: linearRunner of singleSession runners (one
+      // SessionSpec per SCOUTING_STEPS step). singleSession returns a
+      // SessionPlanFactory (() => SessionPlanRunner); calling it yields a
+      // SessionPlanRunner. linearRunner wraps the SessionPlanRunner[] and
+      // returns a SessionPlanFactory — the exact shape taskGraph.addTask
+      // expects for its runnerFactory parameter.
+      const runnerFactory = linearRunner(
+        SCOUTING_STEPS.map((step) =>
+          singleSession({
+            profile: step.profileId,
+            prompt: scoutPrompt,
+            outputMode: "text",
+            isReadOnly: step.isReadOnly,
+            role: step.name,
+            runnerRole: step.name,
+            attempt: 1,
+          })(),
+        ),
+      );
+
+      taskGraph.addTask(
+        {
+          id: taskId,
+          title: topic.topic,
+          prompt: scoutPrompt,
+          profile: "scout",
+          files: topic.files,
+          dependencies: [],
+          status: "ready",
+          phaseId: "scouting",
+          worktree: "none",
+        },
+        runnerFactory,
+      );
     }
   }
 
-  const pool = new RunnerPool({
-    maxConcurrentSessions: maxConcurrentTasks,
-    modelConcurrency: {},
-    profilesDirs,
-    phaseId: "scouting",
+  // ── Load profiles + build gate for the SessionScheduler ────────────
+  const profiles = await loadProfilesFromDirs(profilesDirs);
+  const gate = new SessionGate({
+    total: maxConcurrentTasks,
+    perModel: {},
+  });
+  const auditLog: AuditLog = new AuditLogCtor(workDir);
+  const activeSessions = new Set<{ abort(): Promise<void> }>();
+
+  const scheduler = new SessionScheduler({
+    graph: taskGraph,
+    gate,
+    profiles,
     sessionBaseDir: join(
       workDir,
       "sessions",
       `scouting-round-${phaseOptions.round}`,
     ),
     cwd,
-    apiKeys,
     onStatus,
-    auditLog: tracker.auditLog,
-    // Thread the hook registry alongside auditLog so RunnerPool.run() can
-    // auto-register its own default auditor and observe each scout step's
-    // structured_output / decision events.
     hookRegistry,
-    taskTracker: tracker.taskTracker,
-    // Map SCOUTING_STEPS to a linearRunner of singleSession runners (one
-    // SessionSpec per step). The RunnerPool invokes the returned runner for
-    // each claimed scout task, driving execution through the session
-    // primitive instead of the legacy getStepsForTask/LanePool path.
-    getRunnerForTask: (task: Task) =>
-      linearRunner(
-        SCOUTING_STEPS.map((step) =>
-          singleSession({
-            profile: step.profileId,
-            prompt: task.prompt,
-            outputMode: "text",
-            isReadOnly: step.isReadOnly,
-            role: step.name,
-            runnerRole: step.name,
-            attempt: 1,
-          }),
-        ),
-      ),
+    auditLog,
     signal,
+    phaseId: "scouting",
+    ...(apiKeys !== undefined ? { apiKeys } : {}),
+    activeSessions,
   });
 
-  await pool.run();
+  await scheduler.run();
 }
 
 // ─── Phase 2: Scouting Review ───────────────────────────────────────────────
@@ -235,7 +254,7 @@ const DEFAULT_REVIEW: ScoutingReview = {
  * directly instead of having to discover and read them themselves.
  */
 export async function scoutingReviewPhase(
-  tracker: WorkflowStatusTracker,
+  taskGraph: TaskGraph,
   profilesDirs: string[],
   taskPrompt: string,
   reports: unknown[],

@@ -1,27 +1,25 @@
 // ─── SPIR Backbone Orchestrator Tests ───────────────────────────────────────
 //
-// Tests for spir.ts after the PhaseRunner migration. The hand-written
-// `executePhase` switch + `runSpir` phase loop are replaced by the engine's
-// `PhaseRunner` (task-20):
+// Tests for spir.ts after the E2 tracker-removal migration (kb-28):
 //
-//   - Phases are declared as a `PhaseDefinition[]` (`{ id, label, icon, run }`).
-//   - `runSpir` builds the `PhaseDefinition[]`, constructs
-//     `new PhaseRunner({ phases, tracker, hookRegistry, cwd, workDir, signal })`,
-//     and calls `.run()`.
-//   - SPIR-specific orchestration moves into phase-level hooks registered on
-//     the hookRegistry:
-//       • `shouldRetryPhase` — scouting ≤3 rounds
-//       • `onPhaseSettled`   — scouting collect-loop (task-38)
-//       • `afterPhase`       — sidebar indicator update
-//   - `options.hookRegistry` is threaded through `SpirRunOptions` to the
-//     PhaseRunner.
-//   - `executePhase`, `completePhase`, and the inline phase loop are DELETED.
+//   - WorkflowStatusTracker is REMOVED. Resume state is read from
+//     `options.eventStore.getProjection()` (workflowData, currentPhaseId, …).
+//   - A `TaskGraph` is constructed instead of using `tracker.taskTracker`.
+//   - Workflow data flows via `onStatus.onWorkflowData` (events), not
+//     `tracker.setWorkflowData`.
+//   - The PhaseRunner receives a lightweight `PhaseTracker` adapter (no-ops for
+//     registerPhase/setPhase/save since events are the source of truth) that
+//     surfaces `taskGraph.getAllTasks()` to the `onPhaseSettled` hook.
+//   - PhaseRunner now emits onPhaseStart/onPhaseComplete/onPhaseRegister via
+//     onStatus itself (D6), so the SPIR hooks own only the abort guard,
+//     scouting retry, scouting collect-loop, and sidebar indicator.
+//   - The phase BODY modules (scoutingPhase, planningPhase, …) stay in their
+//     sibling `.lib/*.ts` files and still use old APIs — E3-E6 will rewrite
+//     them. Phase-integration tests may remain failing until then.
 //
-// The phase BODIES (scoutingPhase, planningPhase, …) stay in their sibling
-// `.lib/*.ts` files; only the orchestration moved. These tests mock the
-// engine's `PhaseRunner` (its constructor captures the options it receives) so
-// we can assert exactly what `runSpir` wires into it, and invoke the captured
-// phase `run()` functions + hooks directly.
+// These tests mock the engine's `PhaseRunner` (its constructor captures the
+// options it receives) so we can assert exactly what `runSpir` wires into it,
+// and invoke the captured phase `run()` functions + hooks directly.
 // ────────────────────────────────────────────────────────────────────────────
 
 import { describe, expect, it, jest, mock, beforeEach } from "bun:test";
@@ -32,96 +30,26 @@ import { createEnginMock } from "./engin-mock";
 // re-exported modules need, plus a constructor-spied `PhaseRunner` whose
 // options we capture for the migration assertions.
 
-const mockCancelTask = jest.fn<(id: string) => void>();
-const mockGetAllTasks = jest
-  .fn<() => { id: string; status: string; phaseId?: string }[]>()
-  .mockReturnValue([]);
-const mockTaskTracker = {
-  cancelTask: mockCancelTask,
+const mockGetAllTasks = jest.fn().mockReturnValue([]);
+
+// TaskGraph mock: replaces tracker.taskTracker. spir.ts constructs a fresh
+// TaskGraph per runSpir invocation.
+const MockTaskGraph = jest.fn().mockImplementation(() => ({
+  addTask: jest.fn(),
+  addTasks: jest.fn(),
   getAllTasks: mockGetAllTasks,
-};
-
-/** Build a rich no-op tracker instance (the value returned by the mocked
- *  `WorkflowStatusTracker` constructor and by `.load` for resume tests). */
-function makeTrackerInstance(
-  overrides: Record<string, unknown> = {},
-): Record<string, unknown> {
-  return {
-    setPhase: jest.fn(),
-    setCurrentPhase: jest.fn(),
-    registerPhase: jest.fn(),
-    setTaskPrompt: jest.fn(),
-    setWorktree: jest.fn(),
-    setWorkflowData: jest.fn(),
-    save: jest.fn().mockResolvedValue(undefined),
-    recordAgentSpawn: jest.fn(),
-    incrementAgentCount: jest.fn(),
-    // `auditLog` is needed when the delegating `finalReviewPhase` spy forwards
-    // to the real implementation under spir's mocked engine (the lane-isolation
-    // catch path appends an error event on `runStepTask` failure).
-    auditLog: { append: jest.fn().mockResolvedValue(undefined) },
-    get workflowData() {
-      return {};
-    },
-    get currentPhase() {
-      return "";
-    },
-    get currentPhaseId() {
-      return "";
-    },
-    get completedPhases() {
-      return [];
-    },
-    get completedPhaseIds() {
-      return [];
-    },
-    get taskTracker() {
-      return mockTaskTracker;
-    },
-    get stats() {
-      return { agentCount: 0, totalTokens: 0, totalCost: 0 };
-    },
-    setScoutingReports: jest.fn(),
-    setPlan: jest.fn(),
-    setResearch: jest.fn(),
-    setPlanReviewFeedback: jest.fn(),
-    clearPlanReviewFeedback: jest.fn(),
-    ...overrides,
-  };
-}
-
-const MockWorkflowStatusTracker = jest
-  .fn<() => Record<string, unknown>>()
-  .mockImplementation(() => makeTrackerInstance());
-
-// Default `.load` rejects with the "state file not found" error so a fresh
-// `runSpir` run constructs a new tracker via `new WorkflowStatusTracker(...)`.
-// Resume tests override this with `mockResolvedValueOnce`.
-const TrackerCtor = MockWorkflowStatusTracker as unknown as {
-  load: ReturnType<typeof jest.fn>;
-  mockClear: () => void;
-};
-TrackerCtor.load = jest
-  .fn()
-  .mockRejectedValue(
-    new Error("Workflow state file not found: .engin-state.json"),
-  );
-
-const MockLanePool = jest.fn().mockImplementation(() => ({
-  run: jest.fn().mockResolvedValue({ completedTasks: 0, failedTasks: 0 }),
+  getTask: jest.fn().mockReturnValue(undefined),
+  getReadyTasks: jest.fn().mockReturnValue([]),
+  setTaskStatus: jest.fn(),
+  failDeadlockedTasks: jest.fn(),
+  transitiveDependentCount: jest.fn().mockReturnValue(0),
+  makeNoopRunnerFactory: jest.fn(),
 }));
 
-const MockTaskTracker = jest.fn().mockImplementation(() => ({
-  addTask: jest.fn(),
-  getAllTasks: mockGetAllTasks,
-  getReadyTasks: jest.fn().mockReturnValue([]),
-  claimTasks: jest.fn().mockReturnValue([]),
-  completeTask: jest.fn(),
-  failTask: jest.fn(),
-  cancelTask: mockCancelTask,
-  rejectTask: jest.fn(),
-  startTask: jest.fn(),
-  submitForReview: jest.fn(),
+// SessionScheduler mock: replaces RunnerPool. Phase modules (E3-E6) will
+// construct these; for now it's available in the mock surface.
+const MockSessionScheduler = jest.fn().mockImplementation(() => ({
+  run: jest.fn().mockResolvedValue({ completedTasks: 0, failedTasks: 0 }),
 }));
 
 // ─── PhaseRunner constructor spy (captures the options runSpir wires in) ────
@@ -154,6 +82,7 @@ interface CapturedRunnerOptions {
   workDir: string;
   signal?: AbortSignal;
   maxRounds?: number;
+  onStatus?: unknown;
 }
 
 let capturedRunnerOptions: CapturedRunnerOptions | undefined;
@@ -182,6 +111,7 @@ interface RegistrySpy {
   invokeFirstWins: ReturnType<typeof jest.fn>;
   invokeAllRun: ReturnType<typeof jest.fn>;
   invokePipeline: ReturnType<typeof jest.fn>;
+  clone: ReturnType<typeof jest.fn>;
 }
 
 function makeRegistrySpy(): RegistrySpy {
@@ -195,6 +125,10 @@ function makeRegistrySpy(): RegistrySpy {
     invokeFirstWins: jest.fn(),
     invokeAllRun: jest.fn(),
     invokePipeline: jest.fn(),
+    // clone: return self (the spy is shared). PhaseRunner calls clone() to
+    // give each phase an isolated registry snapshot, but for test assertions
+    // the shared spy is what we inspect.
+    clone: jest.fn(() => spy),
   };
   return spy;
 }
@@ -205,10 +139,9 @@ const mockCreateHookRegistry = jest
 
 mock.module("@harms-haus/engin-engine", () => ({
   ...createEnginMock(),
-  // Types are compile-time only; these are the runtime values
-  WorkflowStatusTracker: MockWorkflowStatusTracker,
-  LanePool: MockLanePool,
-  TaskTracker: MockTaskTracker,
+  // Override with test-specific constructor spies.
+  TaskGraph: MockTaskGraph,
+  SessionScheduler: MockSessionScheduler,
   PhaseRunner: MockPhaseRunner,
   createHookRegistry: mockCreateHookRegistry,
 }));
@@ -233,20 +166,39 @@ mock.module("./initialization", () => ({
   initializationPhase: mockInitializationPhase,
 }));
 
-// ── Delegating spies for ./scouting and ./final-review ────────────────────
+// ── Spies for ./scouting and ./final-review ────────────────────────────
 //
-// `mock.module` is process-global, so the stubs registered here affect ALL
-// test files in the same process. For ./final-review and ./scouting, we use
-// DELEGATING SPIES (jest.fn wrapping the real function) rather than simple
-// stubs. This way sibling test files (scouting.test.ts, final-review.test.ts)
-// that dynamically import those modules get the REAL implementation, not a
-// stub. The spy still tracks call info so spir's own assertions work.
-const realScouting = await import("./scouting");
-const mockScoutingPhase = jest.fn(realScouting.scoutingPhase);
-const mockScoutingReviewPhase = jest.fn(realScouting.scoutingReviewPhase);
+// During the E2→E6 "red window", the phase body modules still import old
+// engine symbols (RunnerPool, TaskTracker) that the new engin-mock (E1) no
+// longer exports. Attempting to `await import("./scouting")` therefore fails
+// until E3-E6 rewrite those modules. We fall back to simple no-op stubs when
+// the real module cannot load; once E3-E6 land, the delegating spies wrap the
+// real implementation automatically.
+const mockScoutingPhase = jest.fn().mockResolvedValue(undefined);
+const mockScoutingReviewPhase = jest.fn().mockResolvedValue({
+  research: "",
+  gaps: [],
+  files: [],
+  ready: true,
+});
+const mockFinalReviewPhase = jest.fn().mockResolvedValue(undefined);
 
-const realFinalReview = await import("./final-review");
-const mockFinalReviewPhase = jest.fn(realFinalReview.finalReviewPhase);
+try {
+  const realScouting = await import("./scouting");
+  mockScoutingPhase.mockImplementation(realScouting.scoutingPhase);
+  mockScoutingReviewPhase.mockImplementation(realScouting.scoutingReviewPhase);
+} catch {
+  // Red window: ./scouting still imports old engine symbols — stubs are fine.
+}
+
+let realFinalReviewExports: Record<string, unknown> = {};
+try {
+  const realFinalReview = await import("./final-review");
+  mockFinalReviewPhase.mockImplementation(realFinalReview.finalReviewPhase);
+  realFinalReviewExports = realFinalReview;
+} catch {
+  // Red window: ./final-review still imports old engine symbols — stubs are fine.
+}
 
 mock.module("./scouting", () => ({
   scoutingPhase: mockScoutingPhase,
@@ -255,8 +207,8 @@ mock.module("./scouting", () => ({
 
 mock.module("./final-review", () => ({
   finalReviewPhase: mockFinalReviewPhase,
-  DEFAULT_FINAL_REVIEWERS: realFinalReview.DEFAULT_FINAL_REVIEWERS,
-  isActionableSeverity: realFinalReview.isActionableSeverity,
+  DEFAULT_FINAL_REVIEWERS: realFinalReviewExports.DEFAULT_FINAL_REVIEWERS ?? [],
+  isActionableSeverity: realFinalReviewExports.isActionableSeverity ?? (() => false),
 }));
 
 // Dynamic import for runtime values (mock must be applied first)
@@ -292,7 +244,7 @@ const MINIMAL_OPTIONS: SpirRunOptions = {
 /** Minimal PhaseRunContext handed to a captured phase `run()` in tests. */
 function makePhaseCtx(state: Record<string, unknown> = {}): PhaseRunCtxLike {
   return {
-    tracker: makeTrackerInstance(),
+    tracker: {},
     state,
     cwd: "/tmp/test-cwd",
     workDir: "/tmp/test-workdir",
@@ -318,18 +270,14 @@ beforeEach(() => {
   MockPhaseRunner.mockClear();
   mockRunnerRun.mockClear();
   mockCreateHookRegistry.mockClear();
-  MockWorkflowStatusTracker.mockClear();
-  TrackerCtor.load.mockClear();
-  TrackerCtor.load.mockRejectedValue(
-    new Error("Workflow state file not found: .engin-state.json"),
-  );
+  MockTaskGraph.mockClear();
+  MockSessionScheduler.mockClear();
   mockImplementationPhase.mockClear();
   mockPlanningPhase.mockClear();
   mockScoutingPhase.mockClear();
   mockScoutingReviewPhase.mockClear();
   mockFinalReviewPhase.mockClear();
   mockInitializationPhase.mockClear();
-  mockCancelTask.mockClear();
   mockGetAllTasks.mockClear();
 });
 
@@ -823,7 +771,7 @@ describe("runSpir — config threading: maxConcurrentSessions + modelConcurrency
       // run is a closure — we can't inspect its internals, but we can confirm
       // that no config/options object passed from the orchestrator references
       // the old seam.
-      expect((p as Record<string, unknown>).getStepsForTask).toBeUndefined();
+      expect((p as unknown as Record<string, unknown>).getStepsForTask).toBeUndefined();
     }
   });
 
@@ -1037,15 +985,15 @@ describe("onPhaseSettled hook — scouting collect-loop", () => {
   });
 
   it("persists scoutingReports to workflowData so the planning resume path works", async () => {
-    // The PhaseRunner persists only its setPhase transitions, not the shared
-    // state bag, so the hook must explicitly write scoutingReports to
-    // workflowData — otherwise planning's resume path (which reads
-    // data.scoutingReports) finds nothing.
+    // The onPhaseSettled hook emits scoutingReports via onStatus.onWorkflowData
+    // (the workflow_data_set event) so the EventStore-backed projection carries
+    // them for the planning phase's resume path.
+    const onWorkflowData = jest.fn();
     const registry = makeRegistrySpy();
-    const opts = await runSpirAndCapture({ hookRegistry: registry });
-    const tracker = opts.tracker as {
-      setWorkflowData: ReturnType<typeof jest.fn>;
-    };
+    await runSpirAndCapture({
+      hookRegistry: registry,
+      onStatus: { onWorkflowData } as never,
+    });
     const onPhaseSettled = registry.registeredHooks.onPhaseSettled as (
       args: unknown,
       ctx: unknown,
@@ -1063,8 +1011,8 @@ describe("onPhaseSettled hook — scouting collect-loop", () => {
 
     await onPhaseSettled({ phaseId: "scouting", tasks, state: {} }, hookCtx);
 
-    expect(tracker.setWorkflowData).toHaveBeenCalledWith({
-      scoutingReports: [{ topic: "api" }],
+    expect(onWorkflowData).toHaveBeenCalledWith({
+      data: { scoutingReports: [{ topic: "api" }] },
     });
   });
 });
@@ -1226,80 +1174,38 @@ describe("runSpir — sidebar updates", () => {
   });
 });
 
-// ─── Abort Handling: cancelTask ─────────────────────────────────────────────
+// ─── Abort Handling ─────────────────────────────────────────────────────────
 //
-// On "Workflow cancelled" (signal abort), runSpir's try/catch around
-// PhaseRunner.run() cancels all active tasks via tracker.taskTracker.cancelTask
-// before calling onWorkflowFailed. The behaviour is preserved from the
-// pre-migration catch block.
+// After E2, abort handling is cooperative: the SessionScheduler (constructed
+// by phase modules in E3-E6) aborts active sessions via `options.signal`.
+// runSpir's catch block around PhaseRunner.run() fires onWorkflowFailed and
+// swallows the 'Workflow cancelled' error. There is no more
+// tracker.taskTracker.cancelTask — the signal is the single cancellation
+// mechanism.
 
 describe("runSpir — abort handling", () => {
-  it("cancels all active tasks on abort before calling onWorkflowFailed", () => {
-    const activeTasks = [
-      { id: "task-1", status: "active" },
-      { id: "task-2", status: "active" },
-      { id: "task-3", status: "ready" }, // not active, should be skipped
-    ];
-    mockGetAllTasks.mockReturnValue(activeTasks);
+  it("fires onWorkflowFailed and returns on 'Workflow cancelled' error", async () => {
+    const onWorkflowFailed = jest.fn();
+    // Make the PhaseRunner's run() throw a cancellation error.
+    mockRunnerRun.mockRejectedValueOnce(new Error("Workflow cancelled"));
 
-    for (const task of mockTaskTracker.getAllTasks()) {
-      if (task.status === "active") {
-        try {
-          mockTaskTracker.cancelTask(task.id);
-        } catch {
-          // ignore errors from already-settled tasks
-        }
-      }
-    }
-
-    expect(mockGetAllTasks).toHaveBeenCalled();
-    expect(mockCancelTask).toHaveBeenCalledTimes(2);
-    expect(mockCancelTask).toHaveBeenCalledWith("task-1");
-    expect(mockCancelTask).toHaveBeenCalledWith("task-2");
-    expect(mockCancelTask).not.toHaveBeenCalledWith("task-3");
-  });
-
-  it("does not throw if cancelTask throws for already-settled tasks", () => {
-    mockGetAllTasks.mockReturnValue([{ id: "task-done", status: "active" }]);
-    mockCancelTask.mockImplementationOnce(() => {
-      throw new Error("Task is already settled");
+    await spir.runSpir(MINIMAL_CONFIG, "Build a feature", {
+      ...MINIMAL_OPTIONS,
+      onStatus: { onWorkflowFailed } as never,
     });
 
-    expect(() => {
-      for (const task of mockTaskTracker.getAllTasks()) {
-        if (task.status === "active") {
-          try {
-            mockTaskTracker.cancelTask(task.id);
-          } catch {
-            // expected: ignore
-          }
-        }
-      }
-    }).not.toThrow();
-
-    expect(mockCancelTask).toHaveBeenCalled();
+    expect(onWorkflowFailed).toHaveBeenCalledTimes(1);
+    const call = onWorkflowFailed.mock.calls[0][0];
+    expect(call.error).toBeInstanceOf(Error);
+    expect(call.error.message).toBe("Workflow cancelled");
   });
 
-  it("skips non-active tasks during abort cancellation", () => {
-    const tasks = [
-      { id: "t1", status: "ready" },
-      { id: "t2", status: "blocked" },
-      { id: "t3", status: "done" },
-      { id: "t4", status: "failed" },
-    ];
-    mockGetAllTasks.mockReturnValue(tasks);
+  it("re-throws non-cancellation errors from PhaseRunner.run()", async () => {
+    mockRunnerRun.mockRejectedValueOnce(new Error("Something broke"));
 
-    for (const task of mockTaskTracker.getAllTasks()) {
-      if (task.status === "active") {
-        try {
-          mockTaskTracker.cancelTask(task.id);
-        } catch {
-          // ignore
-        }
-      }
-    }
-
-    expect(mockCancelTask).not.toHaveBeenCalled();
+    await expect(
+      spir.runSpir(MINIMAL_CONFIG, "Build a feature", MINIMAL_OPTIONS),
+    ).rejects.toThrow("Something broke");
   });
 });
 

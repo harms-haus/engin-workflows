@@ -1,16 +1,18 @@
 import type {
-  Runner,
+  AuditLog,
   StatusCallbacks,
   StepDefinition,
-  Task,
+  TaskGraph,
   WorkflowRunOptions,
-  WorkflowStatusTracker,
 } from "@harms-haus/engin-engine";
 import {
-  RunnerPool,
-  TaskTracker,
+  AuditLog as AuditLogCtor,
+  SessionGate,
+  SessionScheduler,
+  TaskGraph as TaskGraphCtor,
   getDiff,
   linearRunner,
+  loadProfilesFromDirs,
   singleSession,
 } from "@harms-haus/engin-engine";
 import { join } from "node:path";
@@ -44,17 +46,19 @@ import { errorEvent } from "./helpers";
 //   review-fixes passes are skipped entirely.
 // - Each lane maintains its own per-dimension history (all prior review AND
 //   review-fixes results) so the reviewer never re-reports already-fixed items.
-// - Each lane owns its own fixer RunnerPool (findings from other dimensions
-//   never mix in), and per-lane session directories keep fixer sessions
-//   isolated.
+// - Each lane owns its own fixer TaskGraph + SessionScheduler (findings from
+//   other dimensions never mix in), and per-lane session directories keep fixer
+//   sessions isolated.
 //
 // Each lane's review pass uses `runSingleSessionStructured` (shared from
 // session-utils.ts) which wraps `singleSession` + a custom `runSession` to
-// capture the structured `FinalReviewResult`. Per-lane fixer RunnerPools
-// provide isolation for fix-and-verify loops.
+// capture the structured `FinalReviewResult`. Per-lane fixer
+// SessionSchedulers provide isolation for fix-and-verify loops.
 //
-// Fixer tasks are submitted to a per-lane RunnerPool whose `getRunnerForTask`
-// returns a `linearRunner` of `singleSession` wrappers (one per fixer step).
+// Fixer tasks are submitted to a per-lane TaskGraph whose runner factory is a
+// `linearRunner` of `singleSession` wrappers (one per fixer step, built from
+// `config.fixerSteps`). The SessionScheduler drives fixer execution through the
+// session primitive instead of the legacy RunnerPool/getRunnerForTask path.
 //
 // The phase returns `true` only if EVERY lane finished clean.
 
@@ -250,7 +254,6 @@ function formatHistory(history: FinalReviewResult[]): string {
 
 /** Shared, immutable context threaded into every review lane. */
 interface LaneContext {
-  tracker: WorkflowStatusTracker;
   profilesDirs: string[];
   cwd: string;
   workDir: string;
@@ -262,18 +265,20 @@ interface LaneContext {
   titleFormatter: (description: string) => string;
   /** Recomputes the working-tree diff (against HEAD); called fresh before each review pass. */
   collectDiff: () => string;
+  /** Audit log for recording lane-level error events. Threaded into each
+   *  per-lane fixer SessionScheduler so session events are tracked too. */
+  auditLog: AuditLog;
   /** Threaded so the engine's default auditor observes each reviewer's structured_output. */
   hookRegistry?: WorkflowRunOptions["hookRegistry"];
 }
 
 /**
- * Run a fixer RunnerPool over one set of actionable findings for a single lane.
- * Each finding becomes one fixer task; the pool runs them in parallel (bounded
- * by `maxConcurrentSessions`). Each task's runner is a `linearRunner` of
- * `singleSession` wrappers (one per fixer step), pre-built so the runner
- * infrastructure drives fixer execution through the session primitive. The
- * session dir is scoped per dimension + fix round so concurrent lanes never
- * collide.
+ * Run a per-lane fixer SessionScheduler over one set of actionable findings.
+ * Each finding becomes one fixer task added to a FRESH per-lane TaskGraph; the
+ * SessionScheduler runs them in parallel (bounded by `maxConcurrentSessions`).
+ * Each task's runner factory is a `linearRunner` of `singleSession` wrappers
+ * (one per fixer step), built from `ctx.fixerSteps`. The session dir is scoped
+ * per dimension + fix round so concurrent lanes never collide.
  */
 async function runFixersForLane(
   reviewer: FinalReviewerConfig,
@@ -281,11 +286,10 @@ async function runFixersForLane(
   fixRound: number,
   ctx: LaneContext,
 ): Promise<void> {
-  const fixerTracker = new TaskTracker();
-
-  // Pre-build the runner for each fixer task so `linearRunner` +
-  // `singleSession` are invoked during setup (not deferred to pool execution).
-  const taskRunners = new Map<string, Runner>();
+  // Per-lane TaskGraph for fixer isolation (mirrors the original per-lane
+  // TaskTracker). A fresh graph per lane+round ensures findings from other
+  // dimensions or prior rounds never mix in.
+  const laneGraph: TaskGraph = new TaskGraphCtor();
 
   for (let i = 0; i < findings.length; i++) {
     const finding = findings[i];
@@ -305,60 +309,73 @@ async function runFixersForLane(
       finding.fixPrompt,
     ].join("\n");
 
-    fixerTracker.addTask({
-      id: taskId,
-      title: `Fix [${finding.severity}] ${reviewer.label}: ${ctx.titleFormatter(finding.title)}`,
-      prompt,
-      profile: ctx.fixerSteps[0]?.profileId ?? "fixer",
-      files: [filePathOnly(finding.file)],
-      dependencies: [],
-      worktree: "none",
-      phaseId: "review",
-    });
-
-    taskRunners.set(
-      taskId,
-      linearRunner(
-        ctx.fixerSteps.map((step) =>
-          singleSession({
-            profile: step.profileId,
-            prompt,
-            outputMode: step.isReadOnly ? "text" : "filesystem",
-            isReadOnly: step.isReadOnly,
-            role: step.name,
-            runnerRole: step.name,
-            attempt: 1,
-            ...(step.schema !== undefined ? { schema: step.schema } : {}),
-          }),
-        ),
+    // Build the runner factory: linearRunner of singleSession runners (one
+    // SessionSpec per fixer step). `singleSession(spec)` returns a
+    // SessionPlanFactory (() => SessionPlanRunner); calling it yields the
+    // SessionPlanRunner. `linearRunner(SessionPlanRunner[])` returns a
+    // SessionPlanFactory — the shape `taskGraph.addTask` expects for its
+    // `runnerFactory` parameter.
+    const runnerFactory = linearRunner(
+      ctx.fixerSteps.map((step) =>
+        singleSession({
+          profile: step.profileId,
+          prompt,
+          outputMode: step.isReadOnly ? "text" : "filesystem",
+          isReadOnly: step.isReadOnly,
+          role: step.name,
+          runnerRole: step.name,
+          attempt: 1,
+          ...(step.schema !== undefined ? { schema: step.schema } : {}),
+        })(),
       ),
+    );
+
+    laneGraph.addTask(
+      {
+        id: taskId,
+        title: `Fix [${finding.severity}] ${reviewer.label}: ${ctx.titleFormatter(finding.title)}`,
+        prompt,
+        profile: ctx.fixerSteps[0]?.profileId ?? "fixer",
+        files: [filePathOnly(finding.file)],
+        dependencies: [],
+        status: "ready",
+        phaseId: "review",
+        worktree: "none",
+      },
+      runnerFactory,
     );
   }
 
-  const pool = new RunnerPool({
-    maxConcurrentSessions: ctx.maxConcurrentTasks ?? 5,
-    modelConcurrency: {},
-    profilesDirs: ctx.profilesDirs,
+  // ── Load profiles + build gate for the SessionScheduler ────────────
+  const profiles = await loadProfilesFromDirs(ctx.profilesDirs);
+  const gate = new SessionGate({
+    total: ctx.maxConcurrentTasks ?? 5,
+    perModel: {},
+  });
+  const activeSessions = new Set<{ abort(): Promise<void> }>();
+
+  const scheduler = new SessionScheduler({
+    graph: laneGraph,
+    gate,
+    profiles,
     sessionBaseDir: join(
       ctx.workDir,
       "sessions",
       `fix-${reviewer.dimension}-${fixRound}`,
     ),
     cwd: ctx.cwd,
-    apiKeys: ctx.apiKeys,
-    onStatus: ctx.onStatus,
-    auditLog: ctx.tracker.auditLog,
-    // Thread the hook registry alongside auditLog so RunnerPool.run() can
-    // auto-register its own default auditor and observe each fixer step's
-    // structured_output / decision events.
-    hookRegistry: ctx.hookRegistry,
-    taskTracker: fixerTracker,
-    getRunnerForTask: (task: Task) => taskRunners.get(task.id)!,
-    signal: ctx.signal,
+    ...(ctx.apiKeys !== undefined ? { apiKeys: ctx.apiKeys } : {}),
+    ...(ctx.onStatus !== undefined ? { onStatus: ctx.onStatus } : {}),
+    ...(ctx.hookRegistry !== undefined
+      ? { hookRegistry: ctx.hookRegistry }
+      : {}),
+    auditLog: ctx.auditLog,
+    ...(ctx.signal !== undefined ? { signal: ctx.signal } : {}),
     phaseId: "review",
+    activeSessions,
   });
 
-  await pool.run();
+  await scheduler.run();
 }
 
 /**
@@ -478,10 +495,15 @@ async function runFinalReviewLane(
  * session-utils.ts) which wraps `singleSession` + a custom `runSession` to
  * capture the structured `FinalReviewResult`.
  *
+ * `graph` is the shared `TaskGraph` from the orchestrator — accepted for API
+ * symmetry with the scouting/planning/implementation phases. Fixer tasks are
+ * isolated in per-lane graphs (see `runFixersForLane`), so the shared graph is
+ * not modified by this phase.
+ *
  * Returns `true` only if every lane finished clean.
  */
 export async function finalReviewPhase(
-  tracker: WorkflowStatusTracker,
+  graph: TaskGraph,
   profilesDirs: string[],
   cwd: string,
   workDir: string,
@@ -496,6 +518,11 @@ export async function finalReviewPhase(
   titleFormatter: (description: string) => string = (d) => d.slice(0, 100),
   hookRegistry?: WorkflowRunOptions["hookRegistry"],
 ): Promise<boolean> {
+  // `graph` is the shared orchestrator TaskGraph — unused by this phase (fixer
+  // tasks are isolated in per-lane graphs). Accepted for positional API
+  // compatibility with the other phase bodies.
+  void graph;
+
   const collectDiff = (): string => {
     try {
       return getDiff(cwd);
@@ -504,8 +531,9 @@ export async function finalReviewPhase(
     }
   };
 
+  const auditLog: AuditLog = new AuditLogCtor(workDir);
+
   const ctx: LaneContext = {
-    tracker,
     profilesDirs,
     cwd,
     workDir,
@@ -516,6 +544,7 @@ export async function finalReviewPhase(
     fixerSteps,
     titleFormatter,
     collectDiff,
+    auditLog,
     hookRegistry,
   };
 
@@ -533,7 +562,7 @@ export async function finalReviewPhase(
         return await runFinalReviewLane(reviewer, ctx);
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
-        await ctx.tracker.auditLog.append(
+        await ctx.auditLog.append(
           errorEvent(
             reviewer.profileId,
             `Review lane failed and was skipped: ${reason}`,

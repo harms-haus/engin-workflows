@@ -1,4 +1,5 @@
 import type {
+  AuditLog,
   StepDefinition,
   WorkflowRunOptions,
 } from "@harms-haus/engin-engine";
@@ -27,11 +28,19 @@ export interface WorkflowConfig {
   name: string;
   defaultMaxConcurrentSessions: number;
   /**
-   * Per-model concurrency limits applied by the RunnerPool. When a model id
-   * is present, the pool caps how many concurrent sessions use it. Omit (or
-   * pass `{}`) to let every model run unbounded (the RunnerPool's default).
+   * Per-model concurrency limits applied by the SessionScheduler (the engine's
+   * per-session scheduling primitive, constructed by the phase body modules).
+   * When a model id is present, the scheduler caps how many concurrent
+   * sessions use it. Omit (or pass `{}`) to let every model run unbounded
+   * (the SessionScheduler's default).
    */
   modelConcurrency?: Record<string, number>;
+  /**
+   * Config-data describing the fix-and-verify steps for the final review's
+   * fixer loop. Stored as plain `StepDefinition[]` (serializable config),
+   * NOT as runtime runner objects; `final-review.ts` converts these into
+   * `SessionPlanRunner`s at runtime when building each lane's fixer pool.
+   */
   fixerSteps: StepDefinition[];
   /**
    * Specialized reviewers run in the final review phase. Each is invoked in
@@ -50,6 +59,8 @@ export interface SpirRunOptions extends WorkflowRunOptions {
   profilesDirs?: string[];
   /** Legacy singular form; normalized to `profilesDirs: [profilesDir]` by `normalizeOptions`. */
   profilesDir?: string;
+  /** Optional AuditLog; when absent the backbone constructs one from `workDir`. */
+  auditLog?: AuditLog;
 }
 
 // ─── Options Normalization ─────────────────────────────────────────────────

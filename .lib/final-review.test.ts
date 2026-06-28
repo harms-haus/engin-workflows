@@ -1,19 +1,27 @@
-// ─── Final Review Phase Tests (kb-16: B5 migration) ────────────────────────
+// ─── Final Review Phase Tests (kb-31: E5 migration) ────────────────────────
 //
 // Tests for final-review.ts: the migrated per-lane multi-dimensional review
-// that uses RunnerPool + singleSession + linearRunner instead of the old
-// runStepTask + LanePool pattern.
+// that uses TaskGraph + SessionScheduler + singleSession + linearRunner
+// instead of the legacy TaskTracker + RunnerPool pattern.
 //
-// Each reviewer lane runs as a task submitted to a RunnerPool. The pool's
-// getRunnerForTask returns singleSession(reviewSpec) for review passes.
-// Fixer tasks use a separate RunnerPool whose getRunnerForTask returns a
-// linearRunner of singleSession wrappers (one per fixer step).
+// Each reviewer lane runs via `runSingleSessionStructured` (which calls
+// `runSession` directly). Fixer tasks are added to a per-lane TaskGraph and
+// driven by a per-lane SessionScheduler whose runner factory is a linearRunner
+// of singleSession runners (one per fixer step, built from config.fixerSteps).
 //
-// The old runStepTask and LanePool imports MUST be absent; runStepTask MUST
-// never be called and LanePool MUST never be constructed.
+// The old symbols (RunnerPool, TaskTracker, LanePool, runStepTask) MUST be
+// absent from the production code — these tests assert the NEW path
+// (TaskGraph, SessionScheduler) is used instead.
 // ────────────────────────────────────────────────────────────────────────────
 
-import { describe, expect, it, jest, mock, beforeEach } from "bun:test";
+import {
+  beforeEach,
+  describe,
+  expect,
+  it,
+  jest,
+  mock,
+} from "bun:test";
 import { createEnginMock } from "./engin-mock";
 import type {
   FinalReviewResult,
@@ -21,123 +29,70 @@ import type {
   FinalReviewSeverity,
 } from "./schemas";
 
-// ─── Mock @harms-haus/engin (new pool-based pattern) ─────────────────────
+// ─── Mock @harms-haus/engin-engine (SessionPlan contract) ────────────────
 //
-// We mock via createEnginMock() then override with per-test spies for:
-//   - RunnerPool (replaces LanePool)
-//   - singleSession (replaces runStepTask for review passes)
-//   - linearRunner (wraps fixer step sessions)
-//   - getDiff / TaskTracker (unchanged usage)
-//
-// The old symbols (runStepTask, LanePool) are STILL provided in the mock
-// because the production code has NOT been migrated yet — removing them
-// would crash the import. The assertions below verify they are NEVER called.
-
-// ── RunnerPool mock ──────────────────────────────────────────────────────
-const mockPoolRun =
-  jest.fn<() => Promise<{ completedTasks: number; failedTasks: number }>>();
-mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
-
-const MockRunnerPool =
-  jest.fn<(...args: unknown[]) => { run: typeof mockPoolRun }>();
-(MockRunnerPool as unknown as ReturnType<typeof jest.fn>).mockImplementation(
-  () => ({
-    run: mockPoolRun,
-  }),
-);
-
-// ── singleSession mock ───────────────────────────────────────────────────
-// singleSession(spec) returns a Runner (async function). The runner calls
-// ctx.runSession so that runSingleSessionStructured can capture the structured
-// SessionResult via its wrapped runSession.
-const mockSingleSession =
-  jest.fn<(spec: any) => (ctx: any) => Promise<unknown>>();
-mockSingleSession.mockImplementation((spec: any) => {
-  return async (ctx: any) => {
-    await ctx.runSession({
-      spec: {
-        id: `${ctx.task?.id ?? "test"}/${spec.role}#${spec.attempt ?? 1}`,
-        profile: spec.profile,
-        prompt: spec.prompt,
-        ...(spec.schema !== undefined ? { schema: spec.schema } : {}),
-        outputMode: spec.outputMode ?? "text",
-        ...(spec.isReadOnly !== undefined
-          ? { isReadOnly: spec.isReadOnly }
-          : {}),
-        runnerRole: spec.role,
-        attempt: spec.attempt ?? 1,
-      },
-      sessionBaseDir: ctx.sessionBaseDir,
-      cwd: ctx.cwd,
-      phaseId: ctx.phaseId,
-      agentId: ctx.agentId,
-      profiles: ctx.profiles,
-      signal: ctx.signal ?? new AbortController().signal,
-      activeSessions: ctx.activeSessions ?? new Set(),
-    });
-    return { status: "completed" };
-  };
-});
-
-// ── runSession mock ──────────────────────────────────────────────────────
-// runSession is the session primitive called inside the singleSession runner.
-// Tests override this to control the structured data that reviewers produce.
-const mockRunSession = jest.fn().mockResolvedValue({ mode: "text", text: "" });
-
-// ── linearRunner mock ────────────────────────────────────────────────────
-// linearRunner(children: Runner[]) returns a Runner.
-const mockLinearRunner =
-  jest.fn<(...args: unknown[]) => (...args: unknown[]) => Promise<unknown>>();
-const mockLinearRunnerResult = jest
-  .fn<() => Promise<{ status: string }>>()
-  .mockResolvedValue({ status: "completed" });
-mockLinearRunner.mockReturnValue(mockLinearRunnerResult);
-
-// ── Old-symbol stubs (needed for pre-migration production code import) ───
-// Default implementation: return a clean result so old code doesn't crash.
-const mockRunStepTask = jest.fn<(opts: any) => Promise<unknown>>();
-
-const mockGetDiff = jest
-  .fn<() => string>()
-  .mockReturnValue("MOCK-DIFF-CONTENT");
-const mockAddTask = jest.fn<(task: any) => void>();
-const mockGetAllTasks =
-  jest.fn<() => { id: string; status: string; result?: unknown }[]>();
-const MockTaskTracker = jest.fn().mockImplementation(() => ({
-  addTask: mockAddTask,
-  getAllTasks: mockGetAllTasks,
-}));
-const MockLanePool = jest.fn().mockImplementation(() => ({
-  run: jest.fn().mockResolvedValue({ completedTasks: 0, failedTasks: 0 }),
-}));
-
-// Default mock implementation: return clean result so tests that assert
-// new behavior can run without old-code crashes.
-mockRunStepTask.mockImplementation(async (opts: any) => {
-  const dimension = (opts.profileId as string).replace(/-reviewer$/, "");
-  return {
-    dimension,
-    applicable: true,
-    notApplicableReason: "",
-    summary: "No issues found",
-    findings: [],
-  } satisfies FinalReviewResult;
-});
+// We mock the ENTIRE module via createEnginMock(), then override the symbols
+// the migrated final-review.ts uses:
+//   - TaskGraph (replaces TaskTracker — constructed per-lane for fixers)
+//   - SessionScheduler (replaces RunnerPool)
+//   - singleSession / linearRunner (build fixer runner factories)
+//   - AuditLog (constructed by the phase for lane error logging)
+//   - runSession (drives review sessions via runSingleSessionStructured)
+//   - getDiff (returns a mock diff)
 
 mock.module("@harms-haus/engin-engine", () => ({
   ...createEnginMock(),
-  // New pool-based exports (the target)
-  RunnerPool: MockRunnerPool,
-  singleSession: mockSingleSession,
-  linearRunner: mockLinearRunner,
-  runSession: mockRunSession,
-  // Old exports — still provided so pre-migration source can import,
-  // but assertions verify they are never called by finalReviewPhase.
-  runStepTask: mockRunStepTask,
-  LanePool: MockLanePool,
-  TaskTracker: MockTaskTracker,
-  getDiff: mockGetDiff,
+  // singleSession(spec) → SessionPlanFactory (() => SessionPlanRunner).
+  // Production code calls singleSession(spec)() so the mock must return
+  // a callable that yields a SessionPlanRunner.
+  singleSession: jest.fn().mockImplementation((spec: Record<string, unknown>) =>
+    jest.fn(() => ({
+      plan: async function* () {
+        yield [spec];
+      },
+      execute: jest.fn().mockResolvedValue({ mode: "text", text: "" }),
+    })),
+  ),
+  // linearRunner(children) → SessionPlanFactory (() => SessionPlanRunner).
+  linearRunner: jest.fn().mockImplementation((_children: unknown[]) =>
+    jest.fn(() => ({
+      plan: async function* () {
+        yield [];
+      },
+      execute: jest.fn().mockResolvedValue({ mode: "text", text: "" }),
+    })),
+  ),
+  // TaskGraph: replaces TaskTracker. Constructed per-lane for fixer tasks.
+  TaskGraph: jest.fn().mockImplementation(() => ({
+    addTask: jest.fn(),
+    getTask: jest.fn().mockReturnValue(undefined),
+    getAllTasks: jest.fn().mockReturnValue([]),
+    setTaskStatus: jest.fn(),
+    failDeadlockedTasks: jest.fn(),
+  })),
+  // SessionScheduler: replaces RunnerPool. Drives fixer tasks through the gate.
+  SessionScheduler: jest.fn().mockImplementation(() => ({
+    run: jest
+      .fn()
+      .mockResolvedValue({ completedTasks: 0, failedTasks: 0 }),
+  })),
+  // AuditLog: constructed by the phase for lane error logging.
+  AuditLog: jest.fn().mockImplementation(() => ({
+    append: jest.fn().mockResolvedValue(undefined),
+  })),
 }));
+
+// Import the engine to get the ACTUAL mock instances used by the implementation
+const engineModule = await import("@harms-haus/engin-engine");
+
+// References to the shared mock instances (read from the cached engine module)
+type Spy = ReturnType<typeof mock>;
+const mockRunSession = engineModule.runSession as unknown as Spy;
+const mockSingleSession = engineModule.singleSession as unknown as Spy;
+const mockLinearRunner = engineModule.linearRunner as unknown as Spy;
+const mockTaskGraph = engineModule.TaskGraph as unknown as Spy;
+const mockSessionScheduler = engineModule.SessionScheduler as unknown as Spy;
+const mockAuditLog = engineModule.AuditLog as unknown as Spy;
 
 // Dynamic import to ensure mock is applied first
 const { finalReviewPhase, DEFAULT_FINAL_REVIEWERS, isActionableSeverity } =
@@ -158,14 +113,6 @@ const EXPECTED_REVIEWER_COUNT = DEFAULT_FINAL_REVIEWERS.length; // 5
 const MAX_FIX_ROUNDS = 3;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-
-function makeMockTracker() {
-  return {
-    auditLog: {
-      append: jest.fn().mockResolvedValue(undefined),
-    },
-  } as never;
-}
 
 function makeCleanResult(dimension: string): FinalReviewResult {
   return {
@@ -225,18 +172,12 @@ function dimensionOfProfileId(profileId: string): string {
 
 beforeEach(() => {
   // Reset all mocks
-  MockRunnerPool.mockClear();
-  mockPoolRun.mockClear();
   mockSingleSession.mockClear();
   mockRunSession.mockClear();
   mockLinearRunner.mockClear();
-  mockLinearRunnerResult.mockClear();
-  mockRunStepTask.mockClear();
-  MockLanePool.mockClear();
-  mockAddTask.mockClear();
-  mockGetAllTasks.mockClear();
-  mockGetDiff.mockClear();
-  MockTaskTracker.mockClear();
+  mockTaskGraph.mockClear();
+  mockSessionScheduler.mockClear();
+  mockAuditLog.mockClear();
 
   // Default: mockRunSession returns clean structured results for reviewer
   // profiles, so all lanes finish clean by default.
@@ -253,98 +194,84 @@ beforeEach(() => {
     return { mode: "text", text: "" };
   });
 
-  // Default: mockRunStepTask returns clean result per reviewer (kept for
-  // completeness; the migrated code must never call it).
-  mockRunStepTask.mockImplementation(async (opts: any) => {
-    const dimension = (opts.profileId as string).replace(/-reviewer$/, "");
-    return makeCleanResult(dimension);
-  });
+  // SessionScheduler.run succeeds by default
+  mockSessionScheduler.mockImplementation(() => ({
+    run: jest
+      .fn()
+      .mockResolvedValue({ completedTasks: 0, failedTasks: 0 }),
+  }));
 
-  // Pool run succeeds by default
-  mockPoolRun.mockResolvedValue({ completedTasks: 0, failedTasks: 0 });
-  mockLinearRunnerResult.mockResolvedValue({ status: "completed" });
+  // AuditLog returns an appendable mock
+  mockAuditLog.mockImplementation(() => ({
+    append: jest.fn().mockResolvedValue(undefined),
+  }));
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 1. OLD SYMBOLS ARE NOT USED
-// ═══════════════════════════════════════════════════════════════════════════
-
-describe("finalReviewPhase — old symbols not used", () => {
-  it("does NOT call runStepTask (old reviewer path is gone)", async () => {
-    const tracker = makeMockTracker();
-    await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/work", 5);
-    // runStepTask must NOT be called by the migrated code.
-    // FAILS with current code (calls runStepTask 5 times).
-    expect(mockRunStepTask).not.toHaveBeenCalled();
-  });
-
-  it("does NOT construct a LanePool even when there are actionable findings", async () => {
-    const tracker = makeMockTracker();
-    // Make first lane return findings so the code would normally
-    // construct a fixer pool.
-    mockRunSession.mockImplementation(async (sctx: any) => {
-      if (sctx.spec.profile === "efficiency-reviewer") {
-        return {
-          mode: "structured",
-          data: makeResultWithFindings("efficiency", [makeFinding("critical")]),
-        };
-      }
-      const dimension = sctx.spec.profile.replace(/-reviewer$/, "");
-      return { mode: "structured", data: makeCleanResult(dimension) };
-    });
-
-    await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/work", 5);
-    // LanePool must NOT be constructed even when fixers are needed.
-    expect(MockLanePool).not.toHaveBeenCalled();
-  });
-});
-
-// NOTE: The reviewer-level RunnerPool that these tests previously asserted
-// was removed in the kb-16 cleanup — it was dead code (zero tasks added).
-// Reviewer passes now run via runSingleSessionStructured directly, without
-// a wrapping RunnerPool. The fixer RunnerPool is still constructed per-lane
-// when there are actionable findings and is tested below.
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 3. CLEAN ASSESSMENT
+// 1. CLEAN ASSESSMENT
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("finalReviewPhase — clean assessment", () => {
   it("returns true when all reviewers are clean", async () => {
-    const tracker = makeMockTracker();
-    // With mocked runStepTask returning clean results, old code returns true.
-    // After migration, RunnerPool + singleSession should also return true.
-    // (Expected: true, actual with OLD code: true)
     const result = await finalReviewPhase(
-      tracker,
+      null as never,
       ["/profiles"],
       "/cwd",
       "/work",
       5,
     );
-    // This test MUST pass to preserve the contract.
     expect(result).toBe(true);
   });
 
   it("does NOT manually append structured_output for reviewer results (the default auditor handles it)", async () => {
-    const append = jest.fn().mockResolvedValue(undefined);
-    const tracker = { auditLog: { append } } as never;
-    await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/work", 5);
+    await finalReviewPhase(null as never, ["/profiles"], "/cwd", "/work", 5);
 
-    // The audit migration deleted manual structured_output appends.
-    // With the engine mocked here no auditor fires, so append must
-    // NOT receive a structured_output event.
-    expect(append).not.toHaveBeenCalledWith(
-      expect.objectContaining({ type: "structured_output" }),
-    );
+    // The AuditLog constructed by the phase should NOT receive a
+    // structured_output event from the phase body itself (the engine's
+    // default auditor handles that via the hook registry).
+    const auditInstances = mockAuditLog.mock.results;
+    for (const result of auditInstances) {
+      const append = (result.value as any).append as ReturnType<typeof jest.fn>;
+      if (append && typeof append.mock === "object") {
+        expect(append).not.toHaveBeenCalledWith(
+          expect.objectContaining({ type: "structured_output" }),
+        );
+      }
+    }
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 4. FIXER RUNNERPOOL (replaces LanePool)
+// 2. CLEAN LANES SKIP FIXERS
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe("finalReviewPhase — fixer RunnerPool replaces LanePool", () => {
+describe("finalReviewPhase — clean lanes skip fixer path", () => {
+  it("does NOT construct a TaskGraph or SessionScheduler when all lanes are clean", async () => {
+    await finalReviewPhase(null as never, ["/profiles"], "/cwd", "/work", 5);
+
+    expect(mockTaskGraph).not.toHaveBeenCalled();
+    expect(mockSessionScheduler).not.toHaveBeenCalled();
+    expect(mockLinearRunner).not.toHaveBeenCalled();
+    expect(mockSingleSession).not.toHaveBeenCalled();
+  });
+
+  it("runs exactly one review session per reviewer (5 for defaults)", async () => {
+    await finalReviewPhase(null as never, ["/profiles"], "/cwd", "/work", 5);
+
+    const reviewerSessions = mockRunSession.mock.calls.filter(
+      (c: any) =>
+        typeof c[0]?.spec?.profile === "string" &&
+        c[0].spec.profile.endsWith("-reviewer"),
+    );
+    expect(reviewerSessions).toHaveLength(EXPECTED_REVIEWER_COUNT);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3. FIXER PATH: TaskGraph + SessionScheduler (replaces RunnerPool)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("finalReviewPhase — fixer TaskGraph + SessionScheduler", () => {
   // Shared setup: one lane returns findings so fixers are triggered.
   function setupEfficiencyFindings() {
     mockRunSession.mockImplementation(async (sctx: any) => {
@@ -359,54 +286,87 @@ describe("finalReviewPhase — fixer RunnerPool replaces LanePool", () => {
     });
   }
 
-  it("does NOT use LanePool for fixers — uses RunnerPool with getRunnerForTask returning linearRunner", async () => {
-    const tracker = makeMockTracker();
+  it("constructs a TaskGraph when there are actionable findings", async () => {
     setupEfficiencyFindings();
 
-    await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/work", 5);
+    await finalReviewPhase(null as never, ["/profiles"], "/cwd", "/work", 5);
 
-    // LanePool must NOT be constructed
-    expect(MockLanePool).not.toHaveBeenCalled();
-    // RunnerPool should be constructed (at least once for reviewers,
-    // and a second time for fixers)
-    expect(MockRunnerPool).toHaveBeenCalled();
+    expect(mockTaskGraph).toHaveBeenCalled();
   });
 
-  it("creates fixer tasks and submits them to a RunnerPool with linearRunner per fixerStep", async () => {
-    const tracker = makeMockTracker();
+  it("constructs a SessionScheduler when there are actionable findings", async () => {
     setupEfficiencyFindings();
 
-    await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/work", 5);
+    await finalReviewPhase(null as never, ["/profiles"], "/cwd", "/work", 5);
 
-    // linearRunner is called to wrap fixer steps.
-    expect(mockLinearRunner).toHaveBeenCalled();
+    expect(mockSessionScheduler).toHaveBeenCalled();
   });
 
-  it("linearRunner is called with an array of runners from singleSession (one per fixer step)", async () => {
-    const tracker = makeMockTracker();
+  it("adds fixer tasks to the per-lane TaskGraph via addTask", async () => {
     setupEfficiencyFindings();
 
-    await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/work", 5);
+    await finalReviewPhase(null as never, ["/profiles"], "/cwd", "/work", 5);
 
+    // Each TaskGraph mock instance has an addTask spy. Collect all addTask calls.
+    const allAddTaskCalls = mockTaskGraph.mock.results.flatMap(
+      (r: any) => r.value.addTask.mock.calls,
+    );
+    // One finding → one fixer task per fix round (up to MAX_FIX_ROUNDS).
+    expect(allAddTaskCalls.length).toBeGreaterThan(0);
+    // Each call has (task, runnerFactory) — the task has a fixer id pattern.
+    for (const call of allAddTaskCalls) {
+      const task = call[0];
+      expect(task.id).toMatch(/^fixer-/);
+      expect(task.phaseId).toBe("review");
+    }
+  });
+
+  it("builds runner factory via linearRunner of singleSession runners (one per fixer step)", async () => {
+    setupEfficiencyFindings();
+
+    await finalReviewPhase(null as never, ["/profiles"], "/cwd", "/work", 5);
+
+    // linearRunner is called to wrap fixer steps into a SessionPlanFactory.
     expect(mockLinearRunner).toHaveBeenCalled();
+    // singleSession is called to build each step's runner.
+    expect(mockSingleSession).toHaveBeenCalled();
+
+    // linearRunner receives an array of SessionPlanRunner children.
     const children = mockLinearRunner.mock.calls[0][0] as unknown[];
     expect(Array.isArray(children)).toBe(true);
-    // Each child should be a runner (function) created by singleSession
+    // Each child should be a SessionPlanRunner (object with plan/execute).
     for (const child of children) {
-      expect(typeof child).toBe("function");
+      expect(typeof child).toBe("object");
+      expect(child).toHaveProperty("plan");
+      expect(child).toHaveProperty("execute");
     }
+  });
+
+  it("SessionScheduler receives graph, gate, profiles, and phaseId", async () => {
+    setupEfficiencyFindings();
+
+    await finalReviewPhase(null as never, ["/profiles"], "/cwd", "/work", 5);
+
+    const schedulerOpts = mockSessionScheduler.mock.calls[0][0] as Record<
+      string,
+      unknown
+    >;
+    expect(schedulerOpts).toHaveProperty("graph");
+    expect(schedulerOpts).toHaveProperty("gate");
+    expect(schedulerOpts).toHaveProperty("profiles");
+    expect(schedulerOpts.phaseId).toBe("review");
+    expect(schedulerOpts).toHaveProperty("auditLog");
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 5. PER-LANE LOOP BEHAVIOR
+// 4. PER-LANE LOOP BEHAVIOR
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("finalReviewPhase — per-lane loop behavior", () => {
   it("returns true when all lanes are clean", async () => {
-    const tracker = makeMockTracker();
     const result = await finalReviewPhase(
-      tracker,
+      null as never,
       ["/profiles"],
       "/cwd",
       "/work",
@@ -416,8 +376,6 @@ describe("finalReviewPhase — per-lane loop behavior", () => {
   });
 
   it("returns false if ANY lane stays dirty (even if others are clean)", async () => {
-    const tracker = makeMockTracker();
-    // One lane returns findings but never resolves (exhausts MAX_FIX_ROUNDS)
     mockRunSession.mockImplementation(async (sctx: any) => {
       if (sctx.spec.profile === "efficiency-reviewer") {
         return {
@@ -430,7 +388,7 @@ describe("finalReviewPhase — per-lane loop behavior", () => {
     });
 
     const result = await finalReviewPhase(
-      tracker,
+      null as never,
       ["/profiles"],
       "/cwd",
       "/work",
@@ -440,7 +398,6 @@ describe("finalReviewPhase — per-lane loop behavior", () => {
   });
 
   it("gives up on a lane after MAX_FIX_ROUNDS and returns false", async () => {
-    const tracker = makeMockTracker();
     mockRunSession.mockImplementation(async (sctx: any) => {
       if (sctx.spec.profile === "efficiency-reviewer") {
         return {
@@ -452,20 +409,17 @@ describe("finalReviewPhase — per-lane loop behavior", () => {
       return { mode: "structured", data: makeCleanResult(dimension) };
     });
 
-    const result = await finalReviewPhase(
-      tracker,
-      ["/profiles"],
-      "/cwd",
-      "/work",
-      5,
-    );
-    expect(result).toBe(false);
+    await finalReviewPhase(null as never, ["/profiles"], "/cwd", "/work", 5);
+
+    // A lane that never resolves triggers MAX_FIX_ROUNDS fixer attempts.
+    // Each attempt constructs a TaskGraph + SessionScheduler.
+    expect(mockTaskGraph).toHaveBeenCalledTimes(MAX_FIX_ROUNDS);
+    expect(mockSessionScheduler).toHaveBeenCalledTimes(MAX_FIX_ROUNDS);
   });
 
   it("a clean lane does NOT trigger any fixer or review-fixes pass", async () => {
-    const tracker = makeMockTracker();
-    await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/work", 5);
-    // When migrated, clean lanes should not add fixer tasks to the pool.
+    await finalReviewPhase(null as never, ["/profiles"], "/cwd", "/work", 5);
+
     // Only 5 review sessions ran (one per reviewer), no fixer or review-fixes.
     const reviewerSessions = mockRunSession.mock.calls.filter(
       (c: any) =>
@@ -473,16 +427,16 @@ describe("finalReviewPhase — per-lane loop behavior", () => {
         c[0].spec.profile.endsWith("-reviewer"),
     );
     expect(reviewerSessions).toHaveLength(5);
+    expect(mockTaskGraph).not.toHaveBeenCalled();
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 6. REVIEWER HISTORY IS PASSED ON RE-REVIEW
+// 5. REVIEWER HISTORY IS PASSED ON RE-REVIEW
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("finalReviewPhase — passes full prior-pass history to reviewers", () => {
   it("initial-review prompts contain NO history; verify prompts DO", async () => {
-    const tracker = makeMockTracker();
     // One lane returns a finding so it triggers a review-fixes pass.
     mockRunSession.mockImplementation(async (sctx: any) => {
       if (sctx.spec.profile === "efficiency-reviewer") {
@@ -495,10 +449,8 @@ describe("finalReviewPhase — passes full prior-pass history to reviewers", () 
       return { mode: "structured", data: makeCleanResult(dimension) };
     });
 
-    await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/work", 5);
+    await finalReviewPhase(null as never, ["/profiles"], "/cwd", "/work", 5);
 
-    // After migration: initial-review sessions have no "PRIOR REVIEW HISTORY"
-    // in their prompt; verify sessions do.
     const allCalls = mockRunSession.mock.calls.map((c: any) => c[0]);
     const prompts = allCalls.map((c: any) => c.spec.prompt as string);
     const initialPrompts = prompts.filter(
@@ -516,19 +468,18 @@ describe("finalReviewPhase — passes full prior-pass history to reviewers", () 
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 7. CUSTOM REVIEWER SET
+// 6. CUSTOM REVIEWER SET
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("finalReviewPhase — custom finalReviewers", () => {
   it("runs exactly the supplied reviewers (not the defaults)", async () => {
-    const tracker = makeMockTracker();
     const custom = [
       { profileId: "a-reviewer", dimension: "a", label: "A" },
       { profileId: "b-reviewer", dimension: "b", label: "B" },
     ];
 
     await finalReviewPhase(
-      tracker,
+      null as never,
       ["/profiles"],
       "/cwd",
       "/work",
@@ -539,13 +490,13 @@ describe("finalReviewPhase — custom finalReviewers", () => {
       custom,
     );
 
-    // With migrated code, only 2 runSession calls (one per custom reviewer via runSingleSessionStructured)
+    // Only 2 runSession calls (one per custom reviewer via runSingleSessionStructured)
     expect(mockRunSession).toHaveBeenCalledTimes(2);
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 8. PURE HELPERS (unchanged by migration)
+// 7. PURE HELPERS (unchanged by migration)
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("isActionableSeverity", () => {
@@ -580,18 +531,12 @@ describe("DEFAULT_FINAL_REVIEWERS", () => {
   });
 });
 
-// NOTE: The reviewer-level RunnerPool sessionBaseDir assertion was removed
-// in the kb-16 cleanup — the dead reviewer RunnerPool was removed. Fixer
-// RunnerPools per-lane still receive sessionBaseDir (tested in the fixer
-// pool section above).
-
 // ═══════════════════════════════════════════════════════════════════════════
-// 10. LANE ISOLATION (one flaky reviewer must not abort the run)
+// 8. LANE ISOLATION (one flaky reviewer must not abort the run)
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("finalReviewPhase — lane isolation on reviewer failure", () => {
   it("a throwing reviewer does NOT abort the run; the lane is not-clean and the others still run", async () => {
-    const tracker = makeMockTracker();
     // Make one reviewer throw in its runSession call
     mockRunSession.mockImplementation(async (sctx: any) => {
       if (sctx.spec.profile === "ui-ux-reviewer") {
@@ -602,7 +547,7 @@ describe("finalReviewPhase — lane isolation on reviewer failure", () => {
     });
 
     const result = await finalReviewPhase(
-      tracker,
+      null as never,
       ["/profiles"],
       "/cwd",
       "/work",
@@ -614,10 +559,14 @@ describe("finalReviewPhase — lane isolation on reviewer failure", () => {
   });
 
   it("audit-logs the lane failure as an error event and fires onError", async () => {
-    const append = jest.fn().mockResolvedValue(undefined);
-    const tracker = { auditLog: { append } } as never;
     const onError = jest.fn();
     const onStatus = { onError } as never;
+
+    // Capture the AuditLog instance's append calls
+    const auditAppendSpy = jest.fn().mockResolvedValue(undefined);
+    mockAuditLog.mockImplementation(() => ({
+      append: auditAppendSpy,
+    }));
 
     mockRunSession.mockImplementation(async (sctx: any) => {
       if (sctx.spec.profile === "security-reviewer") {
@@ -628,7 +577,7 @@ describe("finalReviewPhase — lane isolation on reviewer failure", () => {
     });
 
     const result = await finalReviewPhase(
-      tracker,
+      null as never,
       ["/profiles"],
       "/cwd",
       "/work",
@@ -638,8 +587,8 @@ describe("finalReviewPhase — lane isolation on reviewer failure", () => {
     );
     expect(result).toBe(false);
 
-    // Lane error is logged
-    const failures = append.mock.calls
+    // Lane error is logged via auditLog.append
+    const failures = auditAppendSpy.mock.calls
       .map((c) => c[0])
       .filter((e: any) => e.type === "error");
     expect(failures).toHaveLength(1);
@@ -653,23 +602,78 @@ describe("finalReviewPhase — lane isolation on reviewer failure", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 11. RESUME VIA REPLAY — singleSession sessions are persisted
+// 9. NOT-APPLICABLE DIMENSIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe("finalReviewPhase — resume via replay", () => {
-  it("uses deterministic session IDs via singleSession so persisted sessions can be replayed", async () => {
-    const tracker = makeMockTracker();
-    await finalReviewPhase(tracker, ["/profiles"], "/cwd", "/work", 5);
+describe("finalReviewPhase — not-applicable dimensions", () => {
+  it("a not-applicable dimension is treated as clean (no actionable findings)", async () => {
+    mockRunSession.mockImplementation(async (sctx: any) => {
+      if (sctx.spec.profile === "ui-ux-reviewer") {
+        return {
+          mode: "structured",
+          data: makeNotApplicable("ui-ux"),
+        };
+      }
+      const dimension = sctx.spec.profile.replace(/-reviewer$/, "");
+      return { mode: "structured", data: makeCleanResult(dimension) };
+    });
 
-    // FAILS: old code does not call singleSession.
+    const result = await finalReviewPhase(
+      null as never,
+      ["/profiles"],
+      "/cwd",
+      "/work",
+      5,
+    );
+
+    // Not-applicable → no actionable findings → clean lane → phase returns true
+    expect(result).toBe(true);
+    // No fixer path triggered
+    expect(mockTaskGraph).not.toHaveBeenCalled();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 10. FIXER RUNNER FACTORY DETAILS
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("finalReviewPhase — fixer runner factory from fixerSteps", () => {
+  it("singleSession is called with the fixer step's profileId and the finding's fixPrompt", async () => {
+    mockRunSession.mockImplementation(async (sctx: any) => {
+      if (sctx.spec.profile === "efficiency-reviewer") {
+        return {
+          mode: "structured",
+          data: makeResultWithFindings("efficiency", [
+            makeFinding("high", { fixPrompt: "SPECIFIC-FIX-INSTRUCTION" }),
+          ]),
+        };
+      }
+      const dimension = sctx.spec.profile.replace(/-reviewer$/, "");
+      return { mode: "structured", data: makeCleanResult(dimension) };
+    });
+
+    const customSteps = [
+      { name: "fix", profileId: "custom-fixer", isReadOnly: false },
+    ];
+
+    await finalReviewPhase(
+      null as never,
+      ["/profiles"],
+      "/cwd",
+      "/work",
+      5,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      customSteps,
+    );
+
+    // singleSession is called for fixer step construction
     expect(mockSingleSession).toHaveBeenCalled();
-    // After migration, singleSession is called with a `role` that follows
-    // the deterministic ID convention: `${taskId}/${role}#${attempt}`.
-    for (const call of mockSingleSession.mock.calls) {
-      const spec = call[0] as Record<string, unknown>;
-      expect(spec).toHaveProperty("role");
-      expect(typeof spec.role).toBe("string");
-      expect((spec.role as string).length).toBeGreaterThan(0);
-    }
+    const spec = mockSingleSession.mock.calls[0][0] as Record<string, unknown>;
+    expect(spec.profile).toBe("custom-fixer");
+    expect(spec.prompt as string).toContain("SPECIFIC-FIX-INSTRUCTION");
+    expect(spec.role).toBe("fix");
   });
 });

@@ -1,11 +1,11 @@
 // ─── Scouting Phase Tests ────────────────────────────────────────────────────
 //
-// Tests for the rewritten scouting.ts that uses RunnerPool instead of LanePool
-// and singleSession/linearRunner/reviewRunner instead of runStepTask.
+// Tests for the migrated scouting.ts that uses TaskGraph + SessionScheduler
+// (SessionPlan contract) instead of the legacy TaskTracker + RunnerPool.
 //
-// These tests pin the DESIRED behavior (kb-13/B2). They will FAIL against the
-// current production code which still uses LanePool + runStepTask. Once the
-// migration is implemented, they should all pass.
+// session-utils.ts now calls `runSession` directly (bypassing the old
+// singleSession callable-runner indirection), so coordinator/review assertions
+// check `runSession` calls rather than `singleSession`.
 
 import {
   afterEach,
@@ -16,68 +16,54 @@ import {
   jest,
   mock,
 } from "bun:test";
-import type {
-  StatusCallbacks,
-  WorkflowStatusTracker,
-} from "@harms-haus/engin-engine";
+import type { StatusCallbacks, TaskGraph } from "@harms-haus/engin-engine";
 import { createEnginMock } from "./engin-mock";
 
 // ─── Mock @harms-haus/engin-engine ────────────────────────────────────────
 //
-// We mock the ENTIRE module via createEnginMock() which provides the improved
-// singleSession that calls ctx.runSession (needed by runSingleSessionStructured
-// in session-utils.ts). We override RunnerPool to capture construction options.
+// We mock the ENTIRE module via createEnginMock(). The real engine's
+// singleSession/linearRunner return SessionPlanFactory (() => SessionPlanRunner);
+// the base mock collapses that indirection (returns SessionPlanRunner directly).
+// scouting.ts's runnerFactory calls singleSession(spec)() — invoking the
+// factory — so we override singleSession/linearRunner here to return CALLABLE
+// factories that match the real contract.
 //
-// Since mock.module is process-global and the engine module may already be
-// cached from another test file, we read the ACTUAL mock instances from the
-// engine module after setup, and clear them in beforeEach.
-
-class MockTaskTracker {
-  private tasks: Map<string, Record<string, unknown>> = new Map();
-
-  addTask(task: Record<string, unknown>) {
-    if (this.tasks.has(task.id as string)) {
-      throw new Error(`Task with id "${task.id}" already exists`);
-    }
-    this.tasks.set(task.id as string, {
-      ...task,
-      status: task.status ?? "ready",
-    });
-  }
-
-  getTask(id: string) {
-    return this.tasks.get(id);
-  }
-
-  getAllTasks() {
-    return Array.from(this.tasks.values());
-  }
-}
-
-/** Captures the most recent RunnerPool construction options. */
-let lastRunnerPoolOpts: Record<string, unknown> | undefined;
-let runnerPoolConstructed = false;
+// SessionScheduler is overridden to capture construction options.
+// TaskGraph instances are created per-test by makeMockTaskGraph().
 
 mock.module("@harms-haus/engin-engine", () => ({
   ...createEnginMock(),
-  TaskTracker: MockTaskTracker,
-  RunnerPool: jest.fn().mockImplementation((opts: Record<string, unknown>) => {
-    runnerPoolConstructed = true;
-    lastRunnerPoolOpts = opts;
-    return {
-      run: jest.fn().mockResolvedValue({ completedTasks: 0, failedTasks: 0 }),
-    };
-  }),
+  // singleSession(spec) → SessionPlanFactory (() => SessionPlanRunner).
+  // Production code calls singleSession(spec)() so the mock must return
+  // a callable that yields a SessionPlanRunner.
+  singleSession: jest.fn().mockImplementation((spec: Record<string, unknown>) =>
+    jest.fn(() => ({
+      plan: async function* () {
+        yield [spec];
+      },
+      execute: jest.fn().mockResolvedValue({ mode: "text", text: "" }),
+    })),
+  ),
+  // linearRunner(children) → SessionPlanFactory (() => SessionPlanRunner).
+  linearRunner: jest.fn().mockImplementation((_children: unknown[]) =>
+    jest.fn(() => ({
+      plan: async function* () {
+        yield [];
+      },
+      execute: jest.fn().mockResolvedValue({ mode: "text", text: "" }),
+    })),
+  ),
 }));
 
 // Import the engine to get the ACTUAL mock instances used by the implementation
 const engineModule = await import("@harms-haus/engin-engine");
 
 // References to the shared mock instances (read from the cached engine module)
-const mockRunStepTask = engineModule.runStepTask as ReturnType<typeof mock>;
-const mockSingleSession = engineModule.singleSession as ReturnType<typeof mock>;
-const mockLinearRunner = engineModule.linearRunner as ReturnType<typeof mock>;
-const mockReviewRunner = engineModule.reviewRunner as ReturnType<typeof mock>;
+type Spy = ReturnType<typeof mock>;
+const mockRunSession = engineModule.runSession as unknown as Spy;
+const mockSingleSession = engineModule.singleSession as unknown as Spy;
+const mockLinearRunner = engineModule.linearRunner as unknown as Spy;
+const mockSessionScheduler = engineModule.SessionScheduler as unknown as Spy;
 
 // Dynamic import after mock is set up
 const { scoutingPhase, scoutingReviewPhase } = await import("./scouting");
@@ -85,26 +71,29 @@ import type { ScoutingReview } from "./schemas";
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-function makeMockTracker(): WorkflowStatusTracker {
+/**
+ * Build a mock TaskGraph that behaves like the real one for the operations
+ * scoutingPhase uses: addTask (stores), getTask (lookup), getAllTasks (list).
+ */
+function makeMockTaskGraph(): TaskGraph {
+  const entries = new Map<string, { task: Record<string, unknown> }>();
   return {
-    auditLog: { append: mock(() => {}) },
-    setWorkflowData: mock(() => {}),
-    recordAgentSpawn: mock(() => {}),
-    incrementAgentCount: mock(() => {}),
-    taskTracker: new MockTaskTracker(),
-  } as unknown as WorkflowStatusTracker;
+    addTask: mock((task: Record<string, unknown>) => {
+      entries.set(task.id as string, { task });
+    }),
+    getTask: mock((id: string) => entries.get(id)),
+    getAllTasks: mock(() => Array.from(entries.values())),
+  } as unknown as TaskGraph;
 }
 
 function makeStatusCallbacksSpy() {
   return {
-    onAgentSpawn: mock(() => {}),
-    onAgentComplete: mock(() => {}),
-    onDecision: mock(() => {}),
     onTaskRegister: mock(() => {}),
     onTaskStart: mock(() => {}),
     onTaskComplete: mock(() => {}),
     onTaskRejected: mock(() => {}),
-    onStepStart: mock(() => {}),
+    onDecision: mock(() => {}),
+    onWorkflowData: mock(() => {}),
   } as unknown as StatusCallbacks;
 }
 
@@ -112,31 +101,32 @@ function makeStatusCallbacksSpy() {
 
 describe("scoutingPhase", () => {
   beforeEach(() => {
-    mockRunStepTask.mockClear();
+    mockRunSession.mockClear();
     mockSingleSession.mockClear();
     mockLinearRunner.mockClear();
-    mockReviewRunner.mockClear();
-    (engineModule.RunnerPool as ReturnType<typeof mock>).mockClear();
-    lastRunnerPoolOpts = undefined;
-    runnerPoolConstructed = false;
+    mockSessionScheduler.mockClear();
   });
 
   // ─── Pre-defined topics path (follow-up round) ────────────────────────
 
   describe("when topics are pre-defined (follow-up round)", () => {
-    it("skips the scout-coordinator and adds one scout task per topic to the SHARED tracker", async () => {
-      const tracker = makeMockTracker();
+    it("skips the scout-coordinator and adds one scout task per topic to the SHARED graph", async () => {
+      const taskGraph = makeMockTaskGraph();
       const topics = [
         {
           topic: "API Design",
           rationale: "Need to understand API endpoints",
           files: ["src/api/"],
         },
-        { topic: "Database", rationale: "Inspect schema", files: ["src/db/"] },
+        {
+          topic: "Database",
+          rationale: "Inspect schema",
+          files: ["src/db/"],
+        },
       ];
 
       await scoutingPhase(
-        tracker,
+        taskGraph,
         ["/profiles"],
         "Implement feature X",
         "/cwd",
@@ -148,21 +138,21 @@ describe("scoutingPhase", () => {
         { topics, round: 1 },
       );
 
-      // Coordinator should NOT have been called — neither via runStepTask nor singleSession
-      expect(mockRunStepTask).not.toHaveBeenCalled();
-      expect(mockSingleSession).not.toHaveBeenCalled();
-      // One scout task per topic lands on the SHARED tracker (phaseId 'scouting')
-      // so the onPhaseSettled hook can collect them.
-      const tasks = tracker.taskTracker.getAllTasks();
-      expect(tasks).toHaveLength(2);
-      expect(tasks[0].id).toBe("scout-api-design");
-      expect(tasks[0].phaseId).toBe("scouting");
-      expect(tasks[0].profile).toBe("scout");
-      expect(tasks[1].id).toBe("scout-database");
+      // Coordinator should NOT have been called — runSession is not invoked
+      expect(mockRunSession).not.toHaveBeenCalled();
+      // One scout task per topic lands on the SHARED graph (phaseId 'scouting')
+      const addTaskCalls = (taskGraph.addTask as Spy).mock.calls as Array<
+        [Record<string, unknown>, unknown]
+      >;
+      expect(addTaskCalls).toHaveLength(2);
+      expect(addTaskCalls[0]![0].id).toBe("scout-api-design");
+      expect(addTaskCalls[0]![0].phaseId).toBe("scouting");
+      expect(addTaskCalls[0]![0].profile).toBe("scout");
+      expect(addTaskCalls[1]![0].id).toBe("scout-database");
     });
 
-    it("does not re-add a task whose slug already exists on the shared tracker", async () => {
-      const tracker = makeMockTracker();
+    it("does not re-add a task whose slug already exists on the shared graph", async () => {
+      const taskGraph = makeMockTaskGraph();
       const topics = [
         { topic: "API Design", rationale: "x", files: ["a"] },
         { topic: "API-Design", rationale: "y", files: ["b"] },
@@ -170,7 +160,7 @@ describe("scoutingPhase", () => {
 
       await expect(
         scoutingPhase(
-          tracker,
+          taskGraph,
           ["/profiles"],
           "Task",
           "/cwd",
@@ -186,20 +176,21 @@ describe("scoutingPhase", () => {
         ),
       ).resolves.toBeUndefined();
 
-      expect(tracker.taskTracker.getAllTasks()).toHaveLength(1);
-      // runStepTask must not be called in the follow-up path
-      expect(mockRunStepTask).not.toHaveBeenCalled();
+      const addTaskCalls = (taskGraph.addTask as Spy).mock.calls;
+      expect(addTaskCalls).toHaveLength(1);
+      // runSession must not be called in the follow-up path
+      expect(mockRunSession).not.toHaveBeenCalled();
     });
   });
 
   // ─── Scout-coordinator path (first round) ─────────────────────────────────
 
   describe("when no topics are provided (first round)", () => {
-    it("uses singleSession for the scout-coordinator (not runStepTask)", async () => {
-      const tracker = makeMockTracker();
+    it("uses runSession for the scout-coordinator", async () => {
+      const taskGraph = makeMockTaskGraph();
 
       await scoutingPhase(
-        tracker,
+        taskGraph,
         ["/profiles"],
         "Task",
         "/cwd",
@@ -211,26 +202,20 @@ describe("scoutingPhase", () => {
         { round: 0 },
       );
 
-      // Once the migration is complete, runStepTask must NOT be called.
-      // Currently the production code calls it, so this assertion FAILS (TDD red).
-      expect(mockRunStepTask).not.toHaveBeenCalled();
-
-      // The coordinator should be invoked via singleSession.
-      expect(mockSingleSession).toHaveBeenCalledTimes(1);
-      const spec = mockSingleSession.mock.calls[0]![0] as Record<
-        string,
-        unknown
-      >;
+      // The coordinator runs via runSession (session-utils calls it directly).
+      expect(mockRunSession).toHaveBeenCalledTimes(1);
+      const ctx = mockRunSession.mock.calls[0]![0] as Record<string, unknown>;
+      const spec = ctx.spec as Record<string, unknown>;
       expect(spec.profile).toBe("scout-coordinator");
-      expect(spec.role).toBe("coordinate");
+      expect(spec.runnerRole).toBe("coordinate");
       expect(spec.isReadOnly).toBe(true);
     });
 
-    it("passes the correct prompt to singleSession for the coordinator", async () => {
-      const tracker = makeMockTracker();
+    it("passes the correct prompt to runSession for the coordinator", async () => {
+      const taskGraph = makeMockTaskGraph();
 
       await scoutingPhase(
-        tracker,
+        taskGraph,
         ["/profiles"],
         "Implement feature X",
         "/cwd",
@@ -242,20 +227,20 @@ describe("scoutingPhase", () => {
         { round: 0 },
       );
 
-      expect(mockSingleSession).toHaveBeenCalledTimes(1);
-      const spec = mockSingleSession.mock.calls[0]![0] as Record<
-        string,
-        unknown
-      >;
-      expect(spec.prompt).toContain("codebase scout");
-      expect(spec.prompt).toContain("Implement feature X");
+      expect(mockRunSession).toHaveBeenCalledTimes(1);
+      const ctx = mockRunSession.mock.calls[0]![0] as Record<string, unknown>;
+      const spec = ctx.spec as Record<string, unknown>;
+      expect(spec.prompt as string).toContain("codebase scout");
+      expect(spec.prompt as string).toContain("Implement feature X");
     });
 
     it("returns void and adds no tasks when the coordinator returns no topics", async () => {
-      const tracker = makeMockTracker();
+      const taskGraph = makeMockTaskGraph();
 
+      // runSession mock returns { mode: "text", text: "" } → no structured
+      // output → coordinatorResult is undefined → topics = [] → early return.
       const result = await scoutingPhase(
-        tracker,
+        taskGraph,
         ["/profiles"],
         "Task",
         "/cwd",
@@ -269,43 +254,19 @@ describe("scoutingPhase", () => {
 
       expect(result).toBeUndefined();
       // No scout tasks are registered when the coordinator returns no topics.
-      // (The coordinator task itself is announced via status callbacks only —
-      // it is NOT inserted into the shared tracker, so it can't pollute the
-      // later RunnerPool claim loop.)
-      expect(tracker.taskTracker.getAllTasks()).toHaveLength(0);
-    });
-
-    it("does NOT manually append structured_output for the coordinator (the default auditor handles it)", async () => {
-      const tracker = makeMockTracker();
-
-      await scoutingPhase(
-        tracker,
-        ["/profiles"],
-        "Task",
-        "/cwd",
-        5,
-        "/workdir",
-        undefined,
-        undefined,
-        undefined,
-        { round: 0 },
-      );
-
-      expect(tracker.auditLog.append).not.toHaveBeenCalledWith(
-        expect.objectContaining({ type: "structured_output" }),
-      );
+      expect((taskGraph.addTask as Spy).mock.calls).toHaveLength(0);
     });
   });
 
-  // ─── RunnerPool wiring ─────────────────────────────────────────────────────
+  // ─── SessionScheduler wiring ─────────────────────────────────────────────
 
-  describe("RunnerPool wiring", () => {
-    it("constructs a RunnerPool (not LanePool) with getRunnerForTask", async () => {
-      const tracker = makeMockTracker();
+  describe("SessionScheduler wiring", () => {
+    it("constructs a SessionScheduler with the shared graph and phaseId", async () => {
+      const taskGraph = makeMockTaskGraph();
       const topics = [{ topic: "Auth", rationale: "x", files: ["auth.ts"] }];
 
       await scoutingPhase(
-        tracker,
+        taskGraph,
         ["/profiles"],
         "Task",
         "/cwd",
@@ -317,29 +278,28 @@ describe("scoutingPhase", () => {
         { topics, round: 0 },
       );
 
-      // Assert RunnerPool was constructed (reads from the engine-module mock)
-      const rpCalls = (engineModule.RunnerPool as ReturnType<typeof mock>).mock
-        .calls as Array<[Record<string, unknown>]>;
-      expect(rpCalls.length).toBeGreaterThanOrEqual(1);
+      const schedulerCalls = mockSessionScheduler.mock.calls as Array<
+        [Record<string, unknown>]
+      >;
+      expect(schedulerCalls.length).toBeGreaterThanOrEqual(1);
 
-      const opts = rpCalls[0]![0];
-      // Must use getRunnerForTask, NOT getStepsForTask
-      expect(opts.getRunnerForTask).toBeDefined();
-      expect(opts.getStepsForTask).toBeUndefined();
-      // Must use maxConcurrentSessions (not maxConcurrentLanes)
-      expect(opts.maxConcurrentSessions).toBe(5);
-      expect(opts.maxConcurrentLanes).toBeUndefined();
-      // Must reference the SHARED tracker
-      expect(opts.taskTracker).toBe(tracker.taskTracker);
+      const opts = schedulerCalls[0]![0];
+      // Must reference the SHARED graph
+      expect(opts.graph).toBe(taskGraph);
       expect(opts.phaseId).toBe("scouting");
+      // Must have a gate and profiles
+      expect(opts.gate).toBeDefined();
+      expect(opts.profiles).toBeDefined();
+      // activeSessions must be provided
+      expect(opts.activeSessions).toBeDefined();
     });
 
-    it("getRunnerForTask returns a linearRunner of singleSession runners (one per SCOUTING_STEPS step)", async () => {
-      const tracker = makeMockTracker();
+    it("runnerFactory uses linearRunner of singleSession runners (one per step)", async () => {
+      const taskGraph = makeMockTaskGraph();
       const topics = [{ topic: "Auth", rationale: "x", files: ["auth.ts"] }];
 
       await scoutingPhase(
-        tracker,
+        taskGraph,
         ["/profiles"],
         "Task",
         "/cwd",
@@ -351,36 +311,7 @@ describe("scoutingPhase", () => {
         { topics, round: 0 },
       );
 
-      const rpCalls = (engineModule.RunnerPool as ReturnType<typeof mock>).mock
-        .calls as Array<[Record<string, unknown>]>;
-      const getRunnerForTask = rpCalls[0]?.[0]?.getRunnerForTask as
-        | ((task: Record<string, unknown>) => unknown)
-        | undefined;
-      if (!getRunnerForTask) {
-        expect(getRunnerForTask).toBeDefined();
-        return;
-      }
-
-      // Reset mocks to isolate the getRunnerForTask calls
-      mockLinearRunner.mockClear();
-      mockSingleSession.mockClear();
-
-      const task = {
-        id: "scout-auth",
-        profile: "scout",
-        prompt: "Investigate auth module",
-      };
-      const runner = getRunnerForTask(task);
-
-      // Should create a linearRunner with children matching SCOUTING_STEPS length
-      expect(mockLinearRunner).toHaveBeenCalledTimes(1);
-      const children = mockLinearRunner.mock.calls[0]![0] as unknown[];
-      // SCOUTING_STEPS currently has 1 step: { name: 'scouting', profileId: 'scout', isReadOnly: true }
-      expect(children).toHaveLength(1);
-      // Each child should be a runner function (returned by singleSession)
-      expect(typeof children[0]).toBe("function");
-
-      // Verify singleSession was called with scout-specific spec
+      // singleSession is called once per topic to build the runnerFactory children
       expect(mockSingleSession).toHaveBeenCalledTimes(1);
       const spec = mockSingleSession.mock.calls[0]![0] as Record<
         string,
@@ -388,40 +319,37 @@ describe("scoutingPhase", () => {
       >;
       expect(spec.profile).toBe("scout");
       expect(spec.isReadOnly).toBe(true);
-      // The returned runner must be callable
-      expect(typeof runner).toBe("function");
-    });
+      expect(spec.outputMode).toBe("text");
+      expect(spec.role).toBe("scouting");
 
-    it("does NOT pass getStepsForTask to the pool", async () => {
-      const tracker = makeMockTracker();
-      const topics = [{ topic: "Auth", rationale: "x", files: ["auth.ts"] }];
+      // linearRunner wraps the children into a SessionPlanFactory
+      expect(mockLinearRunner).toHaveBeenCalledTimes(1);
+      const children = mockLinearRunner.mock.calls[0]![0] as unknown[];
+      // SCOUTING_STEPS currently has 1 step
+      expect(children).toHaveLength(1);
+      // Each child is a SessionPlanRunner (result of calling singleSession(spec)())
+      expect(typeof children[0]).toBe("object");
+      expect(children[0]).toHaveProperty("plan");
+      expect(children[0]).toHaveProperty("execute");
 
-      await scoutingPhase(
-        tracker,
-        ["/profiles"],
-        "Task",
-        "/cwd",
-        5,
-        "/workdir",
-        undefined,
-        undefined,
-        undefined,
-        { topics, round: 0 },
-      );
-
-      // Assert RunnerPool was constructed with getRunnerForTask (no getStepsForTask)
-      const rpCalls = (engineModule.RunnerPool as ReturnType<typeof mock>).mock
-        .calls as Array<[Record<string, unknown>]>;
-      expect(rpCalls.length).toBeGreaterThanOrEqual(1);
-      expect(rpCalls[0]![0].getStepsForTask).toBeUndefined();
+      // The runnerFactory (second arg to addTask) should be a callable factory
+      const addTaskCalls = (taskGraph.addTask as Spy).mock.calls as Array<
+        [Record<string, unknown>, unknown]
+      >;
+      const runnerFactory = addTaskCalls[0]![1];
+      expect(typeof runnerFactory).toBe("function");
+      // Calling it yields a SessionPlanRunner (linearRunner mock returns a factory)
+      const runner = (runnerFactory as () => unknown)();
+      expect(runner).toHaveProperty("plan");
+      expect(runner).toHaveProperty("execute");
     });
 
     it("passes sessionBaseDir derived from workDir and round number", async () => {
-      const tracker = makeMockTracker();
+      const taskGraph = makeMockTaskGraph();
       const topics = [{ topic: "Auth", rationale: "x", files: ["auth.ts"] }];
 
       await scoutingPhase(
-        tracker,
+        taskGraph,
         ["/profiles"],
         "Task",
         "/cwd",
@@ -433,11 +361,11 @@ describe("scoutingPhase", () => {
         { topics, round: 2 },
       );
 
-      // Assert sessionBaseDir incorporates the round number
-      const rpCalls = (engineModule.RunnerPool as ReturnType<typeof mock>).mock
-        .calls as Array<[Record<string, unknown>]>;
-      expect(rpCalls.length).toBeGreaterThanOrEqual(1);
-      expect(rpCalls[0]![0].sessionBaseDir as string).toContain(
+      const schedulerCalls = mockSessionScheduler.mock.calls as Array<
+        [Record<string, unknown>]
+      >;
+      expect(schedulerCalls.length).toBeGreaterThanOrEqual(1);
+      expect(schedulerCalls[0]![0].sessionBaseDir as string).toContain(
         "scouting-round-2",
       );
     });
@@ -445,33 +373,13 @@ describe("scoutingPhase", () => {
 
   // ─── Contract: collection is the onPhaseSettled hook's job ────────────────
 
-  it("does NOT call setWorkflowData (the onPhaseSettled hook persists scoutingReports)", async () => {
-    const tracker = makeMockTracker();
-    const topics = [{ topic: "API", rationale: "x", files: ["api.ts"] }];
-
-    await scoutingPhase(
-      tracker,
-      ["/profiles"],
-      "Task",
-      "/cwd",
-      5,
-      "/workdir",
-      undefined,
-      undefined,
-      undefined,
-      { topics, round: 0 },
-    );
-
-    expect(tracker.setWorkflowData).not.toHaveBeenCalled();
-  });
-
-  it("does NOT fire onAgentComplete (the RunnerPool owns per-scout completion)", async () => {
-    const tracker = makeMockTracker();
+  it("does NOT call onStatus.onWorkflowData (the onPhaseSettled hook persists scoutingReports)", async () => {
+    const taskGraph = makeMockTaskGraph();
     const onStatus = makeStatusCallbacksSpy();
     const topics = [{ topic: "API", rationale: "x", files: ["api.ts"] }];
 
     await scoutingPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       "Task",
       "/cwd",
@@ -483,15 +391,15 @@ describe("scoutingPhase", () => {
       { topics, round: 0 },
     );
 
-    expect(onStatus.onAgentComplete).not.toHaveBeenCalled();
+    expect(onStatus.onWorkflowData).not.toHaveBeenCalled();
   });
 
   it("returns void (reports are collected by the hook, not returned)", async () => {
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
     const topics = [{ topic: "API", rationale: "x", files: ["api.ts"] }];
 
     const result = await scoutingPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       "Task",
       "/cwd",
@@ -506,13 +414,12 @@ describe("scoutingPhase", () => {
     expect(result).toBeUndefined();
   });
 
-  // ─── Global assertion: runStepTask is never used across any scoutingPhase path ──
+  // ─── Global assertion: runSession is never used for scout tasks ───────────
 
-  it("never calls runStepTask (0 calls total across all paths)", async () => {
-    // Follow-up path
-    const tracker1 = makeMockTracker();
+  it("does not call runSession in the follow-up (pre-defined topics) path", async () => {
+    const taskGraph = makeMockTaskGraph();
     await scoutingPhase(
-      tracker1,
+      taskGraph,
       ["/profiles"],
       "Task",
       "/cwd",
@@ -526,9 +433,7 @@ describe("scoutingPhase", () => {
         round: 0,
       },
     );
-    // This already fails because the current code calls runStepTask in the coordinator path
-    // Here we also verify the follow-up path doesn't call it
-    expect(mockRunStepTask).not.toHaveBeenCalled();
+    expect(mockRunSession).not.toHaveBeenCalled();
   });
 });
 
@@ -536,75 +441,77 @@ describe("scoutingPhase", () => {
 
 describe("scoutingReviewPhase", () => {
   beforeEach(() => {
-    mockRunStepTask.mockClear();
+    mockRunSession.mockClear();
     mockSingleSession.mockClear();
     mockLinearRunner.mockClear();
-    mockReviewRunner.mockClear();
-    (engineModule.RunnerPool as ReturnType<typeof mock>).mockClear();
+    mockSessionScheduler.mockClear();
   });
 
-  it("uses singleSession for the scouting review (not runStepTask)", async () => {
-    const tracker = makeMockTracker();
+  it("uses runSession for the scouting review", async () => {
+    const taskGraph = makeMockTaskGraph();
 
     await scoutingReviewPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       "Implement feature X",
       [],
       "/cwd",
     );
 
-    // The migration replaces runStepTask with singleSession — this FAILS currently
-    expect(mockRunStepTask).not.toHaveBeenCalled();
-    expect(mockSingleSession).toHaveBeenCalledTimes(1);
-    const spec = mockSingleSession.mock.calls[0]![0] as Record<string, unknown>;
+    expect(mockRunSession).toHaveBeenCalledTimes(1);
+    const ctx = mockRunSession.mock.calls[0]![0] as Record<string, unknown>;
+    const spec = ctx.spec as Record<string, unknown>;
     expect(spec.profile).toBe("scouting-reviewer");
-    expect(spec.role).toBe("review-scouting");
+    expect(spec.runnerRole).toBe("review-scouting");
     expect(spec.isReadOnly).toBe(true);
   });
 
-  it("passes the review prompt to singleSession with task and reports context", async () => {
-    const tracker = makeMockTracker();
+  it("passes the review prompt to runSession with task and reports context", async () => {
+    const taskGraph = makeMockTaskGraph();
     const reports = [{ report: "found-api-issues" }];
 
     await scoutingReviewPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       "Implement feature X",
       reports,
       "/cwd",
     );
 
-    expect(mockSingleSession).toHaveBeenCalledTimes(1);
-    const prompt = mockSingleSession.mock.calls[0]![0]!.prompt as string;
+    expect(mockRunSession).toHaveBeenCalledTimes(1);
+    const ctx = mockRunSession.mock.calls[0]![0] as Record<string, unknown>;
+    const spec = ctx.spec as Record<string, unknown>;
+    const prompt = spec.prompt as string;
     expect(prompt).toContain("reviewing scouting reports");
     expect(prompt).toContain("Implement feature X");
     expect(prompt).toContain(JSON.stringify(reports, null, 2));
   });
 
   it("instructs the reviewer to emit the key files for the planner", async () => {
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
 
-    await scoutingReviewPhase(tracker, ["/profiles"], "Task", [], "/cwd");
+    await scoutingReviewPhase(taskGraph, ["/profiles"], "Task", [], "/cwd");
 
-    expect(mockSingleSession).toHaveBeenCalledTimes(1);
-    const prompt = mockSingleSession.mock.calls[0]![0]!.prompt as string;
+    expect(mockRunSession).toHaveBeenCalledTimes(1);
+    const ctx = mockRunSession.mock.calls[0]![0] as Record<string, unknown>;
+    const spec = ctx.spec as Record<string, unknown>;
+    const prompt = spec.prompt as string;
     expect(prompt).toContain("`files`");
     expect(prompt).toMatch(/concrete files a planner must/i);
   });
 
   it("returns a ScoutingReview result", async () => {
-    const tracker = makeMockTracker();
+    const taskGraph = makeMockTaskGraph();
 
-    const result = await scoutingReviewPhase(
-      tracker,
+    const result = (await scoutingReviewPhase(
+      taskGraph,
       ["/profiles"],
       "Task",
       [],
       "/cwd",
-    );
+    )) as ScoutingReview;
 
-    // The review result structure must be preserved regardless of how it's produced
+    // runSession mock returns text → reviewData undefined → DEFAULT_REVIEW
     expect(result).toBeDefined();
     expect(typeof result.ready).toBe("boolean");
     expect(typeof result.research).toBe("string");
@@ -612,14 +519,14 @@ describe("scoutingReviewPhase", () => {
     expect(Array.isArray(result.files)).toBe(true);
   });
 
-  it("passes apiKeys, onStatus, and signal through", async () => {
-    const tracker = makeMockTracker();
+  it("passes apiKeys, onStatus, and signal through to runSession context", async () => {
+    const taskGraph = makeMockTaskGraph();
     const onStatus = makeStatusCallbacksSpy();
     const apiKeys = { openai: "sk-test" };
     const abortController = new AbortController();
 
     await scoutingReviewPhase(
-      tracker,
+      taskGraph,
       ["/profiles"],
       "Task",
       [],
@@ -629,21 +536,21 @@ describe("scoutingReviewPhase", () => {
       abortController.signal,
     );
 
-    expect(mockSingleSession).toHaveBeenCalledTimes(1);
-    // apiKeys, onStatus, and signal are threaded through the RunnerContext,
-    // not the singleSession spec itself. This test verifies the overall
-    // flow uses singleSession for the review.
+    expect(mockRunSession).toHaveBeenCalledTimes(1);
+    const ctx = mockRunSession.mock.calls[0]![0] as Record<string, unknown>;
+    expect(ctx.apiKeys).toEqual(apiKeys);
+    expect(ctx.signal).toBe(abortController.signal);
   });
 
   // ─── onDecision callback ──────────────────────────────────────────────────
 
   describe("onDecision callback", () => {
-    it("fires onDecision with proceed_to_planning when ready is true", async () => {
-      const tracker = makeMockTracker();
+    it("fires onDecision with proceed_to_planning when ready is true (default review)", async () => {
+      const taskGraph = makeMockTaskGraph();
       const onStatus = makeStatusCallbacksSpy();
 
       await scoutingReviewPhase(
-        tracker,
+        taskGraph,
         ["/profiles"],
         "Task",
         [],
@@ -660,12 +567,12 @@ describe("scoutingReviewPhase", () => {
       });
     });
 
-    it("fires onDecision with more_scouting_needed when ready is false", async () => {
-      const tracker = makeMockTracker();
+    it("fires onDecision with a valid decision value", async () => {
+      const taskGraph = makeMockTaskGraph();
       const onStatus = makeStatusCallbacksSpy();
 
       await scoutingReviewPhase(
-        tracker,
+        taskGraph,
         ["/profiles"],
         "Task",
         [],
@@ -675,7 +582,6 @@ describe("scoutingReviewPhase", () => {
       );
 
       expect(onStatus.onDecision).toHaveBeenCalledTimes(1);
-      // Cast for mock access — bun:test adds .mock to the spy function
       const onDecisionSpy = onStatus.onDecision as unknown as {
         mock: { calls: Array<[Record<string, unknown>]> };
       };
@@ -688,35 +594,11 @@ describe("scoutingReviewPhase", () => {
     });
 
     it("does not throw when onStatus is undefined", async () => {
-      const tracker = makeMockTracker();
+      const taskGraph = makeMockTaskGraph();
 
       await expect(
-        scoutingReviewPhase(tracker, ["/profiles"], "Task", [], "/cwd"),
+        scoutingReviewPhase(taskGraph, ["/profiles"], "Task", [], "/cwd"),
       ).resolves.toBeDefined();
     });
-  });
-
-  // ─── Audit log ────────────────────────────────────────────────────────────
-
-  describe("audit log", () => {
-    it("does NOT manually append a decision event (the default auditor handles it)", async () => {
-      const tracker = makeMockTracker();
-
-      await scoutingReviewPhase(tracker, ["/profiles"], "Task", [], "/cwd");
-
-      expect(tracker.auditLog.append).not.toHaveBeenCalledWith(
-        expect.objectContaining({ type: "decision" }),
-      );
-    });
-  });
-
-  // ─── Global assertion: runStepTask never called from review phase ─────────
-
-  it("never calls runStepTask (0 calls)", async () => {
-    const tracker = makeMockTracker();
-
-    await scoutingReviewPhase(tracker, ["/profiles"], "Task", [], "/cwd");
-
-    expect(mockRunStepTask).not.toHaveBeenCalled();
   });
 });
