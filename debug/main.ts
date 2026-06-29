@@ -20,7 +20,7 @@ export const workflowConfig = {
     "zai:glm-5.2": 5,
     "zai:glm-5.1": 5,
     "opencode-go:deepseek-v4-flash": 5,
-    "opencode-go:mimo-2.5": 5,
+    "opencode-go:mimo-v2.5": 5,
   },
   fixerSteps: [
     { name: "fix", profileId: "fixer", isReadOnly: false },

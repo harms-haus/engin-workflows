@@ -134,6 +134,10 @@ export async function runSpir(
     hookRegistry: optionsHookRegistry,
     worktreeManager,
   } = options;
+  // Total session concurrency for the SessionGate. Sourced from the workflow
+  // config (defaultMaxConcurrentSessions) — the engine no longer ships a
+  // CLI --max-concurrent flag, so options.maxConcurrentTasks is only set by
+  // workflows that explicitly want to override their own config at call time.
   const maxConcurrentTasks =
     options.maxConcurrentTasks ?? config.defaultMaxConcurrentSessions;
   const profilesDirs: string[] =
