@@ -152,7 +152,7 @@ function tmpDir(): string {
 
 /** Default plan written by the smart runMultiStepTask mock when no plan.json exists. */
 const DEFAULT_PLAN: Plan = {
-    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], is_code: true }],
+    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], mode: "tests_and_code" }],
     strategy: "Default strategy",
 };
 

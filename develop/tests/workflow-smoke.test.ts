@@ -62,7 +62,7 @@ function smartRunStepTask(opts: Record<string, unknown>): unknown {
         return { ready: true, research: "All areas investigated thoroughly. No gaps remain.", gaps: [] };
     }
     if (taskId === "planner" || prompt.includes("planning agent")) {
-        return { tasks: [{ id: "t1", title: "Implement core feature", prompt: "Implement the core feature as described", profile: "implementer", files: ["src/core.ts"], dependencies: [], is_code: true }], strategy: "Implement directly in the core module" };
+        return { tasks: [{ id: "t1", title: "Implement core feature", prompt: "Implement the core feature as described", profile: "implementer", files: ["src/core.ts"], dependencies: [], mode: "tests_and_code" }], strategy: "Implement directly in the core module" };
     }
     if (taskId === "plan-reviewer" || prompt.includes("reviewing an implementation plan")) {
         return { ready: true, feedback: "Plan is well-structured and feasible", suggestions: [] };
@@ -75,7 +75,7 @@ function smartRunStepTask(opts: Record<string, unknown>): unknown {
 
 /** Default plan written by the smart runMultiStepTask mock when no plan.json exists. */
 const DEFAULT_PLAN = {
-    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], is_code: true }],
+    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], mode: "tests_and_code" }],
     strategy: "Default strategy",
 };
 
@@ -145,7 +145,7 @@ describe("Workflow Smoke Tests", () => {
     describe("Resume", () => {
         it("resumes from saved state and completes", async () => {
             const workDir = tmpDir();
-            const plan = { tasks: [{ id: "t1", title: "Resume task", prompt: "Do it", profile: "implementer", files: ["src/a.ts"], dependencies: [], is_code: true }], strategy: "Resume" };
+            const plan = { tasks: [{ id: "t1", title: "Resume task", prompt: "Do it", profile: "implementer", files: ["src/a.ts"], dependencies: [], mode: "tests_and_code" }], strategy: "Resume" };
             const tracker = new WorkflowStatusTracker(workDir);
             tracker.setTaskPrompt("Resume task");
             tracker.setWorkflowData({ research: "Existing research", plan, scoutingReports: [] });

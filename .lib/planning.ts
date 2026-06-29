@@ -51,7 +51,7 @@ const PLAN_SHAPE_EXAMPLE = `{
       "prompt": "Detailed prompt for the implementing agent",
       "profile": "implementer",
       "files": ["src/foo.ts"],
-      "is_code": true,
+      "mode": "tests_and_code",
       "dependencies": []
     }
   ],

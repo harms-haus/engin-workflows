@@ -145,7 +145,7 @@ const SAMPLE_PLAN: Plan = {
       prompt: "Implement",
       profile: "implementer",
       files: ["src/main.ts"],
-      is_code: true,
+      mode: "tests_and_code",
       dependencies: [],
     },
   ],

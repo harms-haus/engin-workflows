@@ -36,7 +36,7 @@ workflows/
 │   ├── initialization.ts     # initializationPhase() (AI title generation)
 │   ├── helpers.ts            # makeHarnessOptions(), spawnAgent()
 │   ├── schemas.ts            # Zod schemas (PlanSchema, ReviewResultSchema, …)
-│   ├── steps.ts              # CODE_STEPS, NON_CODE_STEPS arrays
+│   ├── steps.ts              # legacy CODE_STEPS / NON_CODE_STEPS arrays
 │   ├── package.json
 │   └── tsconfig.json
 ├── develop/
@@ -221,8 +221,7 @@ option). The backbone and step definitions reference profiles by `profileId`:
 | Referenced by | `profileId`s |
 |---|---|
 | `fixerSteps` (config) | `fixer`, `fixer-reviewer` |
-| `CODE_STEPS` (`.lib/steps.ts`) | `test-writer`, `test-reviewer`, `implementer`, `implement-reviewer` |
-| `NON_CODE_STEPS` (`.lib/steps.ts`) | `implementer`, `implement-reviewer` |
+| Task `mode` runners (`.lib/implementation.ts`) | `test-writer`, `test-reviewer`, `implementer` (or the task's `profile`), `implement-reviewer` |
 | Scouting phase | `scout-coordinator`, `scout`, `scouting-reviewer` |
 | Planning phase | `planner`, `plan-reviewer` |
 | Final review phase | `efficiency-reviewer`, `code-quality-reviewer`, `ui-ux-reviewer`, `security-reviewer`, `documentation-reviewer` (each runs as an independent review → fixer → review-fixes lane; `final-reviewer` is the legacy single-reviewer) |

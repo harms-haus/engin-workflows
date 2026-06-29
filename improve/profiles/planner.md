@@ -39,12 +39,26 @@ Your task prompt gives you the exact file path to write your plan to (e.g. `.../
 6. **Include verification** — each task should mention how to verify the change (run specific test, check specific behavior, sanity check code).
 7. **Parallelism** — group tasks that can run in parallel (you can edit the same files).
 
-**Code vs Non-Code Tasks:**
-For each task in your plan, include an `is_code` field (boolean):
-- Set `is_code: true` for tasks that involve writing or modifying code files (implementation tasks)
-- Set `is_code: false` for tasks that involve configuration changes, documentation updates, or other non-code work
+**Task mode (how each task runs):**
+For each task in your plan, include a `mode` field selecting one of four execution modes. The mode decides which runner tree the implementation phase builds. Choose deliberately per task — this replaces the old `is_code` boolean.
 
-Testing is handled automatically for code tasks — do NOT create separate test tasks. The `is_code: true` flag enables an automatic test-writing phase before implementation.
+- **`tests_and_code`** — TDD red→green. Use this as the default for tasks that change production behavior. The RED team (test-writer) writes FAILING tests encoding the target behavior first; then the GREEN team (implementer) writes the production code to make them pass. Failing tests are the intended outcome of the test phase, not an error.
+  - `linearRunner([reviewRunner(write-tests, review-tests), reviewRunner(write-code, review-code)])`
+- **`just_tests`** — improve/extend the test suite on EXISTING code only, with NO production-code phase afterwards. Use this when the task is purely about tests: strengthen assertions, add edge cases, write characterization tests pinning current behavior, split/clean up test files, or remove/rewrite tautological tests. The tests should PASS against the current code. **This is the right mode for "just write tests on existing code" tasks** — do not use `tests_and_code` for them (that would spawn a pointless production-code phase).
+  - `reviewRunner(write-tests, review-tests)`
+- **`code_only`** — production code with NO separate test-writing phase. Use this for mechanical changes where writing failing tests first is pure overhead: extracting a magic value to a constant, removing a dead export, a one-line fix, a rename, or any change already fully covered by existing tests.
+  - `reviewRunner(write-code, review-code)`
+- **`no_code_execution`** — docs, config, comments, or other non-code work with no test phase. (Use `code_only` instead if real production code IS being written.)
+  - `reviewRunner(execute, review)`
+
+**Picking the mode — quick guide:**
+- New feature / behavior change / bug fix that needs a regression spec → `tests_and_code`
+- Refactor that must be proven behavior-preserving (split/decompose/extract) → `tests_and_code` (the red-team writes characterization tests pinning current behavior, which then must stay green through the change)
+- Strengthening/cleaning/splitting tests, adding edge cases, removing tautological tests → `just_tests`
+- Mechanical tweak already covered by tests (extract constant, remove dead code, rename) → `code_only`
+- Docs, config, comment cleanup → `no_code_execution`
+
+Do NOT create separate test tasks — testing is handled by the mode's built-in test phase (`tests_and_code` or `just_tests`).
 
 **Choosing the implementer profile:**
 Each task has a `profile` field. Choose between two implementer profiles:
@@ -70,6 +84,6 @@ When in doubt, use `implementer`. Prefer `implementer-lite` when the task is sma
 
 **Refactors must preserve behavior.** For any restructure/split/decompose/extract task, the test-writing step should produce *characterization tests* first (pinning current behavior) so the change is provably behavior-preserving. Each task's verification must run the relevant tests/build/typecheck/lint.
 
-**Profile choice for improvement tasks:** use `implementer-lite` for mechanical changes (delete dead code, extract a constant, rename, add/trim a docstring or comment, surface core behavior by expanding shorthand); use `implementer` for structural changes (split a file, decompose a function, build a shared-utility system, eliminate a useless barrel across many import sites) or anything with tricky edge cases. Test-only improvement tasks (remove dead/tautological tests, strengthen scenarios) are executed by the test-writing step — still mark them `is_code: true`; the implementer must not edit tests.
+**Profile choice for improvement tasks:** use `implementer-lite` for mechanical changes (delete dead code, extract a constant, rename, add/trim a docstring or comment, surface core behavior by expanding shorthand); use `implementer` for structural changes (split a file, decompose a function, build a shared-utility system, eliminate a useless barrel across many import sites) or anything with tricky edge cases. Test-only improvement tasks (remove dead/tautological tests, strengthen scenarios) should use `mode: "just_tests"` so they run the test-writer/test-reviewer loop with no production-code phase.
 
 **Write your plan to the plan file:** Use the `write` tool to save valid JSON matching the shape and schema given in the task prompt, at the plan file path provided. Do not return the plan as text in your response.

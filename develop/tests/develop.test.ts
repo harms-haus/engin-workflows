@@ -141,7 +141,7 @@ function tmpDir(): string {
 
 /** Default plan written by the smart runMultiStepTask mock when no plan.json exists. */
 const DEFAULT_PLAN: Plan = {
-    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], is_code: true }],
+    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], mode: "tests_and_code" }],
     strategy: "Default strategy",
 };
 
@@ -257,7 +257,7 @@ describe("Zod Schemas", () => {
         const data = {
             tasks: [{
                 id: "t1", title: "Add login", prompt: "Implement login",
-                profile: "implementer", files: ["src/auth.ts"], dependencies: [], is_code: true,
+                profile: "implementer", files: ["src/auth.ts"], dependencies: [], mode: "tests_and_code",
             }],
             strategy: "Bottom-up approach",
         };
@@ -465,8 +465,8 @@ describe("planningPhase", () => {
 
         const plan: Plan = {
             tasks: [
-                { id: "t1", title: "Implement feature X", prompt: "Create the X module", profile: "implementer", files: ["src/x.ts"], dependencies: [], is_code: true },
-                { id: "t2", title: "Add tests for X", prompt: "Write tests", profile: "implementer", files: ["tests/x.test.ts"], dependencies: ["t1"], is_code: true },
+                { id: "t1", title: "Implement feature X", prompt: "Create the X module", profile: "implementer", files: ["src/x.ts"], dependencies: [], mode: "tests_and_code" },
+                { id: "t2", title: "Add tests for X", prompt: "Write tests", profile: "implementer", files: ["tests/x.test.ts"], dependencies: ["t1"], mode: "tests_and_code" },
             ],
             strategy: "Implement core first, then tests",
         };
@@ -488,7 +488,7 @@ describe("implementationPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const plan: Plan = { tasks: [{ id: "t1", title: "Task 1", prompt: "Do task 1", profile: "implementer", files: ["src/a.ts"], dependencies: [], is_code: true }], strategy: "Sequential" };
+        const plan: Plan = { tasks: [{ id: "t1", title: "Task 1", prompt: "Do task 1", profile: "implementer", files: ["src/a.ts"], dependencies: [], mode: "tests_and_code" }], strategy: "Sequential" };
 
         await implementationPhase(tracker, ["/profiles"], plan, "/cwd", 3, "/workdir");
 
@@ -502,7 +502,7 @@ describe("implementationPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const plan: Plan = { tasks: [{ id: "t1", title: "Task 1", prompt: "Do task 1", profile: "implementer", files: ["src/a.ts"], dependencies: [], is_code: true }], strategy: "Direct" };
+        const plan: Plan = { tasks: [{ id: "t1", title: "Task 1", prompt: "Do task 1", profile: "implementer", files: ["src/a.ts"], dependencies: [], mode: "tests_and_code" }], strategy: "Direct" };
 
         await implementationPhase(tracker, ["/my-profiles", "/extra-profiles"], plan, "/cwd", 2, "/workdir");
 
@@ -515,7 +515,7 @@ describe("implementationPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const plan: Plan = { tasks: [{ id: "t1", title: "Code task", prompt: "Implement it", profile: "implementer", files: ["src/a.ts"], dependencies: [], is_code: true }], strategy: "Test" };
+        const plan: Plan = { tasks: [{ id: "t1", title: "Code task", prompt: "Implement it", profile: "implementer", files: ["src/a.ts"], dependencies: [], mode: "tests_and_code" }], strategy: "Test" };
 
         await implementationPhase(tracker, ["/profiles"], plan, "/cwd", 3, "/workdir");
 
@@ -530,7 +530,7 @@ describe("implementationPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const plan: Plan = { tasks: [{ id: "t1", title: "Doc task", prompt: "Update docs", profile: "implementer", files: ["README.md"], dependencies: [], is_code: false }], strategy: "Non-code" };
+        const plan: Plan = { tasks: [{ id: "t1", title: "Doc task", prompt: "Update docs", profile: "implementer", files: ["README.md"], dependencies: [], mode: "no_code_execution" }], strategy: "Non-code" };
 
         await implementationPhase(tracker, ["/profiles"], plan, "/cwd", 3, "/workdir");
 
@@ -545,7 +545,7 @@ describe("implementationPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const plan: Plan = { tasks: [{ id: "t1", title: "Task 1", prompt: "Do task 1", profile: "implementer", files: ["src/a.ts"], dependencies: [], is_code: true }], strategy: "Sequential" };
+        const plan: Plan = { tasks: [{ id: "t1", title: "Task 1", prompt: "Do task 1", profile: "implementer", files: ["src/a.ts"], dependencies: [], mode: "tests_and_code" }], strategy: "Sequential" };
         mockLanePoolRun.mockResolvedValueOnce({ completedTasks: 1, failedTasks: 0 });
 
         await implementationPhase(tracker, ["/profiles"], plan, "/cwd", 3, "/workdir");
@@ -556,7 +556,7 @@ describe("implementationPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const plan: Plan = { tasks: [{ id: "t1", title: "Failing task", prompt: "Do it", profile: "implementer", files: ["src/a.ts"], dependencies: [], is_code: true }], strategy: "Test" };
+        const plan: Plan = { tasks: [{ id: "t1", title: "Failing task", prompt: "Do it", profile: "implementer", files: ["src/a.ts"], dependencies: [], mode: "tests_and_code" }], strategy: "Test" };
         mockLanePoolRun.mockResolvedValueOnce({ completedTasks: 0, failedTasks: 1 });
 
         await implementationPhase(tracker, ["/profiles"], plan, "/cwd", 3, "/workdir");
@@ -567,7 +567,7 @@ describe("implementationPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const plan: Plan = { tasks: [{ id: "t1", title: "Task 1", prompt: "Do task 1", profile: "implementer", files: ["src/a.ts"], dependencies: [], is_code: true }], strategy: "Test" };
+        const plan: Plan = { tasks: [{ id: "t1", title: "Task 1", prompt: "Do task 1", profile: "implementer", files: ["src/a.ts"], dependencies: [], mode: "tests_and_code" }], strategy: "Test" };
 
         await implementationPhase(tracker, ["/profiles"], plan, "/cwd", 3, "/my-workdir");
 
@@ -579,7 +579,7 @@ describe("implementationPhase", () => {
         const dir = tmpDir();
         const tracker = new WorkflowStatusTracker(dir);
 
-        const plan: Plan = { tasks: [{ id: "t1", title: "Task 1", prompt: "Do task 1", profile: "implementer", files: ["src/a.ts"], dependencies: [], is_code: true }, { id: "t2", title: "Task 2", prompt: "Do task 2", profile: "implementer", files: ["src/b.ts"], dependencies: ["t1"], is_code: true }], strategy: "Sequential" };
+        const plan: Plan = { tasks: [{ id: "t1", title: "Task 1", prompt: "Do task 1", profile: "implementer", files: ["src/a.ts"], dependencies: [], mode: "tests_and_code" }, { id: "t2", title: "Task 2", prompt: "Do task 2", profile: "implementer", files: ["src/b.ts"], dependencies: ["t1"], mode: "tests_and_code" }], strategy: "Sequential" };
 
         await implementationPhase(tracker, ["/profiles"], plan, "/cwd", 3, "/workdir");
 
@@ -716,7 +716,7 @@ describe("run", () => {
             if (taskId === "title-generator") return { title: "AI title" };
             if (taskId === "scout-coordinator") return { topics: [{ topic: "core", rationale: "Core module", files: ["src/core.ts"] }] };
             if (taskId === "scouting-reviewer") return { ready: true, research: "Found everything", gaps: [] };
-            if (taskId === "planner") return { tasks: [{ id: "t1", title: "Implement", prompt: "Do it", profile: "implementer", files: ["src/core.ts"], dependencies: [], is_code: true }], strategy: "Direct approach" };
+            if (taskId === "planner") return { tasks: [{ id: "t1", title: "Implement", prompt: "Do it", profile: "implementer", files: ["src/core.ts"], dependencies: [], mode: "tests_and_code" }], strategy: "Direct approach" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "Plan approved", suggestions: [] };
             return smartRunStepTask(opts);
         });
@@ -781,7 +781,7 @@ describe("run", () => {
             if (taskId === "planner") {
                 plannerCalls++;
                 if (plannerCalls <= 1) return { tasks: [], strategy: "Bad plan" };
-                return { tasks: [{ id: "t1", title: "Real task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], is_code: true }], strategy: "Better plan" };
+                return { tasks: [{ id: "t1", title: "Real task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], mode: "tests_and_code" }], strategy: "Better plan" };
             }
             return smartRunStepTask(opts);
         });
@@ -830,7 +830,7 @@ describe("run", () => {
             const taskId = opts.taskId as string;
             if (taskId === "scout-coordinator") return { topics: [] };
             if (taskId === "scouting-reviewer") return { ready: true, research: "From saved reports", gaps: [] };
-            if (taskId === "planner") return { tasks: [{ id: "t1", title: "Task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], is_code: true }], strategy: "Strategy" };
+            if (taskId === "planner") return { tasks: [{ id: "t1", title: "Task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], mode: "tests_and_code" }], strategy: "Strategy" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
             return smartRunStepTask(opts);
         });

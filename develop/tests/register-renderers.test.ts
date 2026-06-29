@@ -11,7 +11,7 @@
 //
 // This file defines the rendering contract:
 //
-//   planner (Plan = { tasks: [{ id, title, prompt, profile, files, is_code,
+//   planner (Plan = { tasks: [{ id, title, prompt, profile, files, mode,
 //            dependencies }], strategy }):
 //     - Guard: if data is not an object whose `tasks` is an array, fall back to
 //       `String(data)`.
@@ -60,7 +60,7 @@ function task(overrides: Partial<Plan["tasks"][number]> = {}): Plan["tasks"][num
         prompt: "Set up the initial schema for the users table",
         profile: "implementer",
         files: ["src/db/schema.ts"],
-        is_code: true,
+        mode: "tests_and_code",
         dependencies: [],
         ...overrides,
     };

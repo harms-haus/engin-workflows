@@ -172,7 +172,7 @@ function tmpDir(): string {
 
 /** Default plan written by the smart runMultiStepTask mock when no plan.json exists. */
 const DEFAULT_PLAN: Plan = {
-    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], is_code: true }],
+    tasks: [{ id: "t1", title: "Default task", prompt: "Do it", profile: "implementer", files: ["src/index.ts"], dependencies: [], mode: "tests_and_code" }],
     strategy: "Default strategy",
 };
 
@@ -301,7 +301,7 @@ describe("Zod Schemas", () => {
                     profile: "implementer",
                     files: ["src/auth.ts"],
                     dependencies: [],
-                    is_code: true,
+                    mode: "tests_and_code",
                 },
             ],
             strategy: "Bottom-up approach",
@@ -567,8 +567,8 @@ describe("planningPhase", () => {
 
         const plan: Plan = {
             tasks: [
-                { id: "t1", title: "Implement feature X", prompt: "Create the X module", profile: "implementer", files: ["src/x.ts"], dependencies: [], is_code: true },
-                { id: "t2", title: "Add tests for X", prompt: "Write tests", profile: "implementer", files: ["tests/x.test.ts"], dependencies: ["t1"], is_code: true },
+                { id: "t1", title: "Implement feature X", prompt: "Create the X module", profile: "implementer", files: ["src/x.ts"], dependencies: [], mode: "tests_and_code" },
+                { id: "t2", title: "Add tests for X", prompt: "Write tests", profile: "implementer", files: ["tests/x.test.ts"], dependencies: ["t1"], mode: "tests_and_code" },
             ],
             strategy: "Implement core first, then tests",
         };
@@ -599,7 +599,7 @@ describe("implementationPhase", () => {
                     profile: "implementer",
                     files: ["src/a.ts"],
                     dependencies: [],
-                    is_code: true,
+                    mode: "tests_and_code",
                 },
             ],
             strategy: "Sequential",
@@ -626,7 +626,7 @@ describe("implementationPhase", () => {
                     profile: "implementer",
                     files: ["src/a.ts"],
                     dependencies: [],
-                    is_code: true,
+                    mode: "tests_and_code",
                 },
             ],
             strategy: "Direct",
@@ -652,7 +652,7 @@ describe("implementationPhase", () => {
                     profile: "implementer",
                     files: ["src/a.ts"],
                     dependencies: [],
-                    is_code: true,
+                    mode: "tests_and_code",
                 },
             ],
             strategy: "Test",
@@ -687,7 +687,7 @@ describe("implementationPhase", () => {
                     profile: "implementer",
                     files: ["README.md"],
                     dependencies: [],
-                    is_code: false,
+                    mode: "no_code_execution",
                 },
             ],
             strategy: "Non-code",
@@ -720,7 +720,7 @@ describe("implementationPhase", () => {
                     profile: "implementer",
                     files: ["src/a.ts"],
                     dependencies: [],
-                    is_code: true,
+                    mode: "tests_and_code",
                 },
             ],
             strategy: "Sequential",
@@ -746,7 +746,7 @@ describe("implementationPhase", () => {
                     profile: "implementer",
                     files: ["src/a.ts"],
                     dependencies: [],
-                    is_code: true,
+                    mode: "tests_and_code",
                 },
             ],
             strategy: "Test",
@@ -773,7 +773,7 @@ describe("implementationPhase", () => {
                     profile: "implementer",
                     files: ["src/a.ts"],
                     dependencies: [],
-                    is_code: true,
+                    mode: "tests_and_code",
                 },
             ],
             strategy: "Test",
@@ -798,7 +798,7 @@ describe("implementationPhase", () => {
                     profile: "implementer",
                     files: ["src/a.ts"],
                     dependencies: [],
-                    is_code: true,
+                    mode: "tests_and_code",
                 },
                 {
                     id: "t2",
@@ -807,7 +807,7 @@ describe("implementationPhase", () => {
                     profile: "implementer",
                     files: ["src/b.ts"],
                     dependencies: ["t1"],
-                    is_code: true,
+                    mode: "tests_and_code",
                 },
             ],
             strategy: "Sequential",
@@ -996,7 +996,7 @@ describe("run", () => {
             if (taskId === "title-generator") return { title: "AI title" };
             if (taskId === "scout-coordinator") return { topics: [{ topic: "core", rationale: "Core module", files: ["src/core.ts"] }] };
             if (taskId === "scouting-reviewer") return { ready: true, research: "Found everything", gaps: [] };
-            if (taskId === "planner") return { tasks: [{ id: "t1", title: "Implement", prompt: "Do it", profile: "implementer", files: ["src/core.ts"], dependencies: [], is_code: true }], strategy: "Direct approach" };
+            if (taskId === "planner") return { tasks: [{ id: "t1", title: "Implement", prompt: "Do it", profile: "implementer", files: ["src/core.ts"], dependencies: [], mode: "tests_and_code" }], strategy: "Direct approach" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "Plan approved", suggestions: [] };
             if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
@@ -1072,7 +1072,7 @@ describe("run", () => {
             if (taskId === "planner") {
                 plannerCalls++;
                 if (plannerCalls <= 1) return { tasks: [], strategy: "Bad plan" };
-                return { tasks: [{ id: "t1", title: "Real task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], is_code: true }], strategy: "Better plan" };
+                return { tasks: [{ id: "t1", title: "Real task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], mode: "tests_and_code" }], strategy: "Better plan" };
             }
             if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};
@@ -1134,7 +1134,7 @@ describe("run", () => {
             const taskId = opts.taskId as string;
             if (taskId === "scout-coordinator") return { topics: [] };
             if (taskId === "scouting-reviewer") return { ready: true, research: "From saved reports", gaps: [] };
-            if (taskId === "planner") return { tasks: [{ id: "t1", title: "Task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], is_code: true }], strategy: "Strategy" };
+            if (taskId === "planner") return { tasks: [{ id: "t1", title: "Task", prompt: "Do it", profile: "implementer", files: [], dependencies: [], mode: "tests_and_code" }], strategy: "Strategy" };
             if (taskId === "plan-reviewer") return { ready: true, feedback: "OK", suggestions: [] };
             if (typeof taskId === "string" && /(?:efficiency|code-quality|ui-ux|security|documentation)-reviewer-round-\d+$/.test(taskId)) return { dimension: taskId.replace(/-round-\d+$/, "").replace(/-reviewer$/, ""), applicable: true, notApplicableReason: "", summary: "No issues", findings: [] };
             return {};

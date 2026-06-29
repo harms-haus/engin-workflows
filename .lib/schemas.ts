@@ -50,6 +50,39 @@ export const ScoutingReviewSchema = z.object({
 
 export type ScoutingReview = z.infer<typeof ScoutingReviewSchema>;
 
+/** How a planned task is executed. Replaces the former `is_code` boolean.
+ *
+ *  The mode selects the runner tree the implementation phase builds for the
+ *  task (see `resolveImplementationRunner` in implementation.ts):
+ *
+ *  - `tests_and_code`  — TDD red→green. The red-team writes FAILING tests
+ *    encoding the target behavior, then the green-team implements the
+ *    production code to make them pass:
+ *      linearRunner([
+ *        reviewRunner(write-tests, review-tests),
+ *        reviewRunner(write-code,  review-code),
+ *      ])
+ *  - `just_tests`      — only improve/extend the test suite on EXISTING code
+ *    (strengthen assertions, add edge cases, write characterization tests,
+ *    remove/rewrite tautological tests). No production code follows:
+ *      reviewRunner(write-tests, review-tests)
+ *    Here the tests should PASS against the current code.
+ *  - `code_only`       — production code with NO separate test-writing phase.
+ *    For mechanical fixes, dead-code removal, or changes already covered by
+ *    existing tests, where a red-team test phase is pure overhead:
+ *      reviewRunner(write-code, review-code)
+ *  - `no_code_execution` — docs, config, comments, or other non-code work,
+ *    with no test phase:
+ *      reviewRunner(execute, review)
+ */
+export const TaskModeSchema = z.enum([
+  "tests_and_code",
+  "just_tests",
+  "code_only",
+  "no_code_execution",
+]);
+export type TaskMode = z.infer<typeof TaskModeSchema>;
+
 export const PlanSchema = z.object({
   tasks: z.array(
     z.object({
@@ -58,11 +91,9 @@ export const PlanSchema = z.object({
       prompt: z.string().describe("Detailed prompt for the implementing agent"),
       profile: z.string().describe("Agent profile to use, e.g. 'implementer'"),
       files: z.array(z.string()).describe("Files this task will modify"),
-      is_code: z
-        .boolean()
-        .describe(
-          "True if this task modifies code (requires test-first), false for docs/config/non-code tasks",
-        ),
+      mode: TaskModeSchema.describe(
+        "How this task runs. 'tests_and_code' = TDD red→green (write failing tests, then implement). 'just_tests' = improve/strengthen tests on existing code only (no production changes; tests should pass). 'code_only' = production code with no separate test-writing phase (mechanical fixes / already-covered changes). 'no_code_execution' = docs, config, comments, or other non-code work with no test phase.",
+      ),
       dependencies: z
         .array(z.string())
         .describe("Task IDs that must complete first"),
@@ -72,6 +103,7 @@ export const PlanSchema = z.object({
 });
 
 export type Plan = z.infer<typeof PlanSchema>;
+export type PlanTask = Plan["tasks"][number];
 
 export const PlanReviewSchema = z.object({
   approved: z.boolean().describe("Whether the plan is approved"),
