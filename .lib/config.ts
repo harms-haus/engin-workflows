@@ -48,6 +48,17 @@ export interface WorkflowConfig {
    * `DEFAULT_FINAL_REVIEWERS` (efficiency, code-quality, ui-ux, security).
    */
   finalReviewers?: FinalReviewerConfig[];
+  /**
+   * Which review strategy to use in the final review phase.
+   * - `'static'` (default): per-lane review with independent fixer loops (legacy).
+   * - `'council'`: retrospective-council pattern with a shared SessionGate.
+   */
+  reviewStrategy?: 'static' | 'council';
+  /**
+   * Maximum council rounds for the retrospective council phase.
+   * Only meaningful when `reviewStrategy === 'council'`. Defaults to 4.
+   */
+  maxCouncilRounds?: number;
   phases: { id: string; label: string; icon: string }[];
   titleFormatter: (description: string) => string;
 }

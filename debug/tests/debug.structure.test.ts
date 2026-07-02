@@ -138,6 +138,11 @@ describe("workflowConfig", () => {
         expect(byDim.security.profileId).toBe("security-reviewer");
         expect(byDim.documentation.profileId).toBe("documentation-reviewer");
     });
+
+    it("opts into the council review strategy", () => {
+        expect(workflowConfig.reviewStrategy).toBe("council");
+        expect(workflowConfig.maxCouncilRounds).toBe(4);
+    });
 });
 
 // ─── B. Runtime: run function ──────────────────────────────────────────────
@@ -312,6 +317,16 @@ describe("main.ts: no web renderer imports or references", () => {
         for (const pattern of webPatterns) {
             expect(pattern.test(mainSource)).toBe(false);
         }
+    });
+});
+
+describe("main.ts: opts into council review strategy", () => {
+    it("contains reviewStrategy: 'council'", () => {
+        expect(mainSource).toContain("reviewStrategy: 'council'");
+    });
+
+    it("contains maxCouncilRounds: 4", () => {
+        expect(mainSource).toContain("maxCouncilRounds: 4");
     });
 });
 

@@ -376,6 +376,11 @@ describe("workflowConfig.finalReviewers & FinalReviewResultSchema re-export", ()
         ]);
     });
 
+    it("opts into the council review strategy", () => {
+        expect(workflowConfig.reviewStrategy).toBe("council");
+        expect(workflowConfig.maxCouncilRounds).toBe(4);
+    });
+
     it("FinalReviewResultSchema is re-exported from ../main.ts and is a parseable schema", () => {
         expect(typeof FinalReviewResultSchema.parse).toBe("function");
         expect(typeof FinalReviewResultSchema.safeParse).toBe("function");

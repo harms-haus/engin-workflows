@@ -173,6 +173,111 @@ describe('WorkflowConfig.modelConcurrency', () => {
   });
 });
 
+// ─── WorkflowConfig: reviewStrategy + maxCouncilRounds fields ────────────
+
+describe('WorkflowConfig.reviewStrategy', () => {
+  it('is optional (config without it still satisfies the interface)', () => {
+    const config: WorkflowConfig = {
+      name: 'no-strategy',
+      defaultMaxConcurrentSessions: 1,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+    };
+    expect((config as unknown as Record<string, unknown>).reviewStrategy).toBeUndefined();
+  });
+
+  it('accepts value "static"', () => {
+    const config: WorkflowConfig = {
+      name: 'static-strategy',
+      defaultMaxConcurrentSessions: 1,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+      reviewStrategy: 'static',
+    };
+    expect(config.reviewStrategy).toBe('static');
+  });
+
+  it('accepts value "council"', () => {
+    const config: WorkflowConfig = {
+      name: 'council-strategy',
+      defaultMaxConcurrentSessions: 1,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+      reviewStrategy: 'council',
+    };
+    expect(config.reviewStrategy).toBe('council');
+  });
+});
+
+describe('WorkflowConfig.maxCouncilRounds', () => {
+  it('is optional (config without it still satisfies the interface)', () => {
+    const config: WorkflowConfig = {
+      name: 'no-rounds',
+      defaultMaxConcurrentSessions: 1,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+    };
+    expect((config as unknown as Record<string, unknown>).maxCouncilRounds).toBeUndefined();
+  });
+
+  it('accepts a positive integer', () => {
+    const config: WorkflowConfig = {
+      name: 'with-rounds',
+      defaultMaxConcurrentSessions: 1,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+      maxCouncilRounds: 5,
+    };
+    expect(config.maxCouncilRounds).toBe(5);
+  });
+
+  it('accepts 0 as a valid value (disables retries)', () => {
+    const config: WorkflowConfig = {
+      name: 'zero-rounds',
+      defaultMaxConcurrentSessions: 1,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+      maxCouncilRounds: 0,
+    };
+    expect(config.maxCouncilRounds).toBe(0);
+  });
+});
+
+describe('WorkflowConfig — reviewStrategy + maxCouncilRounds composition', () => {
+  it('accepts both fields together', () => {
+    const config: WorkflowConfig = {
+      name: 'council-with-rounds',
+      defaultMaxConcurrentSessions: 3,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+      reviewStrategy: 'council',
+      maxCouncilRounds: 5,
+    };
+    expect(config.reviewStrategy).toBe('council');
+    expect(config.maxCouncilRounds).toBe(5);
+  });
+
+  it('accepts reviewStrategy=council without maxCouncilRounds (default at consumption)', () => {
+    const config: WorkflowConfig = {
+      name: 'council-default-rounds',
+      defaultMaxConcurrentSessions: 3,
+      fixerSteps: [],
+      phases: [],
+      titleFormatter: (d: string) => d,
+      reviewStrategy: 'council',
+    };
+    expect(config.reviewStrategy).toBe('council');
+    expect((config as unknown as Record<string, unknown>).maxCouncilRounds).toBeUndefined();
+  });
+});
+
 // ─── WorkflowRunOptions ────────────────────────────────────────────────────
 
 describe('WorkflowRunOptions', () => {

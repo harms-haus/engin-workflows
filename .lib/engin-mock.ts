@@ -147,6 +147,12 @@ export function createEnginMock(): Record<string, unknown> {
         (_coordinatorSpec: unknown, _opts: unknown) =>
           makeSessionPlanRunner(),
       ),
+    retrospectiveCouncilRunner: jest
+      .fn()
+      .mockImplementation(
+        (_options: unknown) =>
+          makeSessionPlanRunner(),
+      ),
     coalescingRunner: jest
       .fn()
       .mockImplementation(

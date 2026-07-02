@@ -17,11 +17,14 @@ export const workflowConfig = {
   name: "develop" as const,
   defaultMaxConcurrentSessions: 20,
   modelConcurrency: {
+    zai: 7, // shared account-level pool across all zai models
     "zai:glm-5.2": 5,
     "zai:glm-5.1": 5,
     "opencode-go:deepseek-v4-flash": 5,
     "opencode-go:mimo-v2.5": 5,
   },
+  reviewStrategy: 'council' as const,
+  maxCouncilRounds: 4,
   fixerSteps: [
     { name: "fix", profileId: "fixer", isReadOnly: false },
     {

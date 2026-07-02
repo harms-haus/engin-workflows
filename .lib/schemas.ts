@@ -225,6 +225,41 @@ export const FinalReviewResultSchema = z.object({
 });
 export type FinalReviewResult = z.infer<typeof FinalReviewResultSchema>;
 
+// ─── Retrospective Decision (post-fix re-assessment) ────────────────────
+export const RetrospectiveDecisionSchema = z.object({
+  terminate: z
+    .boolean()
+    .describe(
+      "Set true when this dimension's review work is complete and clean (no actionable findings or regressions remain, no further fix round needed). Set false when there are still actionable findings or regressions requiring another fix round.",
+    ),
+  applicable: z
+    .boolean()
+    .describe(
+      "false when this review dimension does not apply to the change (e.g. security review on a docs-only change) — put the reason in summary. When false, findings/resolvedFindings/regressions should be empty and terminate should be true.",
+    ),
+  summary: z
+    .string()
+    .describe(
+      "Overall re-assessment after the fixes were applied: what you re-checked, whether prior findings were resolved, and your conclusion. Include the not-applicable reason here when applicable=false.",
+    ),
+  findings: z
+    .array(FinalReviewFindingSchema)
+    .describe(
+      "Remaining actionable findings still OPEN after this round of fixes (severity >= medium), ordered by severity. These drive the next fix round. Empty when the dimension is clean.",
+    ),
+  resolvedFindings: z
+    .array(FinalReviewFindingSchema)
+    .describe(
+      "Prior findings from earlier rounds that this round's fixes CONFIRMED resolved.",
+    ),
+  regressions: z
+    .array(FinalReviewFindingSchema)
+    .describe(
+      "NEW findings introduced by the fixes themselves (regressions) — these must be addressed in the next round.",
+    ),
+});
+export type RetrospectiveDecision = z.infer<typeof RetrospectiveDecisionSchema>;
+
 export const TitleSchema = z.object({
   title: z.string().describe("A concise 3-8 word title summarizing the task"),
 });

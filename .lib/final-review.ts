@@ -114,7 +114,7 @@ function filePathOnly(spec: string): string {
 }
 
 /** Return only the actionable (severity ≥ medium) findings from a result. */
-function actionableFindings(result: FinalReviewResult): FinalReviewFinding[] {
+export function actionableFindings(result: FinalReviewResult): FinalReviewFinding[] {
   return result.applicable
     ? result.findings.filter((f) => isActionableSeverity(f.severity))
     : [];
@@ -154,7 +154,7 @@ function formatDiffSection(diff: string): string {
 }
 
 /** Build the prompt for a lane's INITIAL review pass. */
-function buildReviewerPrompt(
+export function buildReviewerPrompt(
   reviewer: FinalReviewerConfig,
   history: FinalReviewResult[],
   diff: string,
@@ -190,7 +190,7 @@ function buildReviewerPrompt(
 }
 
 /** Build the prompt for a lane's REVIEW-FIXES (verify) pass. */
-function buildReviewFixesPrompt(
+export function buildReviewFixesPrompt(
   reviewer: FinalReviewerConfig,
   history: FinalReviewResult[],
   fixRound: number,

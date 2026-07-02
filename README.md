@@ -28,14 +28,17 @@ delegates to the shared `runSpir` orchestrator. All real pipeline logic lives in
 workflows/
 ├── .lib/                     # Shared SPIR backbone (see .lib/README.md)
 │   ├── config.ts             # WorkflowConfig, SpirRunOptions, normalizeOptions()
-│   ├── spir.ts               # runSpir() orchestrator, executePhase(), PHASES
+│   ├── spir.ts               # runSpir() orchestrator, PHASES
 │   ├── scouting.ts           # scoutingPhase(), scoutingReviewPhase()
-│   ├── planning.ts           # planningPhase(), planReviewPhase()
+│   ├── planning.ts           # planningPhase()
 │   ├── implementation.ts     # implementationPhase()
-│   ├── final-review.ts       # finalReviewPhase()
+│   ├── final-review.ts       # finalReviewPhase() (static review strategy)
+│   ├── retrospective-council-phase.ts # retrospectiveCouncilPhase() (council review strategy)
 │   ├── initialization.ts     # initializationPhase() (AI title generation)
-│   ├── helpers.ts            # makeHarnessOptions(), spawnAgent()
+│   ├── helpers.ts            # makeHarnessOptions(), structuredOutputEvent(), decisionEvent(), errorEvent()
 │   ├── schemas.ts            # Zod schemas (PlanSchema, ReviewResultSchema, …)
+│   ├── renderers.ts          # registerRenderers() — markdown output for planner/plan-reviewer
+│   ├── session-utils.ts      # runSingleSessionStructured() one-shot structured session helper
 │   ├── steps.ts              # legacy CODE_STEPS / NON_CODE_STEPS arrays
 │   ├── package.json
 │   └── tsconfig.json
@@ -90,13 +93,22 @@ This is the complete `develop/main.ts`:
 
 ```ts
 import { runSpir, type SpirRunOptions, type FinalReviewerConfig, normalizeOptions, ReviewResultSchema } from '../.lib/spir';
-import type { StepDefinition } from '@harms-haus/engin';
+import type { StepDefinition } from "@harms-haus/engin-engine";
 
 export * from '../.lib/spir';
 
 export const workflowConfig = {
     name: 'develop' as const,
-    defaultMaxConcurrentTasks: 5,
+    defaultMaxConcurrentSessions: 20,
+    modelConcurrency: {
+        zai: 7,                              // shared account-level pool across all zai models
+        'zai:glm-5.2': 5,
+        'zai:glm-5.1': 5,
+        'opencode-go:deepseek-v4-flash': 5,
+        'opencode-go:mimo-v2.5': 5,
+    },
+    reviewStrategy: 'council' as const,
+    maxCouncilRounds: 4,
     fixerSteps: [
         { name: 'fix', profileId: 'fixer', isReadOnly: false },
         { name: 'verify', profileId: 'fixer-reviewer', isReadOnly: true, schema: ReviewResultSchema },
@@ -109,7 +121,6 @@ export const workflowConfig = {
         { profileId: 'documentation-reviewer', dimension: 'documentation', label: 'Documentation' },
     ] as FinalReviewerConfig[],
     phases: [
-        { id: 'initialization', label: 'Initialization', icon: '⚙' },
         { id: 'scouting',       label: 'Scouting',       icon: '🔍' },
         { id: 'planning',       label: 'Planning',       icon: '📋' },
         { id: 'implementing',   label: 'Implementing',   icon: '🔨' },
@@ -134,13 +145,17 @@ export async function run(taskPrompt: string, options: RunOptions): Promise<void
 | Field | `develop` | `improve` | `debug` |
 |---|---|---|---|
 | `name` | `'develop'` | `'improve'` | `'debug'` |
-| `defaultMaxConcurrentTasks` | `5` | `5` | `3` |
+| `defaultMaxConcurrentSessions` | `20` | `20` | `20` |
+| `modelConcurrency` | `zai:7`, `zai:glm-5.2:5`, `zai:glm-5.1:5`, `opencode-go:deepseek-v4-flash:5`, `opencode-go:mimo-v2.5:5` | same | same |
+| `reviewStrategy` | `'council'` | `'council'` | `'council'` |
+| `maxCouncilRounds` | `4` | `4` | `4` |
 | `fixerSteps` | `fix` + `verify` (read-only review) | `fix` + `verify` (read-only review) | `fix` + `verify` (read-only review) |
 | `finalReviewers` | efficiency / code-quality / ui-ux / security / documentation (same 5) | same 5 | same 5 |
-| `phases` | 5 (incl. initialization) | 4 (no initialization) | 5 (incl. initialization) |
+| `phases` | 4 (scouting / planning / implementing / review) | 4 (same) | 4 (same) |
 | `titleFormatter` | `d.slice(0, 100)` | `d.slice(0, 100)` | `d.slice(0, 100)` |
 
-These six fields are the *entire* code-level difference between the workflows.
+In practice, the only code-level difference between the three shipped wrappers
+is the `name` field (and the `RunOptions` type alias).
 Everything else — scouting, planning, implementation, review — is identical code
 shared from `.lib/`. See [`WorkflowConfig`](./.lib/config.ts) for the interface
 definition.
@@ -160,8 +175,8 @@ definition.
    workflow's `profiles/` directory at runtime. It must be unique across
    workflows.
 
-4. **Set `defaultMaxConcurrentTasks`** — the fallback lane-pool width when the
-   caller does not pass `maxConcurrentTasks`.
+4. **Set `defaultMaxConcurrentSessions`** — the fallback lane-pool width when
+   the caller does not pass `maxConcurrentSessions`.
 
 5. **Define `fixerSteps`** — the ordered repair steps run on each actionable
    finding in the final `review` phase. Each step is a `StepDefinition`
@@ -173,10 +188,28 @@ definition.
    the final review phase. Each entry is a `FinalReviewerConfig`
    (`{ profileId, dimension, label }`). All three shipped workflows use the same
    five: `efficiency-reviewer`, `code-quality-reviewer`, `ui-ux-reviewer`,
-   `security-reviewer`, `documentation-reviewer`. Each runs as an independent
-   "lane" that loops `review → fixer → review-fixes` over its own dimension
+   `security-reviewer`, `documentation-reviewer`. With the `'static'` strategy
+   each runs as an independent "lane" that loops `review → fixer → review-fixes`
+   over its own dimension; with `'council'` the same profiles run via
+   `retrospectiveCouncilRunner` (see 5c below).
    (see [`finalReviewPhase` in `.lib/README.md`](./.lib/README.md#final-reviewts)). Omit it to fall
    back to `.lib`'s `DEFAULT_FINAL_REVIEWERS` (the same five).
+
+5c. **Choose `reviewStrategy` and `maxCouncilRounds`** *(optional)* — two
+   `WorkflowConfig` fields that select how the final review phase runs:
+   - `'static'` *(default if omitted)*: the legacy per-lane design
+     ([`finalReviewPhase`](./.lib/final-review.ts)), where each dimension gets
+     its own `SessionScheduler` with an independent fixer loop.
+   - `'council'`: the retrospective-council pattern
+     ([`retrospectiveCouncilPhase`](./.lib/retrospective-council-phase.ts)),
+     where all five dimensions run as parallel `TaskGraph` tasks driven by a
+     `retrospectiveCouncilRunner`, all sharing one `SessionGate` (seeded from
+     `modelConcurrency`) and one `SessionScheduler`. Each dimension task loops
+     `convener → buildMembers(fixers) → retrospective → interpretRetrospective`
+     until no actionable findings remain or the round cap is hit.
+   When `'council'`, `maxCouncilRounds` caps the number of fix rounds per
+   dimension (default `4`). All three shipped workflows set
+   `reviewStrategy: 'council'`, `maxCouncilRounds: 4`.
 
 6. **Customize `phases`** *(optional)* — the phase chips shown in the UI.
    The `id` of each entry is matched against the backbone's `Phase` type
@@ -211,8 +244,15 @@ definition.
 Because the pipeline code is shared, **what makes `develop`, `improve`, and
 `debug` behave differently is configuration, not branching**:
 
-- The five `workflowConfig` values (above).
+- The `workflowConfig` values (above) — in practice, only `name` differs.
 - **Which agent-profile `.md` files exist** in each `profiles/` directory.
+
+> **Note on `reviewStrategy`:** with `'council'` (the current default), the five
+> final-reviewer profiles run through `retrospectiveCouncilRunner` instead of the
+> legacy per-lane loop — but **no additional profiles are needed**. The same
+> `finalReviewers` config and the same `profiles/*.md` files work under either
+> strategy; the difference is entirely in scheduling (shared gate + single
+> scheduler vs. per-lane schedulers).
 
 Every workflow resolves its profiles from a directory determined by
 `resolveProfilesDirs(options.cwd, config.name)` (or an explicit `profilesDirs`
@@ -224,7 +264,7 @@ option). The backbone and step definitions reference profiles by `profileId`:
 | Task `mode` runners (`.lib/implementation.ts`) | `test-writer`, `test-reviewer`, `implementer` (or the task's `profile`), `implement-reviewer` |
 | Scouting phase | `scout-coordinator`, `scout`, `scouting-reviewer` |
 | Planning phase | `planner`, `plan-reviewer` |
-| Final review phase | `efficiency-reviewer`, `code-quality-reviewer`, `ui-ux-reviewer`, `security-reviewer`, `documentation-reviewer` (each runs as an independent review → fixer → review-fixes lane; `final-reviewer` is the legacy single-reviewer) |
+| Final review phase | `efficiency-reviewer`, `code-quality-reviewer`, `ui-ux-reviewer`, `security-reviewer`, `documentation-reviewer`. Under `reviewStrategy: 'static'` each runs as an independent review → fixer → review-fixes lane; under `'council'` (the current default) these same profiles run via `retrospectiveCouncilRunner` (shared gate, convener → members → retrospective loop). `final-reviewer` is the legacy single-reviewer. |
 | Initialization (title) | `scout` |
 
 Concrete differences across the three shipped workflows:
@@ -265,7 +305,7 @@ which verifies the thin-wrapper contract:
 
 - `runSpir` and `normalizeOptions` are imported from `'../.lib/spir'`.
 - `main.ts` does `export * from '../.lib/spir'` (so test imports resolve).
-- `workflowConfig` has the expected `name`, `defaultMaxConcurrentTasks`,
+- `workflowConfig` has the expected `name`, `defaultMaxConcurrentSessions`,
   `fixerSteps` shape, `finalReviewers` shape, `phases` ids, and a working `titleFormatter`.
 - All re-exported phase functions, Zod schemas, and step arrays resolve.
 - Negative invariants: no `parallelAgents` references (in `main.ts` *or* `.lib/`),

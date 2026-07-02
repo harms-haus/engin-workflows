@@ -320,6 +320,11 @@ describe("workflowConfig", () => {
             "documentation-reviewer",
         ]);
     });
+
+    it("opts into the council review strategy", () => {
+        expect(workflowConfig.reviewStrategy).toBe("council");
+        expect(workflowConfig.maxCouncilRounds).toBe(4);
+    });
 });
 
 // ─── scoutingPhase ──────────────────────────────────────────────────────────

@@ -44,7 +44,8 @@ import type { Plan, ScoutingGap } from "./schemas";
 import { scoutingPhase, scoutingReviewPhase } from "./scouting";
 import { planningPhase } from "./planning";
 import { implementationPhase } from "./implementation";
-import { finalReviewPhase } from "./final-review";
+import { finalReviewPhase, DEFAULT_FINAL_REVIEWERS } from "./final-review";
+import { retrospectiveCouncilPhase } from "./retrospective-council-phase";
 import { initializationPhase } from "./initialization";
 
 // ─── Re-exports (for thin wrappers + tests) ─────────────────────────────────
@@ -52,6 +53,7 @@ export * from "./scouting";
 export * from "./planning";
 export * from "./implementation";
 export * from "./final-review";
+export * from "./retrospective-council-phase";
 export * from "./initialization";
 export * from "./schemas";
 export * from "./steps";
@@ -371,20 +373,39 @@ export async function runSpir(
 
     // ── Review: final quality check + fixer loop ──
     review: async (ctx) => {
-      await finalReviewPhase(
-        taskGraph as never,
-        profilesDirs,
-        cwd,
-        workDir,
-        maxConcurrentTasks,
-        apiKeys,
-        onStatus,
-        ctx.signal,
-        config.finalReviewers,
-        config.fixerSteps,
-        config.titleFormatter,
-        hookRegistry,
-      );
+      if (config.reviewStrategy === 'council') {
+        await retrospectiveCouncilPhase(
+          taskGraph as never,
+          profilesDirs,
+          cwd,
+          workDir,
+          maxConcurrentTasks,
+          apiKeys,
+          onStatus,
+          ctx.signal,
+          config.finalReviewers ?? DEFAULT_FINAL_REVIEWERS,
+          config.fixerSteps,
+          config.titleFormatter,
+          hookRegistry,
+          config.modelConcurrency ?? {},
+          config.maxCouncilRounds ?? 4,
+        );
+      } else {
+        await finalReviewPhase(
+          taskGraph as never,
+          profilesDirs,
+          cwd,
+          workDir,
+          maxConcurrentTasks,
+          apiKeys,
+          onStatus,
+          ctx.signal,
+          config.finalReviewers,
+          config.fixerSteps,
+          config.titleFormatter,
+          hookRegistry,
+        );
+      }
     },
 
     // ── Done: terminal phase (no-op) ──
